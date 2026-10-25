@@ -1,0 +1,685 @@
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+
+package com.julienmiquel.audiotheque.ui.book
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CloudQueue
+import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DoneAll
+import androidx.compose.material.icons.filled.Downloading
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.julienmiquel.audiotheque.AppContainer
+import com.julienmiquel.audiotheque.core.db.BookEntity
+import com.julienmiquel.audiotheque.core.db.BookmarkEntity
+import com.julienmiquel.audiotheque.core.db.ProgressEntity
+import com.julienmiquel.audiotheque.core.db.SyncPairEntity
+import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.ProgressMath
+import com.julienmiquel.audiotheque.core.model.TrackState
+import com.julienmiquel.audiotheque.core.model.chapterLabel
+import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.model.effectiveParentId
+import com.julienmiquel.audiotheque.core.model.effectiveStatus
+import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
+import com.julienmiquel.audiotheque.core.settings.AppSettings
+import com.julienmiquel.audiotheque.core.util.Formats
+import com.julienmiquel.audiotheque.library.Gesture
+import com.julienmiquel.audiotheque.library.LibraryItem
+import com.julienmiquel.audiotheque.library.bookTimeline
+import com.julienmiquel.audiotheque.player.Chapters
+import com.julienmiquel.audiotheque.sync.engine.Transfer
+import com.julienmiquel.audiotheque.ui.common.BookCover
+import com.julienmiquel.audiotheque.ui.common.BookProgress
+import com.julienmiquel.audiotheque.ui.common.InfoCard
+import com.julienmiquel.audiotheque.ui.common.InfoRow
+import com.julienmiquel.audiotheque.ui.common.Labels
+import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
+import com.julienmiquel.audiotheque.ui.common.SectionTitle
+import com.julienmiquel.audiotheque.ui.common.StatusTag
+import com.julienmiquel.audiotheque.ui.common.Tag
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+
+data class BookUiState(
+    val loaded: Boolean = false,
+    val item: LibraryItem? = null,
+    val tracks: List<TrackEntity> = emptyList(),
+    val progress: ProgressEntity? = null,
+    val bookmarks: List<BookmarkEntity> = emptyList(),
+    val pairs: List<SyncPairEntity> = emptyList(),
+    val duplicates: List<BookEntity> = emptyList(),
+    val settings: AppSettings = AppSettings(),
+    val transfers: Map<String, Transfer> = emptyMap(),
+    val localRoot: String? = null,
+) {
+    val book: BookEntity? get() = item?.book
+    val status: BookStatus? get() = item?.status
+}
+
+private data class Context(
+    val pairs: List<SyncPairEntity>,
+    val settings: AppSettings,
+    val duplicates: List<BookEntity>,
+    val transfers: Map<String, Transfer>,
+    val localRoot: String?,
+)
+
+class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel() {
+    private val duplicates = MutableStateFlow<List<BookEntity>>(emptyList())
+    private val localRoot = MutableStateFlow<String?>(null)
+
+    val state: StateFlow<BookUiState> = combine(
+        c.library.observeItem(bookId),
+        c.library.observeTracks(bookId),
+        c.library.observeProgress(bookId),
+        c.library.observeBookmarks(bookId),
+        combine(c.library.observePairs(), c.settings.settings, duplicates, c.engine.transfers.transfers, localRoot) { p, s, d, t, r -> Context(p, s, d, t, r) },
+    ) { item, tracks, progress, bookmarks, ctx ->
+        BookUiState(
+            loaded = true,
+            item = item,
+            tracks = tracks,
+            progress = progress,
+            bookmarks = bookmarks,
+            pairs = ctx.pairs,
+            duplicates = ctx.duplicates,
+            settings = ctx.settings,
+            transfers = ctx.transfers.filterValues { it.bookId == bookId },
+            localRoot = ctx.localRoot,
+        )
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), BookUiState())
+
+    init {
+        viewModelScope.launch {
+            c.library.observeItem(bookId).map { it?.book?.normalizedKey }.distinctUntilChanged().collect {
+                duplicates.value = c.library.book(bookId)?.let { book -> c.library.duplicatesOf(book) }.orEmpty()
+            }
+        }
+        viewModelScope.launch { localRoot.value = runCatching { c.storage.displayRoot() }.getOrNull() }
+    }
+
+    fun gesture(gesture: Gesture) = c.applyGesture(bookId, gesture)
+
+    fun move(pair: SyncPairEntity) = c.moveBook(bookId, pair)
+
+    fun play(trackId: String? = null, positionMs: Long? = null) = c.playBook(bookId, trackId, positionMs)
+
+    fun saveCorrections(title: String, author: String, narrator: String) {
+        viewModelScope.launch {
+            c.editor.save(bookId, title, author, narrator)
+            if (c.settings.current().googleBooksEnrichment) c.enrich(bookId, manual = false)
+        }
+    }
+
+    fun confirmTitle() {
+        viewModelScope.launch {
+            c.editor.confirm(bookId)
+            if (c.settings.current().googleBooksEnrichment) c.enrich(bookId, manual = false)
+        }
+    }
+
+    fun setHidden(hidden: Boolean) {
+        viewModelScope.launch {
+            c.editor.setHidden(bookId, hidden)
+            c.message(if (hidden) "Masqué de la bibliothèque (Réglages › Afficher les dossiers masqués)" else "Affiché dans la bibliothèque")
+        }
+    }
+
+    fun enrich() = c.enrich(bookId, manual = true)
+
+    fun deleteBookmark(id: Long) {
+        viewModelScope.launch { c.library.deleteBookmark(id) }
+    }
+}
+
+@Composable
+fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit, onOpenPlayer: () -> Unit, contentPadding: PaddingValues) {
+    val container = LocalAppContainer.current
+    val vm: BookViewModel = viewModel(key = "book-$bookId") { BookViewModel(container, bookId) }
+    val state by vm.state.collectAsStateWithLifecycle()
+    var menu by remember { mutableStateOf(false) }
+    var editing by rememberSaveable { mutableStateOf(false) }
+    var moving by rememberSaveable { mutableStateOf(false) }
+    val item = state.item
+
+    Scaffold(
+        modifier = Modifier.padding(contentPadding),
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
+        topBar = {
+            TopAppBar(
+                title = { Text(item?.title ?: "Fiche livre", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Retour") }
+                },
+                actions = {
+                    if (item != null) {
+                        Box {
+                            IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Plus d'actions") }
+                            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("Corriger titre, auteur, voix") },
+                                    leadingIcon = { Icon(Icons.Filled.Edit, null) },
+                                    onClick = {
+                                        menu = false
+                                        editing = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Déplacer vers…") },
+                                    leadingIcon = { Icon(Icons.AutoMirrored.Filled.DriveFileMove, null) },
+                                    onClick = {
+                                        menu = false
+                                        moving = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Pochette et résumé (Google Books)") },
+                                    leadingIcon = { Icon(Icons.Filled.Image, null) },
+                                    onClick = {
+                                        menu = false
+                                        vm.enrich()
+                                    },
+                                )
+                                if (item.book.hidden) {
+                                    DropdownMenuItem(
+                                        text = { Text("Réafficher dans la bibliothèque") },
+                                        leadingIcon = { Icon(Icons.Filled.Visibility, null) },
+                                        onClick = {
+                                            menu = false
+                                            vm.setHidden(false)
+                                        },
+                                    )
+                                } else {
+                                    DropdownMenuItem(
+                                        text = { Text("Ce n'est pas un livre (masquer)") },
+                                        leadingIcon = { Icon(Icons.Filled.VisibilityOff, null) },
+                                        onClick = {
+                                            menu = false
+                                            vm.setHidden(true)
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                    }
+                },
+            )
+        },
+    ) { inner ->
+        when {
+            !state.loaded -> Box(Modifier.fillMaxSize().padding(inner), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+            item == null -> Box(Modifier.fillMaxSize().padding(inner), contentAlignment = Alignment.Center) {
+                Text("Ce livre n'est plus dans la bibliothèque Drive.", modifier = Modifier.padding(32.dp))
+            }
+            else -> BookContent(
+                state = state,
+                item = item,
+                padding = inner,
+                onPlay = { trackId, position ->
+                    vm.play(trackId, position)
+                    onOpenPlayer()
+                },
+                onGesture = vm::gesture,
+                onMove = { moving = true },
+                onEdit = { editing = true },
+                onConfirm = vm::confirmTitle,
+                onOpenBook = onOpenBook,
+                onDeleteBookmark = vm::deleteBookmark,
+            )
+        }
+    }
+
+    if (editing && item != null) {
+        EditDialog(
+            item = item,
+            onDismiss = { editing = false },
+            onSave = { t, a, n ->
+                vm.saveCorrections(t, a, n)
+                editing = false
+            },
+        )
+    }
+    if (moving && item != null) {
+        MoveDialog(
+            book = item.book,
+            pairs = state.pairs,
+            onDismiss = { moving = false },
+            onMove = { pair ->
+                vm.move(pair)
+                moving = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun BookContent(
+    state: BookUiState,
+    item: LibraryItem,
+    padding: PaddingValues,
+    onPlay: (String?, Long?) -> Unit,
+    onGesture: (Gesture) -> Unit,
+    onMove: () -> Unit,
+    onEdit: () -> Unit,
+    onConfirm: () -> Unit,
+    onOpenBook: (String) -> Unit,
+    onDeleteBookmark: (Long) -> Unit,
+) {
+    val book = item.book
+    val progress = state.progress
+    val groups = remember(state.tracks) { Chapters.group(state.tracks) }
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(padding),
+        contentPadding = PaddingValues(bottom = 32.dp),
+    ) {
+        item(key = "header") { Header(item) }
+        if (!book.titleConfirmed) {
+            item(key = "confirm") {
+                InfoCard(title = "Titre et auteur à confirmer", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    Text(
+                        "Découpage proposé d'après le nom du dossier Drive « ${book.name} ». Le dossier n'est jamais renommé : la correction reste dans l'app.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = onConfirm) { Text("Confirmer") }
+                        OutlinedButton(onClick = onEdit) { Text("Corriger") }
+                    }
+                }
+            }
+        }
+        item(key = "actions") { Actions(state, item, onPlay, onGesture, onMove) }
+        if (progress?.finished == true && item.status != BookStatus.DONE && item.status != BookStatus.ARCHIVED) {
+            item(key = "finished") {
+                InfoCard(title = "Livre terminé", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    Text("Vous êtes arrivé à la fin de la dernière piste. Le ranger dans _Ecouté ?", style = MaterialTheme.typography.bodyMedium)
+                    Button(onClick = { onGesture(Gesture.MARQUER_ECOUTE) }) { Text("Marquer comme écouté") }
+                }
+            }
+        }
+        if (progress != null && (progress.percent > 0f || progress.lastListenedAt != null)) {
+            item(key = "progress") { ProgressCard(state, progress) }
+        }
+        item(key = "info") { InfoSection(state, item) }
+        if (state.duplicates.isNotEmpty()) {
+            item(key = "duplicates") {
+                InfoCard(title = "Doublon : ${state.duplicates.size + 1} exemplaires", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    state.duplicates.forEach { other ->
+                        val pair = state.pairs.firstOrNull { it.driveFolderId == other.effectiveParentId }
+                        Text(
+                            "${other.name} — ${pair?.name ?: Labels.status(other.effectiveStatus)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable(onClickLabel = "Ouvrir cet exemplaire") { onOpenBook(other.driveId) }
+                                .padding(vertical = 6.dp),
+                        )
+                    }
+                }
+            }
+        }
+        book.summary?.takeIf { it.isNotBlank() }?.let { summary ->
+            item(key = "summary") {
+                InfoCard(title = "Résumé", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    var expanded by rememberSaveable { mutableStateOf(false) }
+                    Text(
+                        summary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = if (expanded) Int.MAX_VALUE else 6,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Réduire" else "Lire la suite") }
+                    Text("Source : Google Books", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
+        if (state.bookmarks.isNotEmpty()) {
+            item(key = "bookmarks-title") { SectionTitle("Signets") }
+            items(state.bookmarks, key = { "bm-${it.id}" }) { bm ->
+                val track = state.tracks.firstOrNull { it.driveId == bm.trackId }
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(onClickLabel = "Écouter depuis ce signet") { onPlay(bm.trackId, bm.positionMs) }
+                        .padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.Bookmark, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(bm.note.ifBlank { "Signet" }, style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "${track?.chapterLabel ?: "Piste ${bm.trackIndex + 1}"} · ${Formats.clock(bm.positionMs)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    IconButton(onClick = { onDeleteBookmark(bm.id) }) { Icon(Icons.Filled.Delete, contentDescription = "Supprimer le signet") }
+                }
+            }
+        }
+        if (state.tracks.isNotEmpty()) {
+            item(key = "tracks-title") { SectionTitle("Pistes · ${Labels.tracks(state.tracks.size)}") }
+            groups.forEach { group ->
+                val label = group.label
+                if (label != null) {
+                    item(key = "group-$label-${group.tracks.first().driveId}") {
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier
+                                .padding(start = 16.dp, top = 12.dp, bottom = 4.dp)
+                                .semantics { heading() },
+                        )
+                    }
+                }
+                items(group.tracks, key = { "t-${it.driveId}" }) { track ->
+                    TrackRow(
+                        track = track,
+                        isCurrent = progress?.trackId == track.driveId,
+                        transfer = state.transfers[track.driveId],
+                        playable = item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP,
+                        onPlay = { onPlay(track.driveId, 0L) },
+                    )
+                }
+            }
+        } else if (book.kind == com.julienmiquel.audiotheque.core.model.BookKind.FOLDER) {
+            item(key = "no-tracks") {
+                Text(
+                    "Pistes non encore inventoriées : elles le seront à la prochaine synchro de ce statut.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Header(item: LibraryItem) {
+    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
+        BookCover(item.cover, item.title, size = 112.dp, cornerRadius = 12.dp)
+        Spacer(Modifier.width(16.dp))
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(item.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold, modifier = Modifier.semantics { heading() })
+            item.author?.let { Text(it, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            item.narrator?.let { Text("Lu par $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                StatusTag(item.status)
+                if (item.pendingSync) Tag("déplacement Drive en attente", icon = Icons.Filled.CloudUpload)
+                if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip, container = MaterialTheme.colorScheme.errorContainer, content = MaterialTheme.colorScheme.onErrorContainer)
+                if (item.finished) Tag("terminé", icon = Icons.Filled.DoneAll)
+            }
+        }
+    }
+}
+
+@Composable
+private fun Actions(state: BookUiState, item: LibraryItem, onPlay: (String?, Long?) -> Unit, onGesture: (Gesture) -> Unit, onMove: () -> Unit) {
+    val gestures = Gesture.forStatus(item.status).filter { !(item.isZip && (it == Gesture.COMMENCER || it == Gesture.REPRENDRE || it == Gesture.REECOUTER)) }
+    Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (item.isZip) {
+            Text(
+                "Livre au format zip : affiché pour mémoire, non lisible dans cette version.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error,
+            )
+        }
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (!item.isZip && item.presentTracks > 0) {
+                val resume = (state.progress?.percent ?: 0f) > 0f && state.progress?.finished != true
+                Button(onClick = { onPlay(null, null) }) {
+                    Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (resume) "Reprendre la lecture" else "Écouter")
+                }
+            }
+            gestures.forEach { g ->
+                FilledTonalButton(onClick = { onGesture(g) }) { Text(g.label) }
+            }
+            TextButton(onClick = onMove) { Text("Déplacer vers…") }
+        }
+    }
+}
+
+@Composable
+private fun ProgressCard(state: BookUiState, progress: ProgressEntity) {
+    val durations = remember(state.tracks, state.book?.durationMs) { bookTimeline(state.tracks, state.book) }
+    val track = state.tracks.firstOrNull { it.driveId == progress.trackId } ?: state.tracks.getOrNull(progress.trackIndex)
+    val trackIndex = track?.sortIndex ?: progress.trackIndex
+    val remaining = ProgressMath.remainingMs(durations, trackIndex, progress.positionMs, progress.speed)
+    InfoCard(title = "Avancement", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+        BookProgress(progress.percent)
+        InfoRow("Avancement", Formats.percent(progress.percent))
+        track?.let { InfoRow("Position", "${it.chapterLabel} · ${Formats.clock(progress.positionMs)}") }
+        if (durations.sum() > 0) InfoRow("Temps restant", "${Formats.duration(remaining)} à ${Formats.speed(progress.speed)}")
+        progress.lastListenedAt?.let { InfoRow("Dernière écoute", Formats.dateTime(it)) }
+        progress.setAsideAtPercent?.let { InfoRow("Mis de côté à", Formats.percent(it)) }
+    }
+}
+
+@Composable
+private fun InfoSection(state: BookUiState, item: LibraryItem) {
+    val book = item.book
+    val pair = state.pairs.firstOrNull { it.driveFolderId == book.effectiveParentId }
+    InfoCard(title = "Informations", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+        InfoRow("Statut", Labels.status(item.status) + (pair?.let { " (${it.name})" } ?: ""))
+        InfoRow("Durée", Formats.duration(book.durationMs, approximate = book.durationMs != null && !book.durationExact) + if (book.durationMs != null && !book.durationExact) " (estimée)" else "")
+        InfoRow("Taille", Formats.size(book.sizeBytes))
+        InfoRow("Pistes", book.trackCount.toString())
+        if (book.trackCount > 0) {
+            val local = state.tracks.filter { it.state == TrackState.PRESENT }
+            InfoRow("Sur le téléphone", "${local.size}/${book.trackCount} · ${Formats.size(local.sumOf { it.sizeBytes })}")
+        }
+        book.localDirName?.let { dir -> InfoRow("Dossier local", "${state.localRoot ?: "Audiobooks"}/$dir") }
+        InfoRow("Dossier Drive", book.name)
+        InfoRow("Ajouté le", Formats.date(book.addedAt))
+        InfoRow("Statut changé le", Formats.date(book.effectiveStatusChangedAt))
+        cleanupDeadline(state, item)?.let { InfoRow("Pistes gardées jusqu'au", Formats.dateTime(it)) }
+    }
+}
+
+/** Échéance du nettoyage des pistes locales (7 jours pour Plus tard, 24 h pour Écouté par défaut). */
+private fun cleanupDeadline(state: BookUiState, item: LibraryItem): Long? {
+    if (item.presentTracks == 0) return null
+    val since = item.book.effectiveStatusChangedAt
+    return when (item.status) {
+        BookStatus.LATER -> since + state.settings.laterRetentionDays * 24L * 3600_000L
+        BookStatus.DONE -> since + state.settings.doneRetentionHours * 3600_000L
+        else -> null
+    }
+}
+
+@Composable
+private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?, playable: Boolean, onPlay: () -> Unit) {
+    val present = track.state == TrackState.PRESENT
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(enabled = present && playable, onClickLabel = "Écouter cette piste", onClick = onPlay)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        when {
+            transfer != null && transfer.totalBytes > 0 -> CircularProgressIndicator(
+                progress = { (transfer.doneBytes.toFloat() / transfer.totalBytes).coerceIn(0f, 1f) },
+                modifier = Modifier.size(20.dp),
+                strokeWidth = 2.dp,
+            )
+            present -> Icon(Icons.Filled.CheckCircle, contentDescription = "Sur le téléphone", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+            track.state == TrackState.DOWNLOADING -> Icon(Icons.Filled.Downloading, contentDescription = "Téléchargement", modifier = Modifier.size(20.dp))
+            else -> Icon(Icons.Filled.CloudQueue, contentDescription = "Sur Drive uniquement", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(20.dp))
+        }
+        Spacer(Modifier.width(16.dp))
+        Column(Modifier.weight(1f)) {
+            Text(
+                track.title,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                listOfNotNull(track.chapterLabel, track.durationMs?.let { Formats.duration(it, !track.durationExact) }, Formats.size(track.sizeBytes)).joinToString(" · "),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun EditDialog(item: LibraryItem, onDismiss: () -> Unit, onSave: (String, String, String) -> Unit) {
+    var title by rememberSaveable { mutableStateOf(item.title) }
+    var author by rememberSaveable { mutableStateOf(item.author.orEmpty()) }
+    var narrator by rememberSaveable { mutableStateOf(item.narrator.orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Corriger le livre") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Dossier Drive : « ${item.book.name} ». Il n'est pas renommé : la correction est gardée par l'app.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Titre") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(value = author, onValueChange = { author = it }, label = { Text("Auteur") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                OutlinedTextField(
+                    value = narrator,
+                    onValueChange = { narrator = it },
+                    label = { Text("Voix (lu par)") },
+                    supportingText = { Text("Lue dans les tags ID3 quand ils la portent") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { onSave(title, author, narrator) }, enabled = title.isNotBlank()) { Text("Enregistrer") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
+    )
+}
+
+@Composable
+private fun MoveDialog(book: BookEntity, pairs: List<SyncPairEntity>, onDismiss: () -> Unit, onMove: (SyncPairEntity) -> Unit) {
+    val choices = pairs.filter { it.enabled || it.driveFolderId == book.effectiveParentId }
+    var selected by remember { mutableStateOf(choices.firstOrNull { it.driveFolderId == book.effectiveParentId }) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Déplacer « ${book.displayTitle} »") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                Text(
+                    "Le dossier change de parent dans Drive, aussitôt ou dès le retour du réseau.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                choices.forEach { pair ->
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .selectable(selected = selected?.id == pair.id, role = Role.RadioButton, onClick = { selected = pair })
+                            .padding(vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        RadioButton(selected = selected?.id == pair.id, onClick = null)
+                        Spacer(Modifier.width(12.dp))
+                        Column {
+                            Text(Labels.destination(pair), style = MaterialTheme.typography.bodyLarge)
+                            Text(Labels.status(pair.status), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                    HorizontalDivider()
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { selected?.let(onMove) },
+                enabled = selected != null && selected?.driveFolderId != book.effectiveParentId,
+            ) { Text("Déplacer") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
+    )
+}

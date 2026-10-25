@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="sync_channel_progress">Synchronisation</string>
+    <string name="sync_channel_progress_description">Transferts en cours depuis Google Drive</string>
+    <string name="sync_channel_alerts">Alertes de synchronisation</string>
+    <string name="sync_channel_alerts_description">Connexion Google à renouveler, erreurs</string>
+    <string name="sync_notification_title">Synchronisation des livres</string>
+    <string name="sync_cancel">Annuler</string>
+    <string name="sync_auth_title">Connexion Google à renouveler</string>
+    <string name="sync_auth_text">Ouvrez Audiothèque pour autoriser à nouveau l\'accès à Google Drive.</string>
+</resources>
