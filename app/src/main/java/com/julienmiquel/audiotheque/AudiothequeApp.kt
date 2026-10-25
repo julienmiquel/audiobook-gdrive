@@ -212,7 +212,7 @@ class AppContainer(private val app: Application) {
     suspend fun completeRenewal(accepted: Boolean, data: Intent?): AuthRenewal {
         if (!accepted) {
             val reason = data?.let { runCatching { auth.consentResult(it) }.exceptionOrNull() }
-            return AuthRenewal.Failed(consentFailureMessage(reason))
+            return AuthRenewal.Failed(consentFailureMessage(reason, firstSignIn = false))
         }
         val email = settings.current().accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
         return runCatching { auth.consentResult(data) }.fold(

@@ -34,16 +34,25 @@ bout → « Marquer comme écouté » → le dossier passe dans `_Ecouté` sur D
 
 ## Configuration Google (vraie bibliothèque)
 
-L'app appelle directement Google Drive API v3 depuis le téléphone : aucun serveur tiers.
+L'app appelle directement Google Drive API v3 depuis le téléphone : aucun serveur tiers. Google
+n'accepte une app Android que si elle est déclarée dans un projet Google Cloud ; tant que ce n'est
+pas fait, l'écran d'autorisation Google se referme aussitôt et l'app affiche « L'autorisation Google
+Drive n'a pas abouti », avec le nom de paquet et l'empreinte SHA-1 à déclarer (bouton « Copier »).
 
-1. **Projet Google Cloud** : créer un projet, activer **Google Drive API**.
-2. **Écran de consentement OAuth** : type *Externe*, statut *En test* ; ajouter les comptes autorisés
-   comme utilisateurs test (Julien, et Julie et Clément s'ils utilisent l'app). Champs d'application :
+À faire une fois, avec le compte Google qui possède `/AudioBook` (de préférence un projet personnel,
+hors organisation) :
+
+1. **Activer Google Drive API** :
+   [console.cloud.google.com/apis/library/drive.googleapis.com](https://console.cloud.google.com/apis/library/drive.googleapis.com).
+2. **Écran de consentement OAuth** ([Google Auth Platform](https://console.cloud.google.com/auth/overview)) :
+   audience *Externe*, statut *Test* ; ajouter les comptes autorisés comme **utilisateurs test**
+   (Julien, et Julie et Clément s'ils utilisent l'app). Accès aux données :
    `https://www.googleapis.com/auth/drive` (déplacer des dossiers que l'app n'a pas créés) et
    `https://www.googleapis.com/auth/drive.appdata` (progression).
-3. **ID client OAuth de type Android** : nom de paquet `com.julienmiquel.audiotheque` et empreinte SHA-1
-   de la clé de signature. Les builds debug et release sont signés avec la clé de debug (usage
-   personnel, APK installé à la main), une seule empreinte suffit :
+3. **ID client OAuth de type Android** ([Clients › Créer](https://console.cloud.google.com/auth/clients/create)) :
+   nom de paquet `com.julienmiquel.audiotheque` et empreinte SHA-1 du certificat de signature. Les
+   builds debug et release sont signés avec la clé de debug (usage personnel, APK installé à la main) :
+   une seule empreinte suffit. Elle est affichée par l'app en cas d'échec, ou par :
    ```bash
    keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android -keypass android | grep SHA1
    ```
@@ -53,6 +62,9 @@ L'app appelle directement Google Drive API v3 depuis le téléphone : aucun serv
    audiotheque.webClientId=1234567890-xxxx.apps.googleusercontent.com
    ```
    Sans lui, le compte est choisi directement à l'écran d'autorisation Drive (AuthorizationClient).
+
+Aucune réinstallation n'est nécessaire après ces étapes : il suffit de toucher à nouveau « Se
+connecter avec Google » (la prise en compte par Google peut prendre quelques minutes).
 
 Notes :
 

@@ -1,12 +1,15 @@
 package com.julienmiquel.audiotheque.ui.onboarding
 
 import android.app.Activity
+import android.content.ClipData
+import android.content.ClipboardManager
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -17,6 +20,7 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
@@ -27,6 +31,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -38,8 +43,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -49,6 +57,7 @@ import com.julienmiquel.audiotheque.auth.GoogleSignIn
 import com.julienmiquel.audiotheque.auth.SignInOutcome
 import com.julienmiquel.audiotheque.auth.authErrorMessage
 import com.julienmiquel.audiotheque.auth.consentFailureMessage
+import com.julienmiquel.audiotheque.auth.isSetupProblem
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import kotlinx.coroutines.launch
 
@@ -63,6 +72,7 @@ fun OnboardingScreen() {
     val scope = rememberCoroutineScope()
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
+    var setupHelp by remember { mutableStateOf(false) }
     var identity by remember { mutableStateOf<GoogleIdentity?>(null) }
 
     suspend fun finish(granted: DriveAuthorization.Granted) {
@@ -79,8 +89,10 @@ fun OnboardingScreen() {
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         scope.launch {
             if (result.resultCode != Activity.RESULT_OK) {
+                // Google ne dit souvent rien : annulation ou app non déclarée dans Google Cloud.
                 val reason = result.data?.let { data -> runCatching { container.auth.consentResult(data) }.exceptionOrNull() }
-                error = consentFailureMessage(reason)
+                error = consentFailureMessage(reason, firstSignIn = true)
+                setupHelp = isSetupProblem(reason, consentClosed = true)
                 busy = false
                 return@launch
             }
@@ -95,7 +107,8 @@ fun OnboardingScreen() {
                     }
                 }
                 .onFailure {
-                    error = "Autorisation impossible : ${it.message ?: it.javaClass.simpleName}"
+                    error = authErrorMessage(it)
+                    setupHelp = isSetupProblem(it, consentClosed = false)
                     busy = false
                 }
         }
@@ -105,6 +118,7 @@ fun OnboardingScreen() {
         val host = activity ?: return
         busy = true
         error = null
+        setupHelp = false
         scope.launch {
             when (val outcome = GoogleSignIn.signIn(host, container.auth.webClientId)) {
                 is SignInOutcome.Success -> identity = outcome.identity
@@ -125,6 +139,7 @@ fun OnboardingScreen() {
                 }
                 .onFailure {
                     error = authErrorMessage(it)
+                    setupHelp = isSetupProblem(it, consentClosed = false)
                     busy = false
                 }
         }
@@ -162,6 +177,7 @@ fun OnboardingScreen() {
                 Text("Se connecter avec Google")
             }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center) }
+            if (setupHelp) GoogleCloudSetup(packageName = container.auth.packageName, sha1 = container.auth.signingSha1)
             Text(
                 "Accès demandés : Google Drive (déplacer les dossiers de livres que l'app n'a pas créés) et l'espace caché de l'app (votre progression, un fichier par livre).",
                 style = MaterialTheme.typography.bodySmall,
@@ -171,6 +187,53 @@ fun OnboardingScreen() {
         }
     }
 }
+
+/**
+ * Google n'accepte une app que si elle est déclarée dans un projet Google Cloud : ID client OAuth
+ * de type Android (nom de paquet + empreinte SHA-1 du certificat de signature), API Drive activée,
+ * compte ajouté comme utilisateur test. Les valeurs affichées sont celles de cette installation.
+ */
+@Composable
+private fun GoogleCloudSetup(packageName: String, sha1: String?) {
+    val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
+    val fingerprint = sha1 ?: "introuvable"
+    Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, shape = MaterialTheme.shapes.medium, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("À faire une fois dans Google Cloud", style = MaterialTheme.typography.titleSmall, modifier = Modifier.semantics { heading() })
+            Text(
+                "1. Activer « Google Drive API ».\n" +
+                    "2. Écran de consentement OAuth : audience Externe, statut Test, votre compte Google ajouté comme utilisateur test.\n" +
+                    "3. Créer un ID client OAuth de type Android avec ces deux valeurs :",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            SelectionContainer {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("Nom de paquet", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(packageName, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+                    Text("Empreinte SHA-1", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(fingerprint, style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+                }
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = {
+                    val text = "Nom de paquet : $packageName\nEmpreinte SHA-1 : $fingerprint"
+                    context.getSystemService(ClipboardManager::class.java)
+                        ?.setPrimaryClip(ClipData.newPlainText("ID client OAuth Android", text))
+                }) { Text("Copier") }
+                Button(onClick = { runCatching { uriHandler.openUri(GOOGLE_CLOUD_CLIENTS_URL) } }) { Text("Ouvrir Google Cloud") }
+            }
+            Text(
+                "Ensuite, revenez ici et touchez « Se connecter avec Google » : rien à réinstaller.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** Console Google Cloud, création d'un ID client OAuth (Google Auth Platform). */
+private const val GOOGLE_CLOUD_CLIENTS_URL = "https://console.cloud.google.com/auth/clients/create"
 
 @Composable
 private fun Feature(icon: ImageVector, text: String) {

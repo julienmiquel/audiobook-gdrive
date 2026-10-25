@@ -4,6 +4,7 @@ import android.accounts.Account
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
 import com.google.android.gms.auth.api.identity.AuthorizationResult
@@ -15,6 +16,7 @@ import com.julienmiquel.audiotheque.BuildConfig
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.sync.drive.AccessTokenProvider
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
+import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,6 +51,19 @@ class GoogleAuthManager(
     private var tokenExpiresAt = 0L
 
     val webClientId: String get() = BuildConfig.WEB_CLIENT_ID
+
+    /** Nom de paquet à déclarer dans l'ID client OAuth Android (Google Cloud). */
+    val packageName: String get() = context.packageName
+
+    /** Empreinte SHA-1 du certificat qui signe cette installation, à déclarer avec le nom de paquet. */
+    val signingSha1: String? by lazy {
+        runCatching {
+            val flags = PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
+            val cert = context.packageManager.getPackageInfo(context.packageName, flags).signingInfo
+                ?.apkContentsSigners?.firstOrNull() ?: return@runCatching null
+            MessageDigest.getInstance("SHA-1").digest(cert.toByteArray()).joinToString(":") { "%02X".format(it) }
+        }.getOrNull()
+    }
 
     private fun request(email: String?): AuthorizationRequest =
         AuthorizationRequest.builder()
@@ -136,11 +151,23 @@ internal fun authErrorMessage(e: Throwable): String {
 }
 
 /**
- * Écran d'autorisation Google fermé sans accord : annulation par l'utilisateur, ou refus de Google
- * (app non enregistrée, réseau…) dont la raison est lue dans le résultat.
+ * Écran d'autorisation Google fermé sans accord. Google ne donne souvent aucune raison : une
+ * annulation et une app non déclarée dans Google Cloud (ID client OAuth Android absent) se
+ * ressemblent, l'écran se refermant alors aussitôt.
  */
-internal fun consentFailureMessage(reason: Throwable?): String = when ((reason as? ApiException)?.statusCode) {
+internal fun consentFailureMessage(reason: Throwable?, firstSignIn: Boolean): String = when ((reason as? ApiException)?.statusCode) {
     CommonStatusCodes.DEVELOPER_ERROR, CommonStatusCodes.NETWORK_ERROR -> authErrorMessage(reason!!)
-    null, CommonStatusCodes.CANCELED -> "Autorisation Google Drive refusée. Elle est nécessaire pour lire la bibliothèque et déplacer les dossiers."
-    else -> "Autorisation Google Drive refusée ou impossible (code ${(reason as ApiException).statusCode} : ${reason.message.orEmpty()})."
+    null, CommonStatusCodes.CANCELED ->
+        if (firstSignIn) {
+            "L'autorisation Google Drive n'a pas abouti. Si l'écran Google s'est refermé sans vous laisser choisir de compte, l'app n'est pas encore déclarée dans Google Cloud : voir ci-dessous."
+        } else {
+            "Autorisation Google Drive refusée : la synchro reste en pause."
+        }
+    else -> "Autorisation Google Drive impossible (code ${(reason as ApiException).statusCode} : ${reason.message.orEmpty()})."
+}
+
+/** Échec qui vient très probablement de la configuration Google Cloud (ID client OAuth Android). */
+internal fun isSetupProblem(reason: Throwable?, consentClosed: Boolean): Boolean {
+    val code = (reason as? ApiException)?.statusCode
+    return code == CommonStatusCodes.DEVELOPER_ERROR || (consentClosed && code != CommonStatusCodes.NETWORK_ERROR)
 }
