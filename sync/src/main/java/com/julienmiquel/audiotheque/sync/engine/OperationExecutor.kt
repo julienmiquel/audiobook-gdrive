@@ -6,6 +6,7 @@ import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.PendingOperationEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
@@ -18,6 +19,8 @@ import com.julienmiquel.audiotheque.sync.drive.DriveService
 import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Rejoue la file d'opérations : chaque geste de statut est un déplacement de dossier dans Drive
@@ -48,10 +51,18 @@ class OperationExecutor(
             try {
                 val file = drive.getFile(op.bookId)
                 if (file.trashed) throw DriveNotFoundException("Le dossier est dans la corbeille")
-                val otherStatusParents = file.parents.filter { it != op.toParentId && (it in pairFolders || it == op.fromParentId) }
-                val alreadyDone = op.toParentId in file.parents && otherStatusParents.isEmpty()
-                if (!alreadyDone) drive.move(op.bookId, op.toParentId, otherStatusParents)
-                onSuccess(op, book, pairs, ctx, moved = !alreadyDone)
+                val parents = file.parents
+                val otherStatusParents = parents.filter { it != op.toParentId && (it in pairFolders || it == op.fromParentId) }
+                when {
+                    op.toParentId in parents && otherStatusParents.isEmpty() -> onSuccess(op, book, pairs, ctx, movedFrom = null)
+                    // Drive fait foi : le dossier a été déplacé ailleurs depuis le geste (web, autre
+                    // membre de la famille). On ne le déplace pas de force : le geste est abandonné.
+                    op.fromParentId !in parents && op.toParentId !in parents -> onConflict(op, book, pairs, parents, ctx)
+                    else -> {
+                        drive.move(op.bookId, op.toParentId, otherStatusParents)
+                        onSuccess(op, book, pairs, ctx, movedFrom = otherStatusParents.firstOrNull() ?: op.fromParentId)
+                    }
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: DriveAuthException) {
@@ -71,26 +82,35 @@ class OperationExecutor(
         return ops.all().isEmpty()
     }
 
+    /** [movedFrom] : dossier quitté dans Drive, ou null si Drive avait déjà la valeur attendue. */
     private suspend fun onSuccess(
         op: PendingOperationEntity,
         book: BookEntity,
         pairs: List<SyncPairEntity>,
         ctx: RunContext?,
-        moved: Boolean,
+        movedFrom: String?,
     ) {
         db.withTransaction {
-            books.updateConfirmedLocation(op.bookId, op.toParentId, op.toStatus, op.createdAt)
-            // Si le geste a été modifié pendant l'appel (annulation, autre statut), l'opération
-            // reste en file avec sa nouvelle cible et le statut en attente est conservé.
+            // Statut confirmé (et sa date, base des délais de nettoyage) mis à jour seulement si
+            // le dossier a vraiment changé : un geste annulé avant la synchro ne touche à rien.
+            if (movedFrom != null || book.parentId != op.toParentId) {
+                books.updateConfirmedLocation(op.bookId, op.toParentId, op.toStatus, op.createdAt)
+            }
             val deleted = ops.deleteIfTarget(op.id, op.toParentId)
-            if (deleted > 0 && ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
+            if (deleted > 0) {
+                if (ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
+            } else {
+                // Geste modifié pendant l'appel (« Annuler », autre statut) : l'opération reste en
+                // file avec sa nouvelle cible, au départ du dossier où le livre vient d'arriver.
+                ops.get(op.id)?.let { ops.update(it.copy(fromParentId = op.toParentId, fromStatus = op.toStatus)) }
+            }
         }
-        if (moved && op.fromParentId != op.toParentId) {
+        if (movedFrom != null && movedFrom != op.toParentId) {
             history.log(
                 type = SyncEventType.DRIVE_MOVE,
-                path = "${pathOf(op.fromParentId, pairs)} → ${pathOf(op.toParentId, pairs)}",
+                path = "${pathOf(movedFrom, pairs)} → ${pathOf(op.toParentId, pairs)}",
                 book = book,
-                message = "${nameOf(op.fromParentId, pairs)} → ${nameOf(op.toParentId, pairs)}",
+                message = "${nameOf(movedFrom, pairs)} → ${nameOf(op.toParentId, pairs)}",
                 runId = ctx?.runId,
             )
             ctx?.moves?.incrementAndGet()
@@ -104,10 +124,7 @@ class OperationExecutor(
         e: DriveHttpException,
         ctx: RunContext?,
     ) {
-        db.withTransaction {
-            ops.delete(op.id)
-            if (ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
-        }
+        abandon(op)
         history.log(
             type = SyncEventType.ERROR,
             path = "${pathOf(op.fromParentId, pairs)} → ${pathOf(op.toParentId, pairs)}",
@@ -117,6 +134,39 @@ class OperationExecutor(
             runId = ctx?.runId,
         )
         ctx?.errors?.incrementAndGet()
+    }
+
+    private suspend fun onConflict(
+        op: PendingOperationEntity,
+        book: BookEntity,
+        pairs: List<SyncPairEntity>,
+        parents: List<String>,
+        ctx: RunContext?,
+    ) {
+        abandon(op)
+        val where = parents.firstNotNullOfOrNull { parent -> pairs.firstOrNull { it.driveFolderId == parent }?.name }
+            ?: "un dossier hors de la bibliothèque"
+        history.log(
+            type = SyncEventType.ERROR,
+            path = "${pathOf(op.fromParentId, pairs)} → ${pathOf(op.toParentId, pairs)}",
+            book = book,
+            result = EventResult.ERROR,
+            message = "Déplacé entre-temps dans Drive (vers $where) : le geste vers ${nameOf(op.toParentId, pairs)} est abandonné, Drive fait foi.",
+            runId = ctx?.runId,
+        )
+        ctx?.errors?.incrementAndGet()
+    }
+
+    /**
+     * Geste abandonné : le livre garde son statut Drive et le geste n'a pas d'effet local. Un
+     * « Marquer écouté » qui n'a pas abouti ne laisse pas « terminé » sur un livre pas fini.
+     */
+    private suspend fun abandon(op: PendingOperationEntity) {
+        db.withTransaction {
+            ops.delete(op.id)
+            if (ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
+            if (op.toStatus == BookStatus.DONE) db.progressDao().clearFinishedUnlessAtEnd(op.bookId, clock.now())
+        }
     }
 
     private suspend fun reschedule(op: PendingOperationEntity, book: BookEntity, e: Exception, ctx: RunContext?) {
@@ -148,11 +198,11 @@ class OperationExecutor(
     }
 }
 
-/** Suppression des fichiers locaux d'une piste (fichier et « .part »). */
+/** Suppression des fichiers locaux d'une piste (fichier et « .part »), toujours hors du thread principal. */
 class LocalFiles(private val db: AppDatabase, private val storage: LocalStorage) {
 
     /** Retourne le nombre d'octets libérés. */
-    suspend fun deleteTrackFiles(track: TrackEntity, updateDb: Boolean = true): Long {
+    suspend fun deleteTrackFiles(track: TrackEntity, updateDb: Boolean = true): Long = withContext(Dispatchers.IO) {
         var freed = 0L
         track.localPath?.let { path ->
             val file = File(path)
@@ -168,7 +218,7 @@ class LocalFiles(private val db: AppDatabase, private val storage: LocalStorage)
             file.parentFile?.let { deleteEmptyDirs(it) }
         }
         if (updateDb) db.trackDao().setLocalState(track.driveId, TrackState.ABSENT, null, 0)
-        return freed
+        freed
     }
 
     /** Remonte en supprimant les dossiers vides, sans jamais toucher à la racine Audiobooks. */

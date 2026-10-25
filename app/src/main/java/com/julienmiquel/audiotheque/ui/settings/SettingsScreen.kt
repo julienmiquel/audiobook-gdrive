@@ -31,6 +31,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -50,6 +51,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
@@ -103,8 +105,21 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
         }
     }
 
+    private val _signingOut = MutableStateFlow(false)
+
+    /** Déconnexion en cours : fin de la synchro, dernière écriture de la progression, effacement. */
+    val signingOut: StateFlow<Boolean> = _signingOut
+
     fun signOut() {
-        c.appScope.launch { c.signOut() }
+        if (_signingOut.value) return
+        _signingOut.value = true
+        c.appScope.launch {
+            try {
+                c.signOut()
+            } finally {
+                _signingOut.value = false
+            }
+        }
     }
 
     /** Démo de « Drive fait foi » : un livre déplacé depuis le web change de statut à la synchro suivante. */
@@ -138,6 +153,7 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
     val settings by vm.settings.collectAsStateWithLifecycle()
     val granted by vm.storageGranted.collectAsStateWithLifecycle()
     val path by vm.storagePath.collectAsStateWithLifecycle()
+    val signingOut by vm.signingOut.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmSignOut by remember { mutableStateOf(false) }
     var confirmReset by remember { mutableStateOf(false) }
@@ -170,10 +186,14 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                         Spacer(Modifier.width(12.dp))
                         Column {
                             Text("Mode démo · Drive simulé", style = MaterialTheme.typography.bodyLarge)
-                            Text("Bibliothèque fictive calquée sur /AudioBook ; aucune donnée ne quitte le téléphone.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Text(
+                                "Bibliothèque fictive calquée sur /AudioBook, sans compte Google. Seuls le titre et l'auteur confirmés partent vers Google Books, si l'option est activée.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
                         }
                     }
-                    OutlinedButton(onClick = { confirmSignOut = true }) { Text("Quitter le mode démo") }
+                    if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Quitter le mode démo") }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Icon(Icons.Filled.AccountCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
@@ -188,7 +208,7 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
-                    OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
+                    if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
                 }
             }
 
@@ -205,7 +225,11 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                         FilterChip(selected = s.doneRetentionHours == h, onClick = { vm.update { it.copy(doneRetentionHours = h) } }, label = { Text(Labels.hours(h)) })
                     }
                 }
-                Text("Seul _En écoute garde toutes ses pistes. Le livre en cours de lecture n'est jamais nettoyé.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(
+                    "Seul _En écoute garde toutes ses pistes. Rien n'est supprimé avant que Drive ait confirmé le déplacement, ni dans les 10 minutes qui suivent ; le livre en cours de lecture n'est jamais nettoyé.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             InfoCard(title = "Lecture") {
@@ -248,9 +272,9 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                     Text("L'accès à tous les fichiers est nécessaire pour écrire dans [Stockage interne]/Audiobooks.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
                     Button(onClick = {
                         val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:${context.packageName}"))
-                        runCatching { context.startActivity(intent) }.onFailure {
-                            context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                        }
+                        val opened = runCatching { context.startActivity(intent) }.isSuccess ||
+                            runCatching { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) }.isSuccess
+                        if (!opened) container.message("Réglage introuvable : autorisez l'accès à tous les fichiers dans les paramètres du téléphone")
                     }) { Text("Autoriser l'accès") }
                 }
                 Text("Emplacement : ${path ?: "—"}", style = MaterialTheme.typography.bodyMedium)
@@ -284,7 +308,15 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
         AlertDialog(
             onDismissRequest = { confirmSignOut = false },
             title = { Text(if (demo) "Quitter le mode démo ?" else "Se déconnecter ?") },
-            text = { Text("La bibliothèque locale et les pistes téléchargées seront effacées du téléphone. Rien n'est supprimé dans Drive.") },
+            text = {
+                Text(
+                    if (demo) {
+                        "La bibliothèque de démonstration et ses pistes seront effacées du téléphone."
+                    } else {
+                        "La bibliothèque locale et les pistes téléchargées seront effacées du téléphone. Votre progression est d'abord enregistrée dans votre Drive, et vos signets restent sur le téléphone. Rien n'est supprimé dans Drive."
+                    },
+                )
+            },
             confirmButton = {
                 TextButton(onClick = {
                     confirmSignOut = false
@@ -307,6 +339,15 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
             },
             dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Annuler") } },
         )
+    }
+}
+
+/** Déconnexion en cours (fin de la synchro, progression enregistrée dans Drive, effacement). */
+@Composable
+private fun SigningOut() {
+    Column(Modifier.fillMaxWidth().semantics(mergeDescendants = true) { }, verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("Déconnexion… (progression enregistrée dans Drive)", style = MaterialTheme.typography.bodyMedium)
+        LinearProgressIndicator(Modifier.fillMaxWidth())
     }
 }
 

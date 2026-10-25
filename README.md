@@ -41,6 +41,13 @@ Parcours du critère de sortie du MVP en mode démo : onglet *En écoute* → �
 jusqu'au bout (2 min 40, ou 1 min 20 à 2,0×) → « Marquer comme écouté » → le dossier passe dans
 `_Ecouté` (Synchro › Historique : « Déplacement Drive ») sans ouvrir Drive.
 
+Builds debug uniquement : en mode démo, simuler une autorisation Google expirée pour voir le bandeau
+« Renouveler » et la notification (le bouton du bandeau rétablit l'accès simulé) :
+
+```bash
+adb shell am broadcast -n com.julienmiquel.audiotheque/.DebugAuthReceiver
+```
+
 ## Configuration Google (vraie bibliothèque)
 
 L'app appelle directement Google Drive API v3 depuis le téléphone : aucun serveur tiers.
@@ -66,11 +73,15 @@ L'app appelle directement Google Drive API v3 depuis le téléphone : aucun serv
 Notes :
 
 - En statut *En test*, Google peut demander de renouveler l'autorisation au bout de quelques jours :
-  l'app affiche alors la notification « Connexion Google à renouveler ».
+  l'app affiche alors une seule fois la notification « Connexion Google à renouveler » et, dans l'app,
+  un bandeau « Autorisation Google Drive à renouveler » au-dessus des onglets. Son bouton
+  **Renouveler** rouvre l'écran d'autorisation Google sans se déconnecter ni rien effacer. L'app
+  n'insiste pas en arrière-plan : les gestes restent en file et partent dès le renouvellement. Une
+  autorisation donnée pour un autre compte est refusée.
 - Une publication sur le Play Store imposerait la vérification Google du champ `drive` (restreint) :
   hors sujet pour un APK personnel (cf. questions ouvertes).
 - Pour enregistrer les livres dans **[Stockage interne]/Audiobooks** comme l'app actuelle, accorder
-  « Accès à tous les fichiers » (Réglages › Stockage, ou Synchro › Dossiers). Sans cette autorisation,
+  « Accès à tous les fichiers » (Réglages › Stockage, ou Synchro › Dossiers synchronisés). Sans cette autorisation,
   les livres vont dans le dossier de l'app (`Android/data/com.julienmiquel.audiotheque/files/Audiobooks`).
 
 ## Architecture
@@ -131,20 +142,23 @@ flowchart LR
 | Spécification | Implémentation |
 | :--- | :--- |
 | Statut = dossier parent ; un geste = un déplacement | `StatusGestures` écrit l'opération en base et le statut « en attente » ; `OperationExecutor` appelle `files.update` (`addParents` / `removeParents`) |
-| Bandeau « Annuler » 10 s | Snackbar `SnackbarDuration.Long` (10 s) après chaque geste, dans [AudiothequeRoot.kt](app/src/main/java/com/julienmiquel/audiotheque/ui/AudiothequeRoot.kt) |
-| Drive fait foi | Flux de modifications : un dossier déplacé ailleurs met à jour le statut (événement « Statut mis à jour depuis Drive ») |
-| Un échec ne modifie pas l'état local | Statut confirmé distinct du statut en attente ; refus définitif → geste abandonné, nouvel essai espacé (30 s, 1 min, 2 min… 1 h) sinon |
-| Seul `_En écoute` descend en entier | `Downloader.plan()` ; Nouveaux : métadonnées (+ 1ʳᵉ piste si « Aperçu ») ; Plus tard 7 j, Écouté 24 h (`Cleaner`, délais réglables) ; archives, méditations, racine : à l'ouverture de l'onglet |
+| Bandeau « Annuler » 10 s | Snackbar `SnackbarDuration.Long` (10 s) après chaque geste ([AudiothequeRoot.kt](app/src/main/java/com/julienmiquel/audiotheque/ui/AudiothequeRoot.kt)). « Annuler » remet le livre dans son dossier de départ et rétablit la progression modifiée par le geste, même si le déplacement était déjà en cours |
+| Drive fait foi | Flux de modifications : un dossier déplacé ailleurs met à jour le statut (« Statut mis à jour depuis Drive ») ; un geste encore en file n'écrase pas ce déplacement : il est abandonné et signalé dans l'historique |
+| Un échec ne modifie pas l'état local | Statut confirmé distinct du statut en attente ; refus définitif → geste abandonné (un « Marquer écouté » refusé ne laisse pas « terminé ») ; nouvel essai espacé (30 s, 1 min, 2 min… 1 h), jamais en boucle si l'autorisation Google est à renouveler |
+| Seul `_En écoute` descend en entier | `Downloader.plan()` ; Nouveaux : métadonnées (+ 1ʳᵉ piste si « Aperçu ») ; Plus tard 7 j, Écouté 24 h ([CleanupPolicy.kt](core/src/main/java/com/julienmiquel/audiotheque/core/model/CleanupPolicy.kt), délais réglables, nettoyage programmé à l'échéance). Rien n'est supprimé avant que Drive ait confirmé le déplacement, ni dans les 10 min qui suivent |
+| Archives, méditations, racine : à l'ouverture | Noms des livres listés à l'inventaire (une requête par dossier, pour que la recherche couvre toute la bibliothèque) ; pistes, durées et pochettes lues à l'ouverture de l'onglet |
 | Inventaire complet à la 1ʳᵉ synchro puis chaque semaine | `LibraryScanner.scan` (`changes.getStartPageToken` / `changes.list` entre-temps) |
-| 6 h, Wi-Fi seul, batterie non faible ; synchro au lancement et à chaque geste | `SyncScheduler` (WorkManager), réglable dans Synchro › Dossiers |
-| 3 téléchargements, reprise, ordre depuis la position, `.part` + taille + md5, espace + 500 Mo | `Downloader` |
+| 6 h, Wi-Fi seul, batterie non faible ; synchro au lancement et à chaque geste | `SyncScheduler` (WorkManager), réglable dans Synchro › Dossiers synchronisés. En « Wi-Fi uniquement », sur réseau mesuré, téléchargements, échantillons audio et pochettes attendent le Wi-Fi : une synchro repart à son retour |
+| 3 téléchargements, reprise, ordre depuis la position, `.part` + taille + md5, espace + 500 Mo | `Downloader` ; les pistes de `_En écoute` sont listées et téléchargées avant les métadonnées du reste de la bibliothèque |
 | Historique 30 jours filtrable par livre | `HistoryLogger`, Synchro › Historique |
-| Lecteur : reprise, chapitres par partie, ±30 s, vitesse 0,8–2,0, minuterie, signets, avancement | [PlayerScreen.kt](app/src/main/java/com/julienmiquel/audiotheque/ui/player/PlayerScreen.kt), `PlaybackService` |
-| Fin du livre : proposer « Marquer comme écouté » sans rien déplacer seul | Dialogue + carte persistante dans le lecteur et la fiche |
-| Progression par utilisateur dans `appDataFolder` | `ProgressSync` : un JSON par livre (`progress-<ID du dossier>.json`), le plus récent l'emporte |
+| Lecteur : reprise, chapitres par partie, ±30 s, vitesse 0,8–2,0, minuterie, signets, avancement | [PlayerScreen.kt](app/src/main/java/com/julienmiquel/audiotheque/ui/player/PlayerScreen.kt), `PlaybackService` ; ouvrir un livre sans l'écouter n'enregistre rien (pas de recul de 5 s cumulé) |
+| Position conservée dans tous les statuts | « Réécouter » repart du début d'un livre fini, garde la position sinon |
+| Fin du livre : proposer « Marquer comme écouté » sans rien déplacer seul | Dialogue + carte persistante dans le lecteur et la fiche (aussi avec la minuterie « fin du chapitre » sur le dernier chapitre) |
+| Progression par utilisateur dans `appDataFolder` | `ProgressSync` : un JSON par livre (`progress-<ID du dossier>.json`), le plus récent l'emporte ; dates de Drive (pas l'horloge du téléphone) |
 | Durée exacte après téléchargement, sinon estimée par le débit | `MetadataProber.probe` (premiers Ko de la 1ʳᵉ piste) puis `MediaMetadataRetriever` |
 | Voix lue dans les tags ID3 | `Id3Tags.narrator()` (TXXX, « lu par », compositeur) |
-| Accessibilité | Descriptions TalkBack, rôles et états (interrupteurs, curseurs), titres de section, tailles en `sp`, palettes M3 contrastées |
+| Badge doublon | Même titre, sauf si les deux auteurs sont connus et diffèrent |
+| Accessibilité | Descriptions TalkBack (interrupteurs, badge de synchro, boutons de vitesse), erreurs signalées en toutes lettres, titres de section, tailles en `sp`, palettes M3 contrastées |
 
 ### Réponses retenues aux questions ouvertes (modifiables)
 
@@ -155,7 +169,8 @@ flowchart LR
 | Dossiers qui ne sont pas des livres | Fiche livre › « Ce n'est pas un livre (masquer) », ou « Déplacer vers… » `_archives` |
 | Délais de nettoyage | 7 jours et 24 h par défaut, réglables (Réglages › Nettoyage) |
 | Play Store ou APK personnel | APK personnel, accès Drive en mode test (voir ci-dessus) |
-| *Les guerriers de l'hiver* | Sa progression (46 %) est conservée ; « Déplacer vers… » `_A écouter plus tard` ou « Réécouter » depuis la fiche |
+| *Les guerriers de l'hiver* | Sa progression (46 %) est conservée ; « Déplacer vers… » `_A écouter plus tard` ou « Réécouter » (qui reprend à 46 %) depuis la fiche |
+| Déconnexion | La progression est d'abord écrite dans l'espace caché du compte, puis la bibliothèque locale et les pistes sont effacées ; progression (par compte) et signets restent sur le téléphone |
 
 ## Tests
 
@@ -163,12 +178,14 @@ flowchart LR
 ./gradlew testDebugUnitTest
 ```
 
+68 tests unitaires (JUnit, Robolectric, MockWebServer) :
+
 | Suite | Couverture |
 | :--- | :--- |
 | `core` · `FolderNameParserTest`, `TrackNameParserTest` | Toutes les anomalies de noms de la spécification, motif « 091_P4_04_… », ordre naturel |
 | `core` · `Mp3ProbeTest`, `ProgressMathTest` | Tags ID3 et pochette d'un vrai mp3, durée par le débit, pourcentage et temps restant, formats français |
-| `library` · `StatusGesturesTest` | Gestes mis en file, Annuler, gestes hors ligne, position gardée, corrections, recherche, « Lu par », doublons |
-| `sync` · `SyncEngineTest` | Moteur de bout en bout sur le Drive simulé : inventaire, téléchargements vérifiés, Marquer écouté → `_Ecouté` puis nettoyage 24 h, Drive fait foi, hors ligne, refus 403, espace insuffisant, reprise Range, progression appData |
+| `library` · `StatusGesturesTest` | Gestes mis en file, « Annuler » (dossier de départ, progression rétablie), gestes hors ligne, position gardée, « Réécouter » d'un livre pas fini, corrections, recherche, « Lu par », doublons titre + auteur |
+| `sync` · `SyncEngineTest` | Moteur de bout en bout sur le Drive simulé : inventaire, téléchargements vérifiés, Marquer écouté → `_Ecouté` puis nettoyage 24 h, rien de supprimé avant confirmation de Drive (+10 min), Drive fait foi (y compris face à un geste en file), « Annuler » pendant un déplacement, hors ligne, refus 403, autorisation expirée sans boucle (bandeau « Renouveler », geste envoyé après renouvellement), Wi-Fi uniquement sur réseau mesuré, espace insuffisant, reprise Range, livre en cours de lecture jamais retiré, dossier de statut jamais pris pour un livre, progression appData (fichier le plus récent) |
 | `sync` · `RestDriveServiceTest` | Chaque appel du tableau Drive API v3 contre un serveur simulé, jeton renouvelé, limites de débit |
 | `player` · `PlayerLogicTest` | Identifiants média, chapitres par partie, minuterie, bornes de vitesse |
 

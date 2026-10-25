@@ -16,8 +16,10 @@ import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayAuthor
 import com.julienmiquel.audiotheque.core.model.displayNarrator
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
+import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
@@ -49,6 +51,8 @@ data class LibraryItem(
     val pendingSync: Boolean,
     /** Pochette : fichier local ou URL Google Books. */
     val cover: String?,
+    /** Clé de tri alphabétique, calculée une fois. */
+    val sortKey: String = TextNormalizer.key(title),
 ) {
     val id: String get() = book.driveId
     val isZip: Boolean get() = book.kind == BookKind.ZIP
@@ -61,8 +65,9 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
 
     private val account: Flow<String> = settings.settings.map { it.accountKey }.distinctUntilChanged()
 
+    /** Bibliothèque affichée. Les écritures sans effet visible (avancement d'un téléchargement) sont ignorées. */
     fun observeLibrary(): Flow<List<LibraryItem>> =
-        account.flatMapLatest { db.bookDao().observeLibrary(it) }.map { rows -> rows.map(::toItem) }
+        account.flatMapLatest { db.bookDao().observeLibrary(it) }.distinctUntilChanged().map { rows -> rows.map(::toItem) }
 
     fun observeItem(bookId: String): Flow<LibraryItem?> =
         account.flatMapLatest { db.bookDao().observeRow(bookId, it) }.map { it?.let(::toItem) }
@@ -83,7 +88,7 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
     suspend fun tracks(bookId: String): List<TrackEntity> = db.trackDao().forBook(bookId)
 
     /** Autres exemplaires du même livre (doublons). */
-    suspend fun duplicatesOf(book: BookEntity): List<BookEntity> = db.bookDao().duplicatesOf(book.normalizedKey, book.driveId)
+    suspend fun duplicatesOf(book: BookEntity): List<BookEntity> = db.bookDao().duplicatesOf(book.normalizedKey, book.authorKey, book.driveId)
 
     suspend fun addBookmark(bookId: String, track: TrackEntity, positionMs: Long, note: String, clock: Clock = Clock.SYSTEM): Long =
         db.bookmarkDao().insert(
@@ -152,10 +157,11 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
             includeArchives: Boolean = true,
         ): List<LibraryItem> {
             val q = query.trim()
+            val narratorKey = narrator?.let(TextNormalizer::key)
             return items.asSequence()
                 .filter { showHidden || !it.book.hidden }
                 .filter { if (q.isNotEmpty()) includeArchives || it.status != BookStatus.ARCHIVED else status == null || it.status == status }
-                .filter { narrator == null || (it.narrator != null && TextNormalizer.key(it.narrator) == TextNormalizer.key(narrator)) }
+                .filter { narratorKey == null || (it.narrator != null && TextNormalizer.key(it.narrator) == narratorKey) }
                 .filter {
                     q.isEmpty() || TextNormalizer.matches(it.title, q) || TextNormalizer.matches(it.author, q) ||
                         TextNormalizer.matches(it.narrator, q) || TextNormalizer.matches(it.book.name, q)
@@ -169,7 +175,7 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
                 .thenByDescending { it.book.effectiveStatusChangedAt }
             BookStatus.NEW -> compareByDescending { it.book.addedAt }
             BookStatus.LATER, BookStatus.DONE -> compareByDescending { it.book.effectiveStatusChangedAt }
-            else -> compareBy { TextNormalizer.key(it.title) }
+            else -> compareBy { it.sortKey }
         }
     }
 }
@@ -200,9 +206,26 @@ enum class Gesture(val label: String, val target: BookStatus) {
     }
 }
 
-/** Résultat d'un geste : de quoi proposer « Annuler » pendant 10 s. */
-data class MoveResult(val bookId: String, val title: String, val from: BookStatus, val to: BookStatus) {
-    val changed: Boolean get() = from != to
+/**
+ * Résultat d'un geste : de quoi proposer « Annuler » pendant 10 s, c'est-à-dire remettre le livre
+ * dans son dossier de départ et rétablir la progression modifiée par le geste.
+ */
+data class MoveResult(
+    val bookId: String,
+    val title: String,
+    val from: BookStatus,
+    val to: BookStatus,
+    /** Dossier Drive (effectif) avant le geste : « Annuler » y remet le livre. */
+    val fromParentId: String,
+    val toParentId: String,
+    /** Geste à l'origine du déplacement (null : « Déplacer vers… » ou « Annuler »). */
+    val gesture: Gesture? = null,
+    /** Progression avant le geste, rétablie par « Annuler ». */
+    val previousProgress: ProgressEntity? = null,
+    /** Heure du geste : une position n'est rétablie que si rien ne l'a modifiée depuis. */
+    val appliedAt: Long = 0,
+) {
+    val changed: Boolean get() = fromParentId != toParentId
 }
 
 /**
@@ -220,32 +243,37 @@ class StatusGestures(
     private val ops = db.pendingOperationDao()
 
     suspend fun apply(bookId: String, gesture: Gesture): MoveResult? {
-        val result = moveTo(bookId, gesture.target) ?: return null
         val account = settings.current().accountKey
         val progressDao = db.progressDao()
-        val progress = progressDao.get(bookId, account)
+        val previous = progressDao.get(bookId, account)
+        val moved = moveTo(bookId, gesture.target) ?: return null
         val now = clock.now()
         when (gesture) {
-            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> progress?.let {
+            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> previous?.let {
                 progressDao.upsert(it.copy(setAsideAtPercent = it.percent, updatedAt = now, dirty = true))
             }
             Gesture.MARQUER_ECOUTE -> progressDao.upsert(
-                (progress ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
+                (previous ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
                     .copy(finished = true, updatedAt = now, dirty = true),
             )
-            Gesture.REECOUTER -> progressDao.upsert(
-                ProgressEntity(
-                    bookId = bookId,
-                    account = account,
-                    speed = progress?.speed ?: 1f,
-                    lastListenedAt = progress?.lastListenedAt,
-                    updatedAt = now,
-                    dirty = true,
-                ),
-            )
+            // Réécouter repart du début d'un livre fini ; un livre pas fini garde sa position.
+            Gesture.REECOUTER -> previous?.takeIf { it.finished || it.percent >= FINISHED_PERCENT }?.let {
+                progressDao.upsert(
+                    it.copy(
+                        trackId = null,
+                        trackIndex = 0,
+                        positionMs = 0,
+                        percent = 0f,
+                        finished = false,
+                        setAsideAtPercent = null,
+                        updatedAt = now,
+                        dirty = true,
+                    ),
+                )
+            }
             else -> Unit
         }
-        return result
+        return moved.copy(gesture = gesture, previousProgress = previous, appliedAt = now)
     }
 
     /** Déplacement vers n'importe quel statut (fiche livre, « Annuler »). */
@@ -255,6 +283,7 @@ class StatusGestures(
         val result = db.withTransaction {
             val book = books.get(bookId) ?: return@withTransaction null
             val from = book.effectiveStatus
+            val fromParentId = book.effectiveParentId
             val existing = ops.latestForBook(bookId)
             val now = clock.now()
             if (existing != null) {
@@ -269,11 +298,11 @@ class StatusGestures(
                         lastError = null,
                     ),
                 )
-                if (targetPair.driveFolderId == book.parentId) {
-                    books.setPending(bookId, null, null, null)
-                } else {
-                    books.setPending(bookId, targetPair.status, targetPair.driveFolderId, now)
-                }
+                // Retour au dossier confirmé : le statut reste « en attente » jusqu'à ce que le moteur
+                // ait vérifié Drive (le déplacement aller est peut-être en cours) ; rien n'est nettoyé
+                // d'ici là et l'ordre de la liste ne change pas.
+                val back = targetPair.driveFolderId == book.parentId
+                books.setPending(bookId, targetPair.status, targetPair.driveFolderId, if (back) book.statusChangedAt else now)
             } else if (targetPair.driveFolderId == book.parentId) {
                 books.setPending(bookId, null, null, null)
             } else {
@@ -289,14 +318,53 @@ class StatusGestures(
                 )
                 books.setPending(bookId, targetPair.status, targetPair.driveFolderId, now)
             }
-            MoveResult(bookId, book.displayTitle, from, targetPair.status)
+            MoveResult(bookId, book.displayTitle, from, targetPair.status, fromParentId, targetPair.driveFolderId)
         } ?: return null
         if (result.changed) sync.requestSync(SyncTrigger.STATUS_CHANGE)
         return result
     }
 
-    /** « Annuler » (bandeau affiché 10 s après un geste). */
-    suspend fun undo(result: MoveResult): MoveResult? = moveTo(result.bookId, result.from)
+    /**
+     * « Annuler » (bandeau affiché 10 s après un geste) : le livre retourne dans son dossier de
+     * départ (pas seulement le premier dossier du même statut) et la progression modifiée par le
+     * geste est rétablie.
+     */
+    suspend fun undo(result: MoveResult): MoveResult? {
+        val back = db.syncPairDao().forFolder(result.fromParentId)
+        val undone = if (back != null) moveTo(result.bookId, back.status, back.id) else moveTo(result.bookId, result.from)
+        restoreProgress(result)
+        return undone
+    }
+
+    private suspend fun restoreProgress(result: MoveResult) {
+        val gesture = result.gesture ?: return
+        val dao = db.progressDao()
+        val current = dao.get(result.bookId, settings.current().accountKey) ?: return
+        val previous = result.previousProgress
+        val restored = when (gesture) {
+            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> current.copy(setAsideAtPercent = previous?.setAsideAtPercent)
+            Gesture.MARQUER_ECOUTE -> current.copy(finished = previous?.finished ?: false)
+            Gesture.REECOUTER -> {
+                // Position remise seulement si rien ne l'a changée depuis (lecture lancée entre-temps).
+                if (previous == null || current.updatedAt != result.appliedAt) return
+                current.copy(
+                    trackId = previous.trackId,
+                    trackIndex = previous.trackIndex,
+                    positionMs = previous.positionMs,
+                    percent = previous.percent,
+                    finished = previous.finished,
+                    setAsideAtPercent = previous.setAsideAtPercent,
+                )
+            }
+            else -> return
+        }
+        if (restored != current) dao.upsert(restored.copy(updatedAt = clock.now(), dirty = true))
+    }
+
+    companion object {
+        /** Au-delà, un livre est considéré comme fini (Réécouter repart du début). */
+        const val FINISHED_PERCENT = 99f
+    }
 }
 
 /** Corrections de titre, d'auteur et de voix, stockées par l'app (le dossier n'est pas renommé). */
@@ -314,7 +382,8 @@ class BookEditor(private val db: AppDatabase) {
         }
         val automaticNarrator = book.tagNarrator ?: book.parsedNarrator ?: ""
         val customNarrator = if (n == automaticNarrator) null else n
-        db.bookDao().updateCorrections(bookId, customTitle, customAuthor, customNarrator, true, TextNormalizer.key(t))
+        val shownAuthor = customAuthor ?: book.parsedAuthor
+        db.bookDao().updateCorrections(bookId, customTitle, customAuthor, customNarrator, true, TextNormalizer.key(t), TextNormalizer.keyOrNull(shownAuthor))
     }
 
     /** Accepte le découpage proposé tel quel. */
@@ -327,6 +396,7 @@ class BookEditor(private val db: AppDatabase) {
             book.customNarrator,
             true,
             TextNormalizer.key(book.displayTitle),
+            book.expectedAuthorKey,
         )
     }
 

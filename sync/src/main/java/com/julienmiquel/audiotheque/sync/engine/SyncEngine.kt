@@ -11,7 +11,9 @@ import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
+import com.julienmiquel.audiotheque.sync.drive.DriveAbout
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
+import com.julienmiquel.audiotheque.sync.drive.DriveFile
 import com.julienmiquel.audiotheque.sync.drive.DriveService
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -56,6 +58,10 @@ data class SyncOutcome(
     val needsAuth: Boolean = false,
     /** Prochain essai de la file d'opérations, s'il reste des déplacements en attente. */
     val retryAtMs: Long? = null,
+    /** Téléchargements ou métadonnées reportés : une synchro est à faire au retour du Wi-Fi. */
+    val waitingForWifi: Boolean = false,
+    /** Prochaine échéance de nettoyage (piste à supprimer du téléphone), ou null. */
+    val nextCleanupAt: Long? = null,
 )
 
 /** Service Drive du compte courant : réel, ou simulé en mode démo ; null si personne n'est connecté. */
@@ -65,8 +71,9 @@ fun interface DriveProvider {
 
 /**
  * Moteur de synchro : seul composant qui parle à Drive. Une exécution enchaîne la file de
- * déplacements, la détection des changements, les métadonnées, les téléchargements de
- * _En écoute, le nettoyage selon le statut et la progression dans l'espace caché.
+ * déplacements, la détection des changements, les pistes de _En écoute (listées puis
+ * téléchargées en priorité), les métadonnées du reste de la bibliothèque, le nettoyage selon le
+ * statut et la progression dans l'espace caché.
  */
 class SyncEngine(
     private val db: AppDatabase,
@@ -91,7 +98,7 @@ class SyncEngine(
     private val history = HistoryLogger(db, clock)
     private val localFiles = LocalFiles(db, storage)
     private val executor = OperationExecutor(db, history, clock)
-    private val scanner = LibraryScanner(db, settings, history, localFiles, storage, clock)
+    private val scanner = LibraryScanner(db, settings, history, localFiles, storage, clock, isBookInUse)
     private val prober = MetadataProber(db, history, localFiles, storage, clock)
     private val downloader = Downloader(db, settings, storage, history, transfers, inspector, clock)
     private val cleaner = Cleaner(db, settings, localFiles, storage, history, clock, isBookInUse)
@@ -103,6 +110,11 @@ class SyncEngine(
 
     @Volatile
     private var currentJob: Job? = null
+
+    /** Début de la dernière synchro : une demande antérieure est déjà satisfaite. */
+    @Volatile
+    var lastRunStartedAt: Long = 0L
+        private set
 
     val isRunning: Boolean get() = _status.value.running
 
@@ -123,12 +135,28 @@ class SyncEngine(
     }
 
     /** Vérifie un dossier Drive avant d'en faire une paire synchronisée (nom réel, type dossier). */
-    suspend fun lookupFolder(folderId: String): Result<com.julienmiquel.audiotheque.sync.drive.DriveFile> = runCatching {
+    suspend fun lookupFolder(folderId: String): Result<DriveFile> = try {
         val drive = driveProvider.get() ?: throw DriveAuthException("Aucun compte connecté")
         val file = drive.getFile(folderId)
         require(file.isFolder) { "Ce lien ne désigne pas un dossier Drive" }
         require(!file.trashed) { "Ce dossier est dans la corbeille" }
-        file
+        Result.success(file)
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        Result.failure(e)
+    }
+
+    /**
+     * about.get au moment de la connexion : adresse et nom du compte qui vient d'accorder l'accès
+     * à Drive, quand l'autorisation ne les donne pas. Seul appel Drive fait hors d'une synchro.
+     */
+    suspend fun identifyAccount(drive: DriveService): DriveAbout? = try {
+        drive.about()
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: Exception) {
+        null
     }
 
     /** Retire une paire : ses livres quittent la bibliothèque locale ; rien n'est supprimé dans Drive. */
@@ -146,6 +174,7 @@ class SyncEngine(
         forceFull: Boolean = false,
         onDownloadsStart: suspend () -> Unit = {},
     ): SyncOutcome = mutex.withLock {
+        lastRunStartedAt = clock.now()
         var currentTrigger = trigger
         var outcome: SyncOutcome
         var passes = 0
@@ -157,12 +186,57 @@ class SyncEngine(
         } while (rerunRequested.get() && passes < 5 &&
             outcome.result != SyncResult.CANCELLED && outcome.result != SyncResult.FAILED
         )
-        outcome.copy(retryAtMs = db.pendingOperationDao().nextAttemptAt()?.takeIf { db.pendingOperationDao().all().isNotEmpty() })
+        // Nouvel essai des déplacements restés en file, espacé (au moins 30 s). Aucun si
+        // l'autorisation Google est à renouveler ou si l'utilisateur vient d'annuler.
+        val retryAt = if (outcome.needsAuth || outcome.result == SyncResult.CANCELLED) {
+            null
+        } else {
+            db.pendingOperationDao().nextAttemptAt()?.coerceAtLeast(clock.now() + MIN_RETRY_DELAY_MS)
+        }
+        outcome.copy(retryAtMs = retryAt, nextCleanupAt = cleaner.nextDeadline())
+    }
+
+    /**
+     * Nettoyage à l'échéance d'un délai (7 jours, 24 h…), sans réseau. Sans effet si une synchro
+     * tourne : elle nettoie elle-même. Retourne l'échéance suivante.
+     */
+    suspend fun cleanupNow(): Long? {
+        if (!mutex.tryLock()) return null
+        return try {
+            cleaner.run(null)
+            cleaner.nextDeadline()
+        } finally {
+            mutex.unlock()
+        }
+    }
+
+    /** Déconnexion : attend la fin de la synchro en cours (annulée au préalable). */
+    suspend fun awaitIdle() {
+        mutex.withLock { }
+    }
+
+    /**
+     * Déconnexion : dernière écriture de la progression dans l'espace caché du compte, une fois
+     * la synchro en cours terminée. Retourne faux si elle n'a pas pu être faite.
+     */
+    suspend fun pushProgressBeforeSignOut(): Boolean = mutex.withLock {
+        val s = settings.current()
+        if (s.demoMode || s.accountKey == Accounts.LOCAL) return@withLock true
+        val drive = driveProvider.get() ?: return@withLock false
+        try {
+            progressSync.run(drive, s.accountKey)
+            true
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            false
+        }
     }
 
     /**
      * Métadonnées d'un dossier ouvert dans l'app (archives, méditations, racine). Léger et
-     * indépendant d'une synchro en cours.
+     * indépendant d'une synchro en cours : les pistes sont fusionnées avec la base dans une
+     * transaction, sans écraser ce qu'une synchro écrit au même moment.
      */
     suspend fun refreshPair(pairId: Long): SyncOutcome {
         val pair = db.syncPairDao().get(pairId) ?: return SyncOutcome(SyncResult.SUCCESS)
@@ -171,7 +245,7 @@ class SyncEngine(
         return try {
             val ctx = RunContext(runId = 0, trigger = SyncTrigger.FOLDER_OPEN, startedAt = clock.now())
             scanner.listPair(drive, pair, db.syncPairDao().all(), ctx)
-            prober.run(drive, null, onlyPair = pair)
+            prober.run(drive, null, onlyPair = pair, allowContent = contentAllowed())
             SyncOutcome(SyncResult.SUCCESS)
         } catch (e: CancellationException) {
             throw e
@@ -183,6 +257,9 @@ class SyncEngine(
             _refreshingPairs.update { it - pairId }
         }
     }
+
+    /** Contenu des fichiers (pistes, échantillons, pochettes) : pas sur réseau mesuré en mode « Wi-Fi uniquement ». */
+    private suspend fun contentAllowed(): Boolean = !settings.current().wifiOnly || network.isUnmetered()
 
     private suspend fun runGuarded(trigger: SyncTrigger, block: suspend (RunContext, DriveService) -> Unit): SyncOutcome {
         val s = settings.current()
@@ -233,8 +310,17 @@ class SyncEngine(
             history.log(SyncEventType.ERROR, path = "Synchro", result = EventResult.ERROR, message = message, runId = runId)
             ctx.errors.incrementAndGet()
         }
+        // Autorisation Google à renouveler : affichée dans l'app jusqu'à une synchro réussie.
+        val authRequired = when {
+            needsAuth -> true
+            result == SyncResult.SUCCESS || result == SyncResult.PARTIAL -> false
+            else -> null
+        }
+        if (authRequired != null && settings.currentSyncState().authRequired != authRequired) {
+            settings.updateSyncState { it.copy(authRequired = authRequired) }
+        }
         finish(ctx, result, message ?: ctx.note)
-        return SyncOutcome(result, message, needsAuth)
+        return SyncOutcome(result, message, needsAuth, waitingForWifi = ctx.waitingForWifi && result != SyncResult.CANCELLED)
     }
 
     private suspend fun finish(ctx: RunContext, result: SyncResult, message: String?) {
@@ -277,6 +363,8 @@ class SyncEngine(
         db.trackDao().resetInterruptedDownloads()
         history.purge()
         operationsPending.set(false)
+        val s = settings.current()
+        val wifiRuleOk = { !s.wifiOnly || network.isUnmetered() }
 
         phase(SyncPhase.OPERATIONS)
         executor.flush(drive, ctx)
@@ -285,29 +373,51 @@ class SyncEngine(
         scanner.scan(drive, ctx, forceFull) { detail(it) }
         flushIfRequested(drive, ctx)
 
+        // _En écoute d'abord : ses pistes sont listées puis téléchargées avant les métadonnées
+        // du reste de la bibliothèque, pour écouter au plus vite.
         phase(SyncPhase.METADATA)
-        prober.run(drive, ctx) { detail(it) }
+        prober.run(drive, ctx, scope = ProbeScope.DOWNLOADS, allowContent = wifiRuleOk()) { detail(it) }
         flushIfRequested(drive, ctx)
 
-        val s = settings.current()
+        var networkLost = false
         val planned = downloader.plan()
         if (planned.isNotEmpty()) {
-            if (s.wifiOnly && !network.isUnmetered()) {
+            if (!wifiRuleOk()) {
                 ctx.note = "Téléchargements en attente du Wi-Fi (${planned.size} pistes)"
+                ctx.waitingForWifi = true
             } else {
                 onDownloadsStart()
                 phase(SyncPhase.DOWNLOADS)
-                downloader.run(drive, ctx) { remaining ->
+                val stop = downloader.run(drive, ctx, canContinue = wifiRuleOk) { remaining ->
                     _status.update { it.copy(queuedTracks = remaining) }
                     // Geste fait pendant les téléchargements : déplacement Drive sans attendre.
                     flushIfRequested(drive, ctx)
                 }
+                when (stop) {
+                    DownloadStop.WAITING_FOR_WIFI -> {
+                        ctx.note = "Téléchargements en attente du Wi-Fi"
+                        ctx.waitingForWifi = true
+                    }
+                    DownloadStop.NETWORK_LOST -> {
+                        ctx.note = "Réseau perdu : téléchargements à reprendre"
+                        networkLost = true
+                    }
+                    DownloadStop.DONE -> Unit
+                }
             }
         }
-        executor.flush(drive, ctx)
+
+        if (!networkLost) {
+            phase(SyncPhase.METADATA)
+            if (prober.run(drive, ctx, scope = ProbeScope.LIBRARY, allowContent = wifiRuleOk()) { detail(it) }) {
+                ctx.waitingForWifi = true
+            }
+            executor.flush(drive, ctx)
+        }
 
         phase(SyncPhase.CLEANUP)
         cleaner.run(ctx)
+        if (networkLost) return
 
         if (s.accountKey != Accounts.LOCAL) {
             phase(SyncPhase.PROGRESS)
@@ -315,13 +425,23 @@ class SyncEngine(
         }
 
         phase(SyncPhase.FINISHING)
-        runCatching { drive.about() }.getOrNull()?.let { about ->
+        try {
+            val about = drive.about()
             settings.updateSyncState {
                 it.copy(driveQuotaUsed = about.quotaUsage, driveQuotaLimit = about.quotaLimit, quotaUpdatedAt = clock.now())
             }
             if (!s.demoMode && about.email != null && s.accountEmail.isNullOrBlank()) {
                 settings.update { it.copy(accountEmail = about.email, accountName = about.displayName) }
             }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // Quota indisponible : sans conséquence, il sera relu à la prochaine synchro.
         }
+    }
+
+    companion object {
+        /** Délai minimal avant un nouvel essai automatique de la file d'opérations. */
+        const val MIN_RETRY_DELAY_MS = 30_000L
     }
 }

@@ -51,8 +51,14 @@ data class BookEntity(
     /** Voix lue dans les tags ID3. */
     val tagNarrator: String? = null,
     val titleConfirmed: Boolean = false,
-    /** Clé normalisée titre + auteur pour repérer les doublons. */
+    /** Clé normalisée du titre affiché, pour repérer les doublons. */
     val normalizedKey: String,
+    /**
+     * Clé normalisée de l'auteur affiché. Deux livres de même titre sont des doublons, sauf si
+     * leurs auteurs sont connus tous les deux et diffèrent : un exemplaire dont le nom de dossier
+     * ne donne pas l'auteur reste un doublon probable.
+     */
+    val authorKey: String? = null,
     val durationMs: Long? = null,
     val durationExact: Boolean = false,
     val sizeBytes: Long = 0,

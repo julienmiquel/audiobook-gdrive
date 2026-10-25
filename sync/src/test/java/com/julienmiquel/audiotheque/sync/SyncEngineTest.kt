@@ -10,6 +10,7 @@ import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults as D
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.SyncResult
@@ -21,6 +22,7 @@ import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.sync.demo.DemoLibrary
 import com.julienmiquel.audiotheque.sync.demo.FakeDriveService
 import com.julienmiquel.audiotheque.sync.drive.DriveContent
+import com.julienmiquel.audiotheque.sync.drive.DriveFile
 import com.julienmiquel.audiotheque.sync.drive.DriveService
 import com.julienmiquel.audiotheque.sync.engine.AudioFileInfo
 import com.julienmiquel.audiotheque.sync.engine.AudioFileInspector
@@ -64,14 +66,28 @@ class SyncEngineTest {
     private lateinit var root: File
     private var now = 1_800_000_000_000L
     private var free = Long.MAX_VALUE
+    private var unmetered = true
+    private var inUse: String? = null
     private val clock = Clock { now }
 
     /** Enregistre les plages demandées (reprise de transfert par en-tête Range). */
     class RecordingDrive(private val inner: FakeDriveService) : DriveService by inner {
         val opened: MutableList<Pair<String, Long>> = Collections.synchronizedList(mutableListOf())
+
+        /** Exécuté pendant l'appel de déplacement (geste fait pendant qu'il est en cours). */
+        var beforeMove: (suspend (String) -> Unit)? = null
+
         override suspend fun openContent(fileId: String, fromByte: Long, toByteInclusive: Long?): DriveContent {
             opened += fileId to fromByte
             return inner.openContent(fileId, fromByte, toByteInclusive)
+        }
+
+        override suspend fun move(fileId: String, addParent: String, removeParents: List<String>): DriveFile {
+            beforeMove?.let { hook ->
+                beforeMove = null
+                hook(fileId)
+            }
+            return inner.move(fileId, addParent, removeParents)
         }
     }
 
@@ -98,9 +114,9 @@ class SyncEngineTest {
         drive = RecordingDrive(fake)
         val network = object : NetworkStatus {
             override fun isConnected() = true
-            override fun isUnmetered() = true
+            override fun isUnmetered() = unmetered
         }
-        engine = SyncEngine(db, settings, { drive }, storage, network, inspector, clock, "test", isBookInUse = { false })
+        engine = SyncEngine(db, settings, { drive }, storage, network, inspector, clock, "test", isBookInUse = { it == inUse })
     }
 
     @After
@@ -333,5 +349,169 @@ class SyncEngineTest {
         assertThat(archived).isNotEmpty()
         archived.forEach { assertThat(it.trackCount).isEqualTo(3) }
         assertThat(db.syncPairDao().get(pair.id)!!.lastInventoryAt).isNotNull()
+    }
+
+    @Test
+    fun `nettoyage - rien n'est supprimé avant que Drive confirme le déplacement, puis 10 min de grâce`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(DemoLibrary.civilisations.name)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+
+        // Archiver, mais Drive refuse passagèrement le déplacement : rien ne bouge sur le téléphone.
+        fake.busyMoves += civ.driveId
+        queueMove(civ, BookStatus.ARCHIVED, D.ARCHIVES_ID)
+        val busy = engine.sync(SyncTrigger.STATUS_CHANGE)
+        assertThat(db.bookDao().get(civ.driveId)!!.status).isEqualTo(BookStatus.IN_PROGRESS)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(busy.retryAtMs).isAtLeast(now + SyncEngine.MIN_RETRY_DELAY_MS)
+
+        // Déplacement fait : les pistes restent pendant le délai de grâce…
+        fake.busyMoves.clear()
+        now += 31_000
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+        assertThat(db.bookDao().get(civ.driveId)!!.status).isEqualTo(BookStatus.ARCHIVED)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+
+        // … puis sont supprimées.
+        now += CleanupPolicy.GRACE_MS
+        engine.sync(SyncTrigger.PERIODIC)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
+    }
+
+    @Test
+    fun `Drive fait foi - un geste en file ne défait pas un déplacement fait entre-temps dans Drive`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val police = book("Police - Hugo Boris")
+        queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID) // geste fait hors ligne
+        fake.simulateExternalMove(police.driveId, D.DONE_ID) // déplacé depuis le web entre-temps
+
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        assertThat(fake.getFile(police.driveId).parents).containsExactly(D.DONE_ID)
+        val b = db.bookDao().get(police.driveId)!!
+        assertThat(b.status).isEqualTo(BookStatus.DONE)
+        assertThat(b.pendingStatus).isNull()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        assertThat(events().any { it.type == SyncEventType.ERROR && it.message.orEmpty().contains("Drive fait foi") }).isTrue()
+    }
+
+    @Test
+    fun `Annuler pendant le déplacement - le livre revient et le retour est journalisé`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val police = book("Police - Hugo Boris")
+        queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
+        // « Annuler » pendant l'appel à Drive : la cible de l'opération redevient _Nouveaux.
+        drive.beforeMove = { id ->
+            val op = db.pendingOperationDao().latestForBook(id)!!
+            db.pendingOperationDao().update(op.copy(toParentId = D.NEW_ID, toStatus = BookStatus.NEW, createdAt = now))
+            db.bookDao().setPending(id, BookStatus.NEW, D.NEW_ID, police.statusChangedAt)
+        }
+
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        assertThat(fake.getFile(police.driveId).parents).containsExactly(D.NEW_ID)
+        val b = db.bookDao().get(police.driveId)!!
+        assertThat(b.status).isEqualTo(BookStatus.NEW)
+        assertThat(b.pendingStatus).isNull()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        // Aller puis retour, tous deux dans l'historique ; jamais téléchargé entre-temps.
+        assertThat(events().count { it.type == SyncEventType.DRIVE_MOVE && it.bookId == police.driveId }).isEqualTo(2)
+        assertThat(db.trackDao().presentCount(police.driveId)).isEqualTo(0)
+    }
+
+    @Test
+    fun `autorisation expirée - le geste est gardé, sans nouvel essai automatique en boucle`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val police = book("Police - Hugo Boris")
+        queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
+        fake.authExpired = true
+
+        val outcome = engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        assertThat(outcome.result).isEqualTo(SyncResult.FAILED)
+        assertThat(outcome.needsAuth).isTrue()
+        assertThat(outcome.retryAtMs).isNull()
+        assertThat(db.bookDao().get(police.driveId)!!.pendingStatus).isEqualTo(BookStatus.IN_PROGRESS)
+        // Bandeau « Renouveler » dans l'app.
+        assertThat(settings.currentSyncState().authRequired).isTrue()
+
+        // Autorisation renouvelée : la synchro suivante déplace le dossier et retire le bandeau.
+        fake.authExpired = false
+        val renewed = engine.sync(SyncTrigger.MANUAL)
+
+        assertThat(renewed.result).isEqualTo(SyncResult.SUCCESS)
+        assertThat(settings.currentSyncState().authRequired).isFalse()
+        assertThat(db.bookDao().get(police.driveId)!!.pendingStatus).isNull()
+        assertThat(db.bookDao().get(police.driveId)!!.status).isEqualTo(BookStatus.IN_PROGRESS)
+    }
+
+    @Test
+    fun `progression - deux fichiers pour un même livre, le plus récent l'emporte`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val police = book("Police - Hugo Boris")
+        fun json(position: Long, updatedAt: Long) = ProgressJson.encode(
+            ProgressJson(bookId = police.driveId, trackIndex = 1, positionMs = position, percent = 40f, updatedAt = updatedAt, device = "autre"),
+        )
+        // Créés par deux téléphones : le plus récent d'abord, l'ancien ensuite.
+        val t0 = now
+        now = t0 + 60_000
+        fake.createAppData(ProgressJson.fileName(police.driveId), json(77_000, now))
+        now = t0
+        fake.createAppData(ProgressJson.fileName(police.driveId), json(11_000, now))
+        now = t0 + 120_000
+
+        engine.sync(SyncTrigger.MANUAL)
+
+        val p = db.progressDao().get(police.driveId, Accounts.DEMO)!!
+        assertThat(p.positionMs).isEqualTo(77_000)
+        assertThat(p.dirty).isFalse()
+    }
+
+    @Test
+    fun `paire retirée - le dossier _meditations ne devient pas un livre`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val meditations = db.syncPairDao().all().single { it.driveFolderId == D.MEDITATIONS_ID }
+        engine.removePair(meditations.id)
+
+        engine.sync(SyncTrigger.MANUAL, forceFull = true)
+
+        assertThat(db.bookDao().all().none { it.driveId == D.MEDITATIONS_ID || it.name.startsWith("_") }).isTrue()
+    }
+
+    @Test
+    fun `Wi-Fi uniquement sur réseau mesuré - transferts reportés, repris au retour du Wi-Fi`() = runBlocking<Unit> {
+        unmetered = false
+        val metered = engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(DemoLibrary.civilisations.name)
+        assertThat(db.trackDao().forBook(civ.driveId)).hasSize(10) // pistes listées quand même
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
+        assertThat(metered.waitingForWifi).isTrue()
+        // Ni échantillon audio ni pochette sur réseau mesuré.
+        assertThat(book("Police - Hugo Boris").probedAt).isNull()
+        assertThat(book("Police - Hugo Boris").coverPath).isNull()
+
+        unmetered = true
+        val wifi = engine.sync(SyncTrigger.WIFI)
+        assertThat(wifi.waitingForWifi).isFalse()
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(book("Police - Hugo Boris").durationMs).isNotNull()
+        assertThat(book("Police - Hugo Boris").coverPath).isNotNull()
+    }
+
+    @Test
+    fun `livre en cours de lecture - retiré de la bibliothèque seulement après l'écoute`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(DemoLibrary.civilisations.name)
+        inUse = civ.driveId
+        fake.simulateExternalMove(civ.driveId, "dossier-hors-bibliotheque")
+
+        engine.sync(SyncTrigger.PERIODIC)
+        assertThat(db.bookDao().get(civ.driveId)).isNotNull()
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+
+        inUse = null
+        engine.sync(SyncTrigger.PERIODIC)
+        assertThat(db.bookDao().get(civ.driveId)).isNull()
+        assertThat(root.walkTopDown().none { it.isFile && it.extension == "mp3" }).isTrue()
     }
 }

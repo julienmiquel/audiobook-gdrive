@@ -80,7 +80,17 @@ enum class EventResult { OK, ERROR, CANCELLED }
 enum class SyncResult { RUNNING, SUCCESS, PARTIAL, FAILED, CANCELLED }
 
 /** Origine d'une synchro. */
-enum class SyncTrigger { LAUNCH, PERIODIC, STATUS_CHANGE, MANUAL, FOLDER_OPEN, PLAYBACK }
+enum class SyncTrigger {
+    LAUNCH,
+    PERIODIC,
+    STATUS_CHANGE,
+    MANUAL,
+    FOLDER_OPEN,
+    PLAYBACK,
+
+    /** Retour du Wi-Fi : téléchargements reportés en mode « Wi-Fi uniquement ». */
+    WIFI,
+}
 
 /** Opérations de la file (seules écritures Drive : déplacer un dossier de livre). */
 enum class OperationType { MOVE_BOOK }

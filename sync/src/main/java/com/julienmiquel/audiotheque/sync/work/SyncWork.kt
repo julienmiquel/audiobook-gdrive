@@ -22,6 +22,7 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.sync.SyncRequester
@@ -49,7 +50,8 @@ class SyncComponent(
 /**
  * Planification : synchro auto toutes les 6 h par défaut (Wi-Fi uniquement, batterie non faible),
  * synchro immédiate au lancement et à chaque changement de statut, nouvel essai espacé quand des
- * déplacements Drive restent en file. Aucune autre tâche de fond.
+ * déplacements Drive restent en file, reprise au retour du Wi-Fi des téléchargements reportés,
+ * nettoyage local à l'échéance des délais. Aucune autre tâche de fond.
  */
 class SyncScheduler(
     private val context: Context,
@@ -67,22 +69,14 @@ class SyncScheduler(
             return
         }
         val request = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setInputData(workDataOf(KEY_TRIGGER to trigger.name))
+            .setInputData(workDataOf(KEY_TRIGGER to trigger.name, KEY_REQUESTED_AT to System.currentTimeMillis()))
             .setConstraints(connected)
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .addTag(TAG)
             .build()
-        workManager.enqueueUniqueWork(WORK_NOW, ExistingWorkPolicy.KEEP, request)
-    }
-
-    override fun requestFolderRefresh(pairId: Long) {
-        val request = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setInputData(workDataOf(KEY_PAIR to pairId))
-            .setConstraints(connected)
-            .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-            .addTag(TAG)
-            .build()
-        workManager.enqueueUniqueWork("$WORK_FOLDER-$pairId", ExistingWorkPolicy.KEEP, request)
+        // À la suite de la synchro en cours plutôt qu'ignorée : un geste fait pendant qu'elle se
+        // termine a droit à son déplacement immédiat. Les demandes déjà satisfaites sont sautées.
+        workManager.enqueueUniqueWork(WORK_NOW, ExistingWorkPolicy.APPEND_OR_REPLACE, request)
     }
 
     /** (Re)programme la synchro périodique selon les réglages. */
@@ -105,17 +99,41 @@ class SyncScheduler(
         workManager.enqueueUniquePeriodicWork(WORK_PERIODIC, ExistingPeriodicWorkPolicy.UPDATE, request)
     }
 
-    /** Après une exécution : nouvel essai des déplacements restés en file. */
+    /** Après une exécution : nouvel essai des déplacements, reprise au retour du Wi-Fi, nettoyage. */
     fun afterRun(outcome: SyncOutcome) {
-        val retryAt = outcome.retryAtMs ?: return
-        val delay = (retryAt - System.currentTimeMillis()).coerceAtLeast(5_000)
+        outcome.retryAtMs?.let { retryAt ->
+            val delay = (retryAt - System.currentTimeMillis()).coerceAtLeast(SyncEngine.MIN_RETRY_DELAY_MS)
+            val request = OneTimeWorkRequestBuilder<SyncWorker>()
+                .setInitialDelay(delay, TimeUnit.MILLISECONDS)
+                .setConstraints(connected)
+                .setInputData(workDataOf(KEY_TRIGGER to SyncTrigger.STATUS_CHANGE.name))
+                .addTag(TAG)
+                .build()
+            workManager.enqueueUniqueWork(WORK_RETRY, ExistingWorkPolicy.REPLACE, request)
+        }
+        if (outcome.waitingForWifi) {
+            val request = OneTimeWorkRequestBuilder<SyncWorker>()
+                .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.UNMETERED).build())
+                .setInputData(workDataOf(KEY_TRIGGER to SyncTrigger.WIFI.name))
+                .addTag(TAG)
+                .build()
+            workManager.enqueueUniqueWork(WORK_WIFI, ExistingWorkPolicy.KEEP, request)
+        }
+        scheduleCleanup(outcome.nextCleanupAt)
+    }
+
+    /** Nettoyage local (aucun réseau) à l'échéance d'un délai : 7 jours pour Plus tard, 24 h pour Écouté. */
+    fun scheduleCleanup(at: Long?) {
+        if (at == null) {
+            workManager.cancelUniqueWork(WORK_CLEANUP)
+            return
+        }
         val request = OneTimeWorkRequestBuilder<SyncWorker>()
-            .setInitialDelay(delay, TimeUnit.MILLISECONDS)
-            .setConstraints(connected)
-            .setInputData(workDataOf(KEY_TRIGGER to SyncTrigger.STATUS_CHANGE.name))
+            .setInitialDelay((at - System.currentTimeMillis()).coerceAtLeast(0) + CLEANUP_SLACK_MS, TimeUnit.MILLISECONDS)
+            .setInputData(workDataOf(KEY_MODE to MODE_CLEANUP))
             .addTag(TAG)
             .build()
-        workManager.enqueueUniqueWork(WORK_RETRY, ExistingWorkPolicy.REPLACE, request)
+        workManager.enqueueUniqueWork(WORK_CLEANUP, ExistingWorkPolicy.REPLACE, request)
     }
 
     /** Bouton « Annuler » : arrête la synchro en cours sans toucher au planning périodique. */
@@ -148,9 +166,15 @@ class SyncScheduler(
         const val WORK_NOW = "sync-now"
         const val WORK_PERIODIC = "sync-periodic"
         const val WORK_RETRY = "sync-retry"
-        const val WORK_FOLDER = "sync-folder"
+        const val WORK_WIFI = "sync-wifi"
+        const val WORK_CLEANUP = "cleanup"
         const val KEY_TRIGGER = "trigger"
-        const val KEY_PAIR = "pairId"
+        const val KEY_REQUESTED_AT = "requestedAt"
+        const val KEY_MODE = "mode"
+        const val MODE_CLEANUP = "cleanup"
+
+        /** Petite marge après l'échéance, pour ne pas se réveiller une seconde trop tôt. */
+        private const val CLEANUP_SLACK_MS = 60_000L
     }
 }
 
@@ -161,12 +185,15 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     override suspend fun doWork(): Result {
         val c = component ?: return Result.failure()
-        val pairId = inputData.getLong(SyncScheduler.KEY_PAIR, -1L)
-        if (pairId >= 0) {
-            val outcome = c.engine.refreshPair(pairId)
-            if (outcome.needsAuth) c.notifications.showAuthRequired()
+        if (inputData.getString(SyncScheduler.KEY_MODE) == SyncScheduler.MODE_CLEANUP) {
+            // Sans effet (null) si une synchro tourne : elle nettoie et reprogramme elle-même.
+            c.engine.cleanupNow()?.let { c.scheduler.scheduleCleanup(it) }
             return Result.success()
         }
+        // Demande déjà satisfaite par une synchro commencée depuis (demandes en file pendant
+        // une coupure réseau, par exemple).
+        val requestedAt = inputData.getLong(SyncScheduler.KEY_REQUESTED_AT, 0L)
+        if (requestedAt in 1 until c.engine.lastRunStartedAt) return Result.success()
         val trigger = inputData.getString(SyncScheduler.KEY_TRIGGER)
             ?.let { runCatching { SyncTrigger.valueOf(it) }.getOrNull() } ?: SyncTrigger.PERIODIC
         var foreground = false
@@ -181,7 +208,10 @@ class SyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
             result
         }
         c.scheduler.afterRun(outcome)
-        if (outcome.needsAuth) c.notifications.showAuthRequired()
+        when {
+            outcome.needsAuth -> c.notifications.showAuthRequired()
+            outcome.result == SyncResult.SUCCESS || outcome.result == SyncResult.PARTIAL -> c.notifications.dismissAuthRequired()
+        }
         return Result.success()
     }
 
@@ -256,9 +286,15 @@ class SyncNotifications(private val context: Context) {
             .setContentTitle(context.getString(R.string.sync_auth_title))
             .setContentText(context.getString(R.string.sync_auth_text))
             .setAutoCancel(true)
+            .setOnlyAlertOnce(true)
             .setContentIntent(openAppIntent())
             .build()
         manager.notify(NOTIFICATION_AUTH, notification)
+    }
+
+    /** Accès Drive rétabli (autorisation renouvelée, synchro réussie, déconnexion) : alerte retirée. */
+    fun dismissAuthRequired() {
+        manager.cancel(NOTIFICATION_AUTH)
     }
 
     companion object {

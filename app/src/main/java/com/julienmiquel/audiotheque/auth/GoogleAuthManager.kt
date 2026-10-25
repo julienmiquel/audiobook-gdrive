@@ -119,3 +119,14 @@ class GoogleAuthManager(
         private const val TOKEN_LIFETIME_MS = 50 * 60 * 1000L
     }
 }
+
+/** Message d'erreur lisible pour une connexion ou une autorisation Google qui échoue. */
+internal fun authErrorMessage(e: Throwable): String {
+    val text = e.message.orEmpty()
+    return when {
+        "10:" in text || "DEVELOPER_ERROR" in text ->
+            "Client OAuth Android non configuré pour cette app (nom de paquet + empreinte SHA-1). Voir le README."
+        "7:" in text || "NETWORK" in text.uppercase() -> "Réseau indisponible : la connexion Google nécessite Internet."
+        else -> "Connexion Google impossible : ${text.ifBlank { e.javaClass.simpleName }}"
+    }
+}

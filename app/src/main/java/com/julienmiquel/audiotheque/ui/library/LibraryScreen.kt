@@ -101,11 +101,15 @@ import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import com.julienmiquel.audiotheque.ui.common.StatusTag
 import com.julienmiquel.audiotheque.ui.common.Tag
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
@@ -144,13 +148,13 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
     private val selectedKey = MutableStateFlow<String?>(null)
     private val lastRefresh = mutableMapOf<Long, Long>()
 
-    val state: StateFlow<LibraryUiState> = combine(
+    /** Listes, onglets et compteurs : recalculés hors du thread principal, seulement si la bibliothèque ou les filtres changent. */
+    private val content = combine(
         c.library.observeLibrary(),
         c.library.observePairs(),
         c.settings.settings,
         combine(query, narrator, selectedKey) { q, n, s -> Filters(q, n, s) },
-        combine(c.engine.status, c.engine.refreshingPairs, c.library.observePendingOperations()) { e, r, p -> Activity(e, r, p) },
-    ) { all, pairs, settings, filters, activity ->
+    ) { all, pairs, settings, filters ->
         val tabs = buildTabs(pairs, settings.showArchives)
         val visible = all.filter { settings.showHidden || !it.book.hidden }
         val counts = tabs.associate { tab -> tab.key to visible.count { tab.matches(it) } }
@@ -174,12 +178,23 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
             query = filters.query,
             narrator = filters.narrator,
             narrators = LibraryRepository.narrators(visible),
-            engine = activity.engine,
-            refreshingPairs = activity.refreshing,
-            pendingMoves = activity.pendingMoves,
             totalBooks = visible.size,
         )
+    }.flowOn(Dispatchers.Default)
+
+    /** Activité du moteur, sans le détail (qui change à chaque livre) : fusion légère. */
+    private val activity = combine(
+        c.engine.status.map { it.copy(detail = null) }.distinctUntilChanged(),
+        c.engine.refreshingPairs,
+        c.library.observePendingOperations(),
+    ) { e, r, p -> Activity(e, r, p) }
+
+    val state: StateFlow<LibraryUiState> = combine(content, activity) { content, activity ->
+        content.copy(engine = activity.engine, refreshingPairs = activity.refreshing, pendingMoves = activity.pendingMoves)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), LibraryUiState())
+
+    /** Texte saisi dans la recherche (mis à jour aussitôt, pour le champ de saisie). */
+    val queryText: StateFlow<String> = query
 
     fun setQuery(text: String) = query.update { text }
 
@@ -259,6 +274,8 @@ fun LibraryScreen(
     val container = LocalAppContainer.current
     val vm: LibraryViewModel = viewModel { LibraryViewModel(container) }
     val state by vm.state.collectAsStateWithLifecycle()
+    // Texte de recherche lu directement (sans attendre le calcul des résultats en arrière-plan).
+    val queryText by vm.queryText.collectAsStateWithLifecycle()
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var narratorMenu by remember { mutableStateOf(false) }
     var pulling by remember { mutableStateOf(false) }
@@ -277,7 +294,7 @@ fun LibraryScreen(
         topBar = {
             if (searchOpen) {
                 SearchTopBar(
-                    query = state.query,
+                    query = queryText,
                     onQuery = vm::setQuery,
                     onClose = {
                         vm.setQuery("")

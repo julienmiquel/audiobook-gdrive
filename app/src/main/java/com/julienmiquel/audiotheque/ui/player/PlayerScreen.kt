@@ -577,17 +577,25 @@ private fun SpeedSheet(speed: Float, onSpeed: (Float) -> Unit, onDismiss: () -> 
             Text("Vitesse de lecture", style = MaterialTheme.typography.titleLarge, modifier = Modifier.semantics { heading() })
             Text(Formats.speed(speed), style = MaterialTheme.typography.displaySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
-                TextButton(onClick = { onSpeed(speed - 0.1f) }, enabled = speed > PlaybackService.MIN_SPEED + 0.01f) { Text("−0,1", style = MaterialTheme.typography.titleMedium) }
+                TextButton(
+                    onClick = { onSpeed(Math.round((speed - 0.1f) * 10) / 10f) },
+                    enabled = speed > PlaybackService.MIN_SPEED + 0.01f,
+                    modifier = Modifier.semantics { contentDescription = "Ralentir de 0,1" },
+                ) { Text("−0,1", style = MaterialTheme.typography.titleMedium) }
                 Slider(
                     value = speed,
-                    onValueChange = { onSpeed(it) },
+                    onValueChange = { onSpeed(Math.round(it * 10) / 10f) },
                     valueRange = PlaybackService.MIN_SPEED..PlaybackService.MAX_SPEED,
                     steps = 11,
                     modifier = Modifier
                         .weight(1f)
                         .semantics { contentDescription = "Vitesse" },
                 )
-                TextButton(onClick = { onSpeed(speed + 0.1f) }, enabled = speed < PlaybackService.MAX_SPEED - 0.01f) { Text("+0,1", style = MaterialTheme.typography.titleMedium) }
+                TextButton(
+                    onClick = { onSpeed(Math.round((speed + 0.1f) * 10) / 10f) },
+                    enabled = speed < PlaybackService.MAX_SPEED - 0.01f,
+                    modifier = Modifier.semantics { contentDescription = "Accélérer de 0,1" },
+                ) { Text("+0,1", style = MaterialTheme.typography.titleMedium) }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 listOf(0.8f, 1.0f, 1.2f, 1.5f, 2.0f).forEach { preset ->

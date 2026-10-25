@@ -48,6 +48,7 @@ import com.julienmiquel.audiotheque.auth.DriveAuthorization
 import com.julienmiquel.audiotheque.auth.GoogleIdentity
 import com.julienmiquel.audiotheque.auth.GoogleSignIn
 import com.julienmiquel.audiotheque.auth.SignInOutcome
+import com.julienmiquel.audiotheque.auth.authErrorMessage
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import kotlinx.coroutines.launch
 
@@ -65,7 +66,7 @@ fun OnboardingScreen() {
     var identity by remember { mutableStateOf<GoogleIdentity?>(null) }
 
     suspend fun finish(granted: DriveAuthorization.Granted) {
-        val about = if (identity?.email == null && granted.email == null) container.identify(granted.accessToken) else null
+        val about = if (identity?.email == null && granted.email == null) container.identify() else null
         val email = identity?.email ?: granted.email ?: about?.email
         if (email == null) {
             error = "Le compte Google autorisé n'a pas pu être identifié. Réessayez."
@@ -175,16 +176,6 @@ fun OnboardingScreen() {
                 textAlign = TextAlign.Center,
             )
         }
-    }
-}
-
-private fun authErrorMessage(e: Throwable): String {
-    val text = e.message.orEmpty()
-    return when {
-        "10:" in text || "DEVELOPER_ERROR" in text ->
-            "Client OAuth Android non configuré pour cette app (nom de paquet + empreinte SHA-1). Voir le README."
-        "7:" in text || "NETWORK" in text.uppercase() -> "Réseau indisponible : la connexion Google nécessite Internet."
-        else -> "Connexion Google impossible : ${text.ifBlank { e.javaClass.simpleName }}"
     }
 }
 

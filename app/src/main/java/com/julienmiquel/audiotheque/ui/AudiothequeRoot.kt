@@ -1,6 +1,7 @@
 package com.julienmiquel.audiotheque.ui
 
 import android.Manifest
+import android.app.Activity
 import android.content.pm.PackageManager
 import android.graphics.Color
 import androidx.activity.ComponentActivity
@@ -8,18 +9,29 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.LocalActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.LibraryBooks
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material.icons.filled.SyncProblem
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -37,10 +49,17 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavDestination.Companion.hasRoute
@@ -52,6 +71,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.julienmiquel.audiotheque.AppContainer
+import com.julienmiquel.audiotheque.AuthRenewal
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
@@ -70,6 +90,7 @@ import com.julienmiquel.audiotheque.ui.theme.AudiothequeTheme
 import com.julienmiquel.audiotheque.ui.theme.isDarkTheme
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 
 @Serializable
@@ -128,6 +149,7 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
         ?: if (destination?.hasRoute(BookDest::class) == true) TopTab.LIBRARY else lastTab
     LaunchedEffect(currentTab) { lastTab = currentTab }
     val engine by container.engine.status.collectAsStateWithLifecycle()
+    val authRequired by container.authRequired.collectAsStateWithLifecycle(initialValue = false)
     var finishedBook by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     NotificationPermission()
@@ -165,22 +187,27 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
 
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
-        snackbarHost = { SnackbarHost(snackbar) },
+        snackbarHost = { SnackbarHost(snackbar, modifier = Modifier.imePadding()) },
         bottomBar = {
-            NavigationBar {
-                TopTab.entries.forEach { tab ->
-                    NavigationBarItem(
-                        selected = currentTab == tab,
-                        onClick = { nav.navigateToTab(tab) },
-                        icon = {
-                            if (tab == TopTab.SYNC && engine.running) {
-                                BadgedBox(badge = { Badge() }) { Icon(tab.icon, contentDescription = null) }
-                            } else {
-                                Icon(tab.icon, contentDescription = null)
-                            }
-                        },
-                        label = { Text(tab.label) },
-                    )
+            Column {
+                if (authRequired) AuthRenewalBanner(container)
+                NavigationBar {
+                    TopTab.entries.forEach { tab ->
+                        NavigationBarItem(
+                            selected = currentTab == tab,
+                            onClick = { nav.navigateToTab(tab) },
+                            icon = {
+                                if (tab == TopTab.SYNC && engine.running) {
+                                    BadgedBox(badge = { Badge(Modifier.semantics { contentDescription = "Synchro en cours" }) }) {
+                                        Icon(tab.icon, contentDescription = null)
+                                    }
+                                } else {
+                                    Icon(tab.icon, contentDescription = null)
+                                }
+                            },
+                            label = { Text(tab.label) },
+                        )
+                    }
                 }
             }
         },
@@ -246,6 +273,62 @@ private fun NavHostController.navigateToTab(tab: TopTab) {
         popUpTo(graph.findStartDestination().id) { saveState = true }
         launchSingleTop = true
         restoreState = true
+    }
+}
+
+/**
+ * Autorisation Google Drive refusée ou expirée : synchro en pause (lecture et gestes restent possibles,
+ * les déplacements attendent en file) jusqu'au renouvellement, fait sans quitter l'app.
+ */
+@Composable
+private fun AuthRenewalBanner(container: AppContainer) {
+    val scope = rememberCoroutineScope()
+    var busy by remember { mutableStateOf(false) }
+
+    fun report(renewal: AuthRenewal) {
+        if (renewal is AuthRenewal.Failed) container.message(renewal.message)
+        busy = false
+    }
+
+    val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+        scope.launch { report(container.completeRenewal(result.resultCode == Activity.RESULT_OK, result.data)) }
+    }
+
+    Surface(color = MaterialTheme.colorScheme.errorContainer, contentColor = MaterialTheme.colorScheme.onErrorContainer) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .semantics { liveRegion = LiveRegionMode.Polite }
+                .padding(start = 16.dp, end = 12.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Filled.SyncProblem, contentDescription = null)
+            Spacer(Modifier.width(12.dp))
+            Text(
+                "Autorisation Google Drive à renouveler : synchro en pause.",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    busy = true
+                    scope.launch {
+                        when (val renewal = container.renewAuthorization()) {
+                            is AuthRenewal.NeedsConsent ->
+                                runCatching { consent.launch(IntentSenderRequest.Builder(renewal.pendingIntent.intentSender).build()) }
+                                    .onFailure { report(AuthRenewal.Failed("Écran d'autorisation Google indisponible : réessayez.")) }
+                            else -> report(renewal)
+                        }
+                    }
+                },
+                enabled = !busy,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.error,
+                    contentColor = MaterialTheme.colorScheme.onError,
+                ),
+            ) { Text("Renouveler") }
+        }
     }
 }
 

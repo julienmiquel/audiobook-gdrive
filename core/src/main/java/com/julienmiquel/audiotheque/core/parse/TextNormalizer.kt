@@ -22,6 +22,9 @@ object TextNormalizer {
     fun key(s: String): String =
         stripAccents(s).lowercase(Locale.ROOT).replace(nonAlphanumeric, " ").trim()
 
+    /** Clé d'un champ facultatif (auteur) : null s'il est vide. */
+    fun keyOrNull(s: String?): String? = s?.let(::key)?.takeIf { it.isNotEmpty() }
+
     /** Vrai si tous les mots de [query] apparaissent dans [text] (insensible aux accents). */
     fun matches(text: String?, query: String): Boolean {
         if (text.isNullOrBlank()) return false

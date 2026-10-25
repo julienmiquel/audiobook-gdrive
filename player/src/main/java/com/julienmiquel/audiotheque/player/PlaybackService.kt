@@ -4,6 +4,7 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
 import androidx.annotation.OptIn
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
@@ -35,7 +36,9 @@ import com.julienmiquel.audiotheque.core.model.displayAuthor
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import java.io.File
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -47,19 +50,26 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Lecture hors ligne uniquement (fichiers locaux, jamais de streaming depuis Drive), avec
  * notification média, écran verrouillé, boutons du casque Bluetooth et Android Auto.
  *
  * Reprise à la seconde près : position enregistrée toutes les 10 s et à chaque pause ; à la
- * reprise, recul automatique de 5 s.
+ * reprise, recul automatique de 5 s. Charger un livre (écran Lecteur, Android Auto) n'enregistre
+ * rien : seules l'écoute et les actions de l'utilisateur (déplacement, vitesse) le font.
  */
 @OptIn(UnstableApi::class)
 class PlaybackService : MediaLibraryService() {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val errors = CoroutineExceptionHandler { _, e -> Log.w(TAG, "Erreur du lecteur", e) }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate + errors)
+    private val persistScope = CoroutineScope(SupervisorJob() + Dispatchers.IO + errors)
+
+    /** Enregistrements faits un par un, dans l'ordre des demandes. */
+    private val persistMutex = Mutex()
 
     private lateinit var deps: PlayerDependencies
     private lateinit var exo: ExoPlayer
@@ -72,6 +82,12 @@ class PlaybackService : MediaLibraryService() {
     private var tickerJob: Job? = null
     private var pausedAt: Long? = null
     private var waitingForNext = false
+
+    /** Faux tant que le livre chargé n'a été ni écouté ni déplacé par l'utilisateur. */
+    private var persistEnabled = false
+
+    /** Écoute effective depuis le dernier enregistrement (date de « dernière écoute »). */
+    private var listenedSinceSave = false
 
     @Volatile
     private var skipMs = 30_000L
@@ -201,6 +217,8 @@ class PlaybackService : MediaLibraryService() {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) {
                 pausedAt = null
+                persistEnabled = true
+                listenedSinceSave = true
                 startTicker()
             } else {
                 if (exo.playbackState != Player.STATE_ENDED && exo.playbackState != Player.STATE_BUFFERING) {
@@ -212,11 +230,24 @@ class PlaybackService : MediaLibraryService() {
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
-            persistNow()
+            finishedEmitted = false
+            // Nouvelle liste (livre chargé) : rien à enregistrer, ce n'est pas une écoute.
+            if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) persistNow()
+        }
+
+        override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
+            if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                // Position choisie par l'utilisateur (barre, chapitres, saut) : enregistrée.
+                finishedEmitted = false
+                persistEnabled = true
+                persistNow()
+            }
         }
 
         override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
-            persistNow()
+            val bookId = currentBook?.driveId ?: return
+            val speed = playbackParameters.speed
+            persistScope.launch(start = CoroutineStart.UNDISPATCHED) { persistMutex.withLock { persistSpeed(bookId, speed) } }
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
@@ -228,6 +259,8 @@ class PlaybackService : MediaLibraryService() {
                 PlayerRuntime.sleepTimer.value is SleepTimerState.EndOfChapter
             ) {
                 PlayerRuntime.cancelTimer()
+                // Minuterie « fin du chapitre » sur le dernier chapitre : c'est aussi la fin du livre.
+                if (isOnLastTrack()) onEnded()
             }
         }
 
@@ -237,14 +270,27 @@ class PlaybackService : MediaLibraryService() {
         }
     }
 
+    /** Fin du livre déjà signalée pour la position actuelle (STATE_ENDED et minuterie). */
+    private var finishedEmitted = false
+
+    private fun currentTrack(): TrackEntity? {
+        val ref = exo.currentMediaItem?.let { MediaIds.parseTrack(it.mediaId) } ?: return null
+        return currentTracks.firstOrNull { it.driveId == ref.trackId }
+    }
+
+    private fun isOnLastTrack(): Boolean {
+        val track = currentTrack() ?: return false
+        val last = currentTracks.maxOfOrNull { it.sortIndex } ?: return false
+        return track.sortIndex >= last
+    }
+
     private fun onEnded() {
         val book = currentBook ?: return
-        val ref = exo.currentMediaItem?.let { MediaIds.parseTrack(it.mediaId) } ?: return
-        val track = currentTracks.firstOrNull { it.driveId == ref.trackId } ?: return
-        val last = currentTracks.maxOfOrNull { it.sortIndex } ?: return
-        if (track.sortIndex >= last) {
-            val snapshot = snapshot(markFinished = true)
-            persistScope.launch { snapshot?.let { persist(it) } }
+        currentTrack() ?: return
+        if (isOnLastTrack()) {
+            if (finishedEmitted) return
+            finishedEmitted = true
+            persistNow(markFinished = true)
             PlayerRuntime.emit(PlaybackEvent.BookFinished(book.driveId))
         } else {
             waitingForNext = true
@@ -291,18 +337,27 @@ class PlaybackService : MediaLibraryService() {
         val positionMs: Long,
         val speed: Float,
         val markFinished: Boolean,
+        /** Écoute effective depuis le dernier enregistrement : met à jour « dernière écoute ». */
+        val listened: Boolean,
     )
 
-    private fun snapshot(markFinished: Boolean = false): Snapshot? {
+    private fun snapshot(markFinished: Boolean, listened: Boolean): Snapshot? {
         val book = currentBook ?: return null
         val ref = exo.currentMediaItem?.let { MediaIds.parseTrack(it.mediaId) } ?: return null
         if (ref.bookId != book.driveId) return null
-        return Snapshot(book, currentTracks, ref.trackId, exo.currentPosition.coerceAtLeast(0), exo.playbackParameters.speed, markFinished)
+        return Snapshot(book, currentTracks, ref.trackId, exo.currentPosition.coerceAtLeast(0), exo.playbackParameters.speed, markFinished, listened)
     }
 
-    private fun persistNow() {
-        val snapshot = snapshot() ?: return
-        persistScope.launch { persist(snapshot) }
+    /**
+     * Enregistre la position (instantané pris tout de suite, écrit ensuite). Sans effet tant que
+     * le livre chargé n'a été ni écouté ni déplacé. Les écritures se font une par une, dans
+     * l'ordre : la fin du livre ne peut pas être effacée par une pause enregistrée en même temps.
+     */
+    private fun persistNow(markFinished: Boolean = false) {
+        if (!persistEnabled && !markFinished) return
+        val snapshot = snapshot(markFinished, listened = listenedSinceSave || exo.isPlaying) ?: return
+        listenedSinceSave = exo.isPlaying
+        persistScope.launch(start = CoroutineStart.UNDISPATCHED) { persistMutex.withLock { persist(snapshot) } }
     }
 
     private suspend fun persist(s: Snapshot) {
@@ -321,20 +376,34 @@ class PlaybackService : MediaLibraryService() {
                 positionMs = s.positionMs,
                 speed = s.speed,
                 percent = percent,
-                lastListenedAt = now,
-                finished = (existing?.finished == true && percent >= 99f) || s.markFinished,
+                lastListenedAt = if (s.listened) now else existing?.lastListenedAt,
+                finished = (existing?.finished == true && percent >= FINISHED_PERCENT) || s.markFinished,
                 updatedAt = now,
                 dirty = true,
             ),
         )
-        if (settings.lastPlayedBookId != s.book.driveId) {
+        if (s.listened && settings.lastPlayedBookId != s.book.driveId) {
             deps.settings.update { it.copy(lastPlayedBookId = s.book.driveId) }
         }
+    }
+
+    /** Vitesse mémorisée par livre : écrite seule, et seulement si elle change. */
+    private suspend fun persistSpeed(bookId: String, speed: Float) {
+        val account = deps.settings.current().accountKey
+        val dao = deps.database.progressDao()
+        val existing = dao.get(bookId, account)
+        if (existing?.speed == speed || (existing == null && speed == 1f)) return
+        val now = System.currentTimeMillis()
+        dao.upsert((existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now)).copy(speed = speed, updatedAt = now, dirty = true))
     }
 
     // ------------------------------------------------------------------ livres → éléments média
 
     private suspend fun resolveBook(bookId: String, trackId: String?, positionMs: Long?): MediaSession.MediaItemsWithStartPosition? {
+        // Livre précédent : sa position est enregistrée avant d'en charger un autre, et les
+        // enregistrements en cours sont terminés pour lire une position à jour.
+        persistNow()
+        persistMutex.withLock { }
         val db = deps.database
         val book = db.bookDao().get(bookId) ?: return null
         val tracks = db.trackDao().forBook(bookId)
@@ -372,11 +441,15 @@ class PlaybackService : MediaLibraryService() {
         currentBook = book
         currentTracks = tracks
         waitingForNext = false
+        persistEnabled = false
+        listenedSinceSave = false
+        finishedEmitted = false
         BookInUse.set(book.driveId)
         tracksJob?.cancel()
         tracksJob = scope.launch {
             deps.database.trackDao().observeForBook(book.driveId).collect { updated ->
-                currentTracks = updated
+                // Livre retiré de la base pendant l'écoute : on garde ses pistes pour enregistrer la position.
+                if (updated.isNotEmpty()) currentTracks = updated
                 insertNewlyDownloaded(book, updated)
             }
         }
@@ -569,10 +642,11 @@ class PlaybackService : MediaLibraryService() {
             mediaItems.flatMap { item ->
                 val track = MediaIds.parseTrack(item.mediaId)
                 val book = MediaIds.parseBookRequest(item.mediaId)
+                // Lecture hors ligne uniquement : seules les pistes téléchargées de la bibliothèque
+                // sont acceptées, jamais une adresse fournie par une autre app.
                 when {
                     track != null -> chapterItems(track.bookId).filter { it.mediaId == item.mediaId }
                     book != null -> chapterItems(book.bookId)
-                    item.localConfiguration != null -> listOf(item)
                     else -> emptyList()
                 }
             }.toMutableList()
@@ -600,5 +674,9 @@ class PlaybackService : MediaLibraryService() {
         const val FADE_MS = 10_000L
         const val MIN_SPEED = 0.8f
         const val MAX_SPEED = 2.0f
+
+        /** Au-delà, le livre reste « terminé » malgré une petite marge de position. */
+        private const val FINISHED_PERCENT = 99f
+        private const val TAG = "PlaybackService"
     }
 }

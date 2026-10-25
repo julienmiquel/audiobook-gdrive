@@ -1,10 +1,13 @@
 package com.julienmiquel.audiotheque.sync.engine
 
+import androidx.room.withTransaction
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
+import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncEventType
@@ -16,12 +19,14 @@ import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
 import com.julienmiquel.audiotheque.sync.drive.DriveHttpException
+import com.julienmiquel.audiotheque.sync.drive.DriveNotFoundException
 import com.julienmiquel.audiotheque.sync.drive.DriveRangeNotSatisfiableException
 import com.julienmiquel.audiotheque.sync.drive.DriveService
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
@@ -33,6 +38,25 @@ import kotlinx.coroutines.withContext
 
 /** Contrôle d'intégrité échoué (taille ou checksum Drive). */
 class IntegrityException(message: String) : IOException(message)
+
+/** Wi-Fi perdu pendant un transfert en mode « Wi-Fi uniquement » : le « .part » reste pour reprendre. */
+class DownloadDeferredException : IOException("Téléchargement reporté au retour du Wi-Fi")
+
+/** Écriture impossible sur le téléphone (stockage plein, accès retiré) : ce n'est pas le réseau. */
+class LocalWriteException(file: File, cause: IOException) :
+    IOException("Écriture impossible sur le téléphone (${file.name}) : ${cause.message ?: cause.javaClass.simpleName}", cause)
+
+/** Fin d'une série de téléchargements. */
+enum class DownloadStop {
+    /** Plus rien à télécharger (ou seulement des pistes en échec). */
+    DONE,
+
+    /** Réseau mesuré en mode « Wi-Fi uniquement » : reprise au retour du Wi-Fi. */
+    WAITING_FOR_WIFI,
+
+    /** Réseau perdu : reprise à la prochaine synchro. */
+    NETWORK_LOST,
+}
 
 /**
  * Téléchargement des pistes : 3 en parallèle, avec reprise après coupure (fichier « .part » et
@@ -91,14 +115,29 @@ class Downloader(
         return result
     }
 
-    suspend fun run(drive: DriveService, ctx: RunContext, onSlot: suspend (remaining: Int) -> Unit = {}) = coroutineScope {
+    /**
+     * Télécharge le plan, 3 pistes à la fois. [canContinue] est consulté avant chaque piste et
+     * pendant les transferts : faux en mode « Wi-Fi uniquement » quand le réseau devient mesuré.
+     */
+    suspend fun run(
+        drive: DriveService,
+        ctx: RunContext,
+        canContinue: () -> Boolean = { true },
+        onSlot: suspend (remaining: Int) -> Unit = {},
+    ): DownloadStop = coroutineScope {
         val inFlight = ConcurrentHashMap.newKeySet<String>()
         val failures = ConcurrentHashMap<String, Int>()
         val blockedBooks = ConcurrentHashMap.newKeySet<String>()
         val checkedBooks = ConcurrentHashMap.newKeySet<String>()
+        val stop = AtomicReference<DownloadStop?>(null)
         val lock = Mutex()
 
         suspend fun next(): Task? = lock.withLock {
+            if (stop.get() != null) return@withLock null
+            if (!canContinue()) {
+                stop.compareAndSet(null, DownloadStop.WAITING_FOR_WIFI)
+                return@withLock null
+            }
             val planned = plan().filter { it.book.driveId !in blockedBooks && (failures[it.track.driveId] ?: 0) < MAX_ATTEMPTS }
             onSlot(planned.size)
             for (task in planned) {
@@ -121,16 +160,42 @@ class Downloader(
                 while (true) {
                     val task = next() ?: break
                     try {
-                        download(drive, task, ctx)
+                        download(drive, task, ctx, canContinue)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: DriveAuthException) {
                         throw e
+                    } catch (e: DownloadDeferredException) {
+                        stop.compareAndSet(null, DownloadStop.WAITING_FOR_WIFI)
                     } catch (e: Exception) {
-                        val attempts = failures.merge(task.track.driveId, 1, Int::plus) ?: 1
-                        val transientNetwork = e is IOException && e !is DriveHttpException && e !is IntegrityException
-                        if (transientNetwork) failures[task.track.driveId] = MAX_ATTEMPTS
-                        if (attempts >= MAX_ATTEMPTS || transientNetwork) {
+                        val transientNetwork = e is IOException && e !is DriveHttpException &&
+                            e !is IntegrityException && e !is LocalWriteException
+                        if (transientNetwork) {
+                            // Réseau perdu : inutile d'essayer les pistes suivantes, un seul message.
+                            if (stop.compareAndSet(null, DownloadStop.NETWORK_LOST)) {
+                                history.log(
+                                    type = SyncEventType.ERROR,
+                                    path = task.book.name,
+                                    book = task.book,
+                                    result = EventResult.ERROR,
+                                    message = "Réseau perdu : téléchargements interrompus, reprise à la prochaine synchro (${e.message ?: e.javaClass.simpleName}).",
+                                    runId = ctx.runId,
+                                )
+                                ctx.errors.incrementAndGet()
+                            }
+                            continue
+                        }
+                        val attempts = when (e) {
+                            is DriveNotFoundException -> {
+                                // Piste supprimée ou remplacée dans Drive : la liste sera relue.
+                                books.invalidateTracks(listOf(task.book.driveId))
+                                MAX_ATTEMPTS.also { failures[task.track.driveId] = it }
+                            }
+                            // Stockage plein ou accès retiré : réessayer tout de suite ne servirait à rien.
+                            is LocalWriteException -> MAX_ATTEMPTS.also { failures[task.track.driveId] = it }
+                            else -> failures.merge(task.track.driveId, 1, Int::plus) ?: 1
+                        }
+                        if (attempts >= MAX_ATTEMPTS) {
                             history.log(
                                 type = SyncEventType.ERROR,
                                 path = "${task.book.name}/${task.track.relativePath}",
@@ -149,6 +214,7 @@ class Downloader(
                 }
             }
         }
+        stop.get() ?: DownloadStop.DONE
     }
 
     /** Espace libre ≥ reste à télécharger du livre + 500 Mo. */
@@ -170,7 +236,10 @@ class Downloader(
         return false
     }
 
-    private suspend fun bookDir(book: BookEntity): File {
+    /** Verrou : deux livres de même nom téléchargés en même temps n'obtiennent pas le même dossier. */
+    private val dirLock = Mutex()
+
+    private suspend fun bookDir(book: BookEntity): File = dirLock.withLock {
         val fresh = books.get(book.driveId) ?: book
         val name = fresh.localDirName ?: run {
             val base = LocalStorage.sanitize(fresh.name)
@@ -178,10 +247,10 @@ class Downloader(
             books.setLocalDirName(fresh.driveId, unique)
             unique
         }
-        return File(storage.root(), name)
+        File(storage.root(), name)
     }
 
-    suspend fun download(drive: DriveService, task: Task, ctx: RunContext) = withContext(Dispatchers.IO) {
+    suspend fun download(drive: DriveService, task: Task, ctx: RunContext, canContinue: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
         val track = tracks.get(task.track.driveId) ?: return@withContext
         if (track.state == TrackState.PRESENT) return@withContext
         val book = books.get(track.bookId) ?: return@withContext
@@ -211,7 +280,12 @@ class Downloader(
                         part.delete()
                         start = 0
                     }
-                    FileOutputStream(part, start > 0).use { out ->
+                    val output = try {
+                        FileOutputStream(part, start > 0)
+                    } catch (e: IOException) {
+                        throw LocalWriteException(part, e)
+                    }
+                    output.use { out ->
                         val buffer = ByteArray(64 * 1024)
                         var done = start
                         var lastUi = 0L
@@ -222,7 +296,11 @@ class Downloader(
                             ensureActive()
                             val n = content.stream.read(buffer)
                             if (n < 0) break
-                            out.write(buffer, 0, n)
+                            try {
+                                out.write(buffer, 0, n)
+                            } catch (e: IOException) {
+                                throw LocalWriteException(part, e)
+                            }
                             done += n
                             val now = clock.now()
                             if (now - lastUi >= 250) {
@@ -235,6 +313,8 @@ class Downloader(
                             if (now - lastDb >= 2000) {
                                 tracks.setDownloadedBytes(track.driveId, done)
                                 lastDb = now
+                                // Wi-Fi perdu en mode « Wi-Fi uniquement » : arrêt, reprise plus tard.
+                                if (!canContinue()) throw DownloadDeferredException()
                             }
                         }
                     }
@@ -301,9 +381,11 @@ class Downloader(
 }
 
 /**
- * Nettoyage selon le statut : seul _En écoute garde ses pistes sur le téléphone ; _A écouter plus
- * tard les garde 7 jours, _Ecouté 24 h (délais réglables) ; les autres statuts ne gardent que
- * leurs métadonnées (sauf la première piste des _Nouveaux si « Aperçu »).
+ * Nettoyage selon le statut ([CleanupPolicy]) : seul _En écoute garde ses pistes sur le
+ * téléphone ; _A écouter plus tard les garde 7 jours, _Ecouté 24 h (délais réglables) ; les autres
+ * statuts ne gardent que leurs métadonnées (sauf la première piste des _Nouveaux si « Aperçu »).
+ * Seul le statut confirmé par Drive compte : un geste encore annulable ou un déplacement pas
+ * encore fait dans Drive ne supprime rien.
  */
 class Cleaner(
     private val db: AppDatabase,
@@ -323,16 +405,8 @@ class Cleaner(
             if (isBookInUse(book.driveId)) continue
             if (track.state == TrackState.DOWNLOADING) continue
             val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-            val since = now - book.effectiveStatusChangedAt
-            val keep = when (book.pendingStatus ?: book.status) {
-                BookStatus.IN_PROGRESS -> true
-                BookStatus.NEW -> s.previewNew && track.sortIndex == 0
-                BookStatus.LATER -> since < s.laterRetentionDays * DAY_MS
-                BookStatus.DONE -> since < s.doneRetentionHours * HOUR_MS
-                BookStatus.COLLECTION -> pairMode == PairMode.FULL
-                BookStatus.ARCHIVED, BookStatus.UNSORTED -> false
-            }
-            if (keep) continue
+            val deadline = CleanupPolicy.deadline(book, track.sortIndex, pairMode, s) ?: continue
+            if (now < deadline) continue
             val path = track.localPath
             val freed = localFiles.deleteTrackFiles(track)
             if (freed > 0 && path != null) {
@@ -343,29 +417,29 @@ class Cleaner(
                     path = storage.displayPath(File(path)),
                     book = book,
                     sizeBytes = freed,
-                    message = "Nettoyage : livre dans ${pairs.firstOrNull { it.driveFolderId == (book.pendingParentId ?: book.parentId) }?.name ?: "un autre statut"}",
+                    message = "Nettoyage : livre dans ${pairs.firstOrNull { it.driveFolderId == book.parentId }?.name ?: "un autre statut"}",
                     runId = ctx?.runId,
                 )
             }
         }
     }
 
-    /** Prochaine échéance de nettoyage (pour planifier une synchro), ou null. */
+    /**
+     * Prochaine échéance de nettoyage d'une piste encore sur le téléphone, postérieure à
+     * maintenant (pour programmer le nettoyage à l'heure dite), ou null. Le livre en cours de
+     * lecture est ignoré : il sera nettoyé à la synchro suivante.
+     */
     suspend fun nextDeadline(): Long? {
         val s = settings.current()
-        val candidates = db.trackDao().withLocalData().mapNotNull { db.bookDao().get(it.bookId) }.distinctBy { it.driveId }
-        return candidates.mapNotNull { b ->
-            when (b.pendingStatus ?: b.status) {
-                BookStatus.LATER -> b.effectiveStatusChangedAt + s.laterRetentionDays * DAY_MS
-                BookStatus.DONE -> b.effectiveStatusChangedAt + s.doneRetentionHours * HOUR_MS
-                else -> null
-            }
+        val now = clock.now()
+        val pairs = db.syncPairDao().all()
+        val booksById = HashMap<String, BookEntity?>()
+        return db.trackDao().withLocalData().mapNotNull { track ->
+            val book = booksById.getOrPut(track.bookId) { db.bookDao().get(track.bookId) } ?: return@mapNotNull null
+            if (isBookInUse(book.driveId)) return@mapNotNull null
+            val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
+            CleanupPolicy.deadline(book, track.sortIndex, pairMode, s)?.takeIf { it > now }
         }.minOrNull()
-    }
-
-    companion object {
-        const val HOUR_MS = 3600L * 1000
-        const val DAY_MS = 24 * HOUR_MS
     }
 }
 
@@ -373,6 +447,9 @@ class Cleaner(
  * Progression par utilisateur dans l'espace caché de l'app sur le Drive de chaque compte
  * (appDataFolder) : elle suit l'utilisateur d'un téléphone à l'autre sans mélanger les positions
  * des membres de la famille. Le plus récent l'emporte.
+ *
+ * Les dates de synchro sont celles de Drive (modifiedTime), jamais l'horloge du téléphone : un
+ * téléphone en avance ou en retard ne fait pas manquer une mise à jour venue d'ailleurs.
  */
 class ProgressSync(
     private val db: AppDatabase,
@@ -381,8 +458,11 @@ class ProgressSync(
 ) {
     suspend fun run(drive: DriveService, account: String) {
         val dao = db.progressDao()
-        val remote = drive.listAppData().filter { ProgressJson.bookIdFromFileName(it.name) != null }
-        val remoteByBook = remote.associateBy { ProgressJson.bookIdFromFileName(it.name)!! }
+        // Un fichier par livre. Si deux téléphones en ont créé un au même moment, le plus récent.
+        val remoteByBook = drive.listAppData()
+            .mapNotNull { file -> ProgressJson.bookIdFromFileName(file.name)?.let { it to file } }
+            .groupBy({ it.first }, { it.second })
+            .mapValues { (_, files) -> files.maxBy { it.modifiedTime ?: 0L } }
 
         for (local in dao.dirty(account)) {
             val payload = ProgressJson(
@@ -401,7 +481,7 @@ class ProgressSync(
             val id = local.remoteFileId ?: remoteByBook[local.bookId]?.id
             val file = if (id != null) {
                 runCatching { drive.updateAppData(id, ProgressJson.encode(payload)) }.getOrElse { e ->
-                    if (e is com.julienmiquel.audiotheque.sync.drive.DriveNotFoundException) {
+                    if (e is DriveNotFoundException) {
                         drive.createAppData(ProgressJson.fileName(local.bookId), ProgressJson.encode(payload))
                     } else {
                         throw e
@@ -410,37 +490,48 @@ class ProgressSync(
             } else {
                 drive.createAppData(ProgressJson.fileName(local.bookId), ProgressJson.encode(payload))
             }
-            dao.markSynced(local.bookId, account, local.updatedAt, file.id, clock.now())
+            // Sans effet si le lecteur a enregistré une position plus récente entre-temps.
+            dao.markSynced(local.bookId, account, local.updatedAt, file.id, file.modifiedTime ?: 0L)
         }
 
         for ((bookId, file) in remoteByBook) {
-            val local = dao.get(bookId, account)
-            if (local?.dirty == true) continue
-            val remoteModified = file.modifiedTime ?: Long.MAX_VALUE
-            if (local != null && local.remoteSyncedAt != null && remoteModified <= local.remoteSyncedAt!!) continue
+            val known = dao.get(bookId, account)
+            if (known?.dirty == true) continue
+            val remoteModified = file.modifiedTime
+            val alreadySeen = known != null && known.remoteFileId == file.id && remoteModified != null &&
+                known.remoteSyncedAt?.let { remoteModified <= it } == true
+            if (alreadySeen) continue
             val json = runCatching { ProgressJson.decode(drive.readAppData(file.id)) }.getOrNull() ?: continue
-            if (local != null && local.updatedAt >= json.updatedAt) {
-                dao.markSynced(bookId, account, local.updatedAt, file.id, clock.now())
-                continue
+            db.withTransaction {
+                // Relu dans la transaction : une position enregistrée pendant la lecture du JSON gagne.
+                val local = dao.get(bookId, account)
+                when {
+                    local?.dirty == true -> Unit
+                    local != null && local.updatedAt > json.updatedAt && local.remoteFileId != null && local.remoteFileId != file.id ->
+                        // Deux fichiers pour ce livre : notre position, plus récente, ira dans le plus récent.
+                        dao.upsert(local.copy(dirty = true, remoteFileId = file.id))
+                    local != null && local.updatedAt >= json.updatedAt ->
+                        dao.markSynced(bookId, account, local.updatedAt, file.id, remoteModified ?: 0L)
+                    else -> dao.upsert(
+                        ProgressEntity(
+                            bookId = bookId,
+                            account = account,
+                            trackId = json.trackId,
+                            trackIndex = json.trackIndex,
+                            positionMs = json.positionMs,
+                            speed = json.speed,
+                            percent = json.percent,
+                            lastListenedAt = json.lastListenedAt,
+                            finished = json.finished,
+                            setAsideAtPercent = json.setAsideAtPercent,
+                            updatedAt = json.updatedAt,
+                            dirty = false,
+                            remoteFileId = file.id,
+                            remoteSyncedAt = remoteModified ?: 0L,
+                        ),
+                    )
+                }
             }
-            dao.upsert(
-                com.julienmiquel.audiotheque.core.db.ProgressEntity(
-                    bookId = bookId,
-                    account = account,
-                    trackId = json.trackId,
-                    trackIndex = json.trackIndex,
-                    positionMs = json.positionMs,
-                    speed = json.speed,
-                    percent = json.percent,
-                    lastListenedAt = json.lastListenedAt,
-                    finished = json.finished,
-                    setAsideAtPercent = json.setAsideAtPercent,
-                    updatedAt = json.updatedAt,
-                    dirty = false,
-                    remoteFileId = file.id,
-                    remoteSyncedAt = clock.now(),
-                ),
-            )
         }
     }
 }

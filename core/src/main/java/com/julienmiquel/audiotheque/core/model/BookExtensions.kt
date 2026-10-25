@@ -2,6 +2,7 @@ package com.julienmiquel.audiotheque.core.model
 
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 
 /** Statut affiché : celui du geste en attente s'il y en a un, sinon celui confirmé par Drive. */
 val BookEntity.effectiveStatus: BookStatus get() = pendingStatus ?: status
@@ -25,6 +26,10 @@ val BookEntity.displayAuthor: String?
 /** Voix : correction, sinon tags ID3, sinon nom du dossier (« lu par … »). */
 val BookEntity.displayNarrator: String?
     get() = (customNarrator ?: tagNarrator ?: parsedNarrator)?.takeIf { it.isNotBlank() }
+
+/** Clé d'auteur attendue (doublons), d'après l'auteur affiché. */
+val BookEntity.expectedAuthorKey: String?
+    get() = TextNormalizer.keyOrNull(displayAuthor)
 
 val BookEntity.isPlayableKind: Boolean get() = kind != BookKind.ZIP
 

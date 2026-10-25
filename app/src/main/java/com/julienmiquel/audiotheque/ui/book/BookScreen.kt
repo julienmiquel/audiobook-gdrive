@@ -89,6 +89,7 @@ import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
+import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.util.Formats
@@ -554,19 +555,23 @@ private fun InfoSection(state: BookUiState, item: LibraryItem) {
         InfoRow("Dossier Drive", book.name)
         InfoRow("Ajouté le", Formats.date(book.addedAt))
         InfoRow("Statut changé le", Formats.date(book.effectiveStatusChangedAt))
-        cleanupDeadline(state, item)?.let { InfoRow("Pistes gardées jusqu'au", Formats.dateTime(it)) }
+        cleanupInfo(state, item)?.let { (label, value) -> InfoRow(label, value) }
     }
 }
 
-/** Échéance du nettoyage des pistes locales (7 jours pour Plus tard, 24 h pour Écouté par défaut). */
-private fun cleanupDeadline(state: BookUiState, item: LibraryItem): Long? {
+/**
+ * Nettoyage des pistes locales, avec la règle du moteur ([CleanupPolicy]) : rien tant que Drive
+ * n'a pas confirmé le déplacement, puis 7 jours pour Plus tard, 24 h pour Écouté (par défaut).
+ */
+private fun cleanupInfo(state: BookUiState, item: LibraryItem): Pair<String, String>? {
     if (item.presentTracks == 0) return null
-    val since = item.book.effectiveStatusChangedAt
-    return when (item.status) {
-        BookStatus.LATER -> since + state.settings.laterRetentionDays * 24L * 3600_000L
-        BookStatus.DONE -> since + state.settings.doneRetentionHours * 3600_000L
-        else -> null
+    val book = item.book
+    if (book.pendingStatus != null) {
+        return if (book.pendingStatus == BookStatus.IN_PROGRESS) null else "Pistes gardées" to "jusqu'à la confirmation du déplacement par Drive"
     }
+    val mode = state.pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
+    val deadline = CleanupPolicy.bookDeadline(book, mode, state.settings) ?: return null
+    return "Pistes gardées jusqu'au" to Formats.dateTime(deadline)
 }
 
 @Composable

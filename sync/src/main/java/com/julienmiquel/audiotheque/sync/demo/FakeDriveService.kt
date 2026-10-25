@@ -76,6 +76,13 @@ class FakeDriveService(
     /** Dossiers dont le déplacement est refusé (403), pour tester les échecs définitifs. */
     val forbiddenMoves: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf())
 
+    /** Dossiers dont le déplacement échoue passagèrement (503), pour tester les nouveaux essais. */
+    val busyMoves: MutableSet<String> = java.util.Collections.synchronizedSet(mutableSetOf())
+
+    /** Autorisation Google expirée (tests) : chaque appel demande une reconnexion. */
+    @Volatile
+    var authExpired: Boolean = false
+
     // ------------------------------------------------------------------ DriveService
 
     override suspend fun listChildren(folderId: String): List<DriveFile> = op {
@@ -125,6 +132,7 @@ class FakeDriveService(
 
     override suspend fun move(fileId: String, addParent: String, removeParents: List<String>): DriveFile = op {
         if (fileId in forbiddenMoves) throw DriveHttpException(403, "insufficientFilePermissions", "Drive 403 : permission refusée")
+        if (fileId in busyMoves) throw DriveHttpException(503, "backendError", "Drive 503 : service momentanément indisponible")
         val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
         node.parents = (node.parents - removeParents.toSet() + addParent).distinct()
         node.modifiedTime = clock.now()
@@ -202,6 +210,7 @@ class FakeDriveService(
     private suspend fun <T> op(block: suspend () -> T): T {
         if (latencyMs > 0) delay(latencyMs)
         if (offline) throw java.io.IOException("Réseau indisponible (simulé)")
+        if (authExpired) throw com.julienmiquel.audiotheque.sync.drive.DriveAuthException("Autorisation Google Drive à renouveler")
         return mutex.withLock {
             ensureLoaded()
             block()

@@ -48,6 +48,10 @@ class RunContext(val runId: Long, val trigger: SyncTrigger, val startedAt: Long)
     /** Remarque affichée dans le résumé (« Téléchargements en attente du Wi-Fi »). */
     @Volatile
     var note: String? = null
+
+    /** Transferts ou échantillons reportés : synchro à refaire au retour du Wi-Fi. */
+    @Volatile
+    var waitingForWifi = false
 }
 
 /** Journal des événements (réception, suppression locale, déplacement Drive, erreur). */

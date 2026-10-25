@@ -41,8 +41,14 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE COALESCE(pendingStatus, status) = :status")
     fun observeByEffectiveStatus(status: BookStatus): Flow<List<BookEntity>>
 
-    @Query("SELECT * FROM books WHERE normalizedKey = :key AND driveId != :excludeId")
-    suspend fun duplicatesOf(key: String, excludeId: String): List<BookEntity>
+    /** Autres exemplaires : même titre, auteurs identiques ou inconnus (cf. [BookEntity.authorKey]). */
+    @Query(
+        """
+        SELECT * FROM books WHERE normalizedKey = :key AND driveId != :excludeId
+          AND (:authorKey IS NULL OR authorKey IS NULL OR authorKey = :authorKey)
+        """,
+    )
+    suspend fun duplicatesOf(key: String, authorKey: String?, excludeId: String): List<BookEntity>
 
     @Upsert
     suspend fun upsert(book: BookEntity)
@@ -55,6 +61,9 @@ interface BookDao {
 
     @Query("DELETE FROM books WHERE driveId = :id")
     suspend fun delete(id: String)
+
+    @Query("DELETE FROM books")
+    suspend fun deleteAll()
 
     @Query("SELECT COUNT(*) FROM books")
     suspend fun count(): Int
@@ -71,11 +80,15 @@ interface BookDao {
     @Query(
         """
         UPDATE books SET name = :name, parsedTitle = :title, parsedAuthor = :author, parsedNarrator = :narrator,
-          normalizedKey = CASE WHEN customTitle IS NULL OR customTitle = '' THEN :key ELSE normalizedKey END
+          normalizedKey = CASE WHEN customTitle IS NULL OR customTitle = '' THEN :key ELSE normalizedKey END,
+          authorKey = CASE WHEN customAuthor IS NULL THEN :authorKey ELSE authorKey END
         WHERE driveId = :id
         """,
     )
-    suspend fun updateDriveName(id: String, name: String, title: String, author: String?, narrator: String?, key: String)
+    suspend fun updateDriveName(id: String, name: String, title: String, author: String?, narrator: String?, key: String, authorKey: String?)
+
+    @Query("UPDATE books SET authorKey = :authorKey WHERE driveId = :id")
+    suspend fun setAuthorKey(id: String, authorKey: String?)
 
     @Query("UPDATE books SET modifiedAt = :modifiedAt WHERE driveId = :id")
     suspend fun updateModifiedAt(id: String, modifiedAt: Long?)
@@ -119,11 +132,11 @@ interface BookDao {
     @Query(
         """
         UPDATE books SET customTitle = :title, customAuthor = :author, customNarrator = :narrator,
-          titleConfirmed = :confirmed, normalizedKey = :key
+          titleConfirmed = :confirmed, normalizedKey = :key, authorKey = :authorKey
         WHERE driveId = :id
         """,
     )
-    suspend fun updateCorrections(id: String, title: String?, author: String?, narrator: String?, confirmed: Boolean, key: String)
+    suspend fun updateCorrections(id: String, title: String?, author: String?, narrator: String?, confirmed: Boolean, key: String, authorKey: String?)
 
     @Query("UPDATE books SET hidden = :hidden WHERE driveId = :id")
     suspend fun setHidden(id: String, hidden: Boolean)
@@ -131,6 +144,7 @@ interface BookDao {
     @Query("UPDATE books SET coverUrl = :coverUrl, summary = :summary, enrichedAt = :at WHERE driveId = :id")
     suspend fun setEnrichment(id: String, coverUrl: String?, summary: String?, at: Long)
 
+    // Doublons : même titre, sauf si les deux auteurs sont connus et diffèrent.
 
     @Query(
         """
@@ -139,7 +153,8 @@ interface BookDao {
           p.percent AS percent,
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
-          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey) AS duplicateCount
+          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey
+             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account
         """,
@@ -153,7 +168,8 @@ interface BookDao {
           p.percent AS percent,
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
-          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey) AS duplicateCount
+          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey
+             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account
         WHERE b.driveId = :id
@@ -211,6 +227,9 @@ interface TrackDao {
 
     @Query("SELECT COUNT(*) FROM tracks WHERE bookId = :bookId AND state = 'PRESENT'")
     suspend fun presentCount(bookId: String): Int
+
+    @Query("DELETE FROM tracks")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -244,6 +263,13 @@ interface ProgressDao {
         """,
     )
     suspend fun migrateAccount(from: String, to: String)
+
+    @Query("DELETE FROM progress WHERE account = :account")
+    suspend fun deleteForAccount(account: String)
+
+    /** Déplacement vers _Ecouté abandonné : « terminé » est retiré si le livre n'était pas fini. */
+    @Query("UPDATE progress SET finished = 0, dirty = 1, updatedAt = :now WHERE bookId = :bookId AND finished = 1 AND percent < 99")
+    suspend fun clearFinishedUnlessAtEnd(bookId: String, now: Long)
 }
 
 @Dao
@@ -259,6 +285,10 @@ interface BookmarkDao {
 
     @Query("DELETE FROM bookmarks WHERE id = :id")
     suspend fun delete(id: Long)
+
+    /** Signets des livres de la bibliothèque actuelle (sortie du mode démo). */
+    @Query("DELETE FROM bookmarks WHERE bookId IN (SELECT driveId FROM books)")
+    suspend fun deleteForLibraryBooks()
 }
 
 @Dao
@@ -277,6 +307,9 @@ interface SyncEventDao {
 
     @Query("DELETE FROM sync_events WHERE timestamp < :before")
     suspend fun purgeOlderThan(before: Long): Int
+
+    @Query("DELETE FROM sync_events")
+    suspend fun deleteAll()
 
     /** Livres présents dans l'historique, pour le filtre par livre. */
     @Query("SELECT DISTINCT bookId, bookTitle FROM sync_events WHERE bookId IS NOT NULL ORDER BY bookTitle")
@@ -308,6 +341,9 @@ interface SyncRunDao {
 
     @Query("DELETE FROM sync_runs WHERE startedAt < :before")
     suspend fun purgeOlderThan(before: Long)
+
+    @Query("DELETE FROM sync_runs")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -345,6 +381,9 @@ interface PendingOperationDao {
 
     @Query("SELECT MIN(nextAttemptAt) FROM pending_ops")
     suspend fun nextAttemptAt(): Long?
+
+    @Query("DELETE FROM pending_ops")
+    suspend fun deleteAll()
 }
 
 @Dao
@@ -375,6 +414,9 @@ interface SyncPairDao {
 
     @Query("DELETE FROM sync_pairs WHERE id = :id")
     suspend fun delete(id: Long)
+
+    @Query("DELETE FROM sync_pairs")
+    suspend fun deleteAll()
 
     @Query("UPDATE sync_pairs SET lastInventoryAt = :at WHERE id = :id")
     suspend fun setLastInventory(id: Long, at: Long)

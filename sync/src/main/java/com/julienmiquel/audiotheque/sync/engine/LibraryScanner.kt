@@ -7,6 +7,7 @@ import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults
 import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncEventType
@@ -14,6 +15,7 @@ import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
+import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
 import com.julienmiquel.audiotheque.core.parse.FolderNameParser
 import com.julienmiquel.audiotheque.core.parse.Mp3Probe
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
@@ -23,17 +25,24 @@ import com.julienmiquel.audiotheque.core.parse.TrackOrdering
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
+import com.julienmiquel.audiotheque.sync.drive.DriveChange
 import com.julienmiquel.audiotheque.sync.drive.DriveFile
+import com.julienmiquel.audiotheque.sync.drive.DriveHttpException
 import com.julienmiquel.audiotheque.sync.drive.DriveNotFoundException
 import com.julienmiquel.audiotheque.sync.drive.DriveService
 import com.julienmiquel.audiotheque.sync.drive.readUpTo
 import java.io.File
+import java.io.IOException
+import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CancellationException
 
 /**
  * Détection des changements : inventaire complet à la première synchro puis une fois par
  * semaine, flux de modifications Drive (changes.list) entre-temps. Drive fait foi : un dossier
  * déplacé depuis le web ou par un autre membre de la famille met à jour le statut local.
+ *
+ * Une paire désactivée est « en pause » : ses livres restent affichés tels quels, sans nouveaux
+ * livres ni mises à jour, jusqu'à sa réactivation.
  */
 class LibraryScanner(
     private val db: AppDatabase,
@@ -42,16 +51,21 @@ class LibraryScanner(
     private val localFiles: LocalFiles,
     private val storage: LocalStorage,
     private val clock: Clock,
+    private val isBookInUse: (String) -> Boolean = { false },
 ) {
     private val books = db.bookDao()
     private val tracks = db.trackDao()
     private val pairsDao = db.syncPairDao()
+
+    /** Livres à retirer de la bibliothèque, gardés le temps de leur écoute ; revérifiés à chaque synchro. */
+    private val deferredRemovals = ConcurrentHashMap.newKeySet<String>()
 
     suspend fun scan(drive: DriveService, ctx: RunContext, forceFull: Boolean = false, progress: (String) -> Unit = {}) {
         val pairs = pairsDao.all()
         val account = settings.current().accountKey
         val state = settings.currentSyncState()
         val now = clock.now()
+        reconcileDeferred(drive, pairs, ctx)
         val lastFull = state.lastFullInventoryAt
         val needFull = forceFull || state.pageToken == null || state.pageTokenAccount != account ||
             lastFull == null || now - lastFull >= FULL_INVENTORY_INTERVAL_MS
@@ -60,10 +74,17 @@ class LibraryScanner(
             ctx.initialInventory = books.count() == 0
             // Jeton pris avant l'inventaire : aucun changement intervenu pendant n'est perdu.
             val token = drive.startPageToken()
+            // Tous les dossiers actifs sont listés, « à l'ouverture » compris : une requête par
+            // dossier suffit pour que la recherche couvre toute la bibliothèque. Les pistes, durées
+            // et pochettes de ces dossiers ne sont lues qu'à leur ouverture (MetadataProber).
             for (pair in pairs.filter { it.enabled }) {
                 progress("Inventaire de ${pair.name}")
                 listPair(drive, pair, pairs, ctx)
             }
+            // Livres rattachés à un dossier qui n'est plus synchronisé : vérifiés un par un.
+            val pairFolders = pairs.map { it.driveFolderId }.toSet()
+            books.all().filter { it.parentId !in pairFolders && it.effectiveParentId !in pairFolders }
+                .forEach { reconcileMissing(drive, it, pairs, ctx) }
             // Inventaire hebdomadaire : les pistes de tous les livres synchronisés sont relistées.
             val metadataFolders = pairs.filter { it.enabled && it.mode != PairMode.ON_OPEN }.map { it.driveFolderId }
             if (metadataFolders.isNotEmpty()) books.invalidateTracksIn(metadataFolders)
@@ -73,7 +94,7 @@ class LibraryScanner(
             if (ctx.initialInventory) {
                 history.log(
                     type = SyncEventType.LIBRARY_CHANGE,
-                    path = pairs.firstOrNull { it.status == BookStatus.UNSORTED }?.drivePath ?: "/AudioBook",
+                    path = pairs.firstOrNull { it.status == BookStatus.UNSORTED }?.drivePath ?: DriveLibraryDefaults.ROOT_PATH,
                     message = "Inventaire complet : ${books.count()} livres trouvés.",
                     runId = ctx.runId,
                 )
@@ -83,7 +104,7 @@ class LibraryScanner(
             var token = state.pageToken!!
             while (true) {
                 val page = drive.changes(token)
-                applyChanges(drive, page.changes.map { it.fileId to it }, pairs, ctx)
+                applyChanges(drive, page.changes, pairs, ctx)
                 val next = page.nextPageToken ?: page.newStartPageToken ?: break
                 settings.updateSyncState { it.copy(pageToken = next) }
                 if (page.nextPageToken == null) break
@@ -96,11 +117,10 @@ class LibraryScanner(
 
     /** Inventaire des livres d'un dossier de statut. */
     suspend fun listPair(drive: DriveService, pair: SyncPairEntity, pairs: List<SyncPairEntity>, ctx: RunContext) {
-        val pairFolders = pairs.map { it.driveFolderId }.toSet()
         val children = drive.listChildren(pair.driveFolderId)
         val present = HashSet<String>()
         for (child in children) {
-            if (child.id in pairFolders) continue
+            if (isStatusFolder(child, pair, pairs)) continue
             val kind = classify(child) ?: continue
             present += child.id
             upsertFromDrive(child, pair, kind, ctx)
@@ -111,14 +131,10 @@ class LibraryScanner(
         pairsDao.setLastInventory(pair.id, clock.now())
     }
 
-    private suspend fun applyChanges(
-        drive: DriveService,
-        changes: List<Pair<String, com.julienmiquel.audiotheque.sync.drive.DriveChange>>,
-        pairs: List<SyncPairEntity>,
-        ctx: RunContext,
-    ) {
+    private suspend fun applyChanges(drive: DriveService, changes: List<DriveChange>, pairs: List<SyncPairEntity>, ctx: RunContext) {
         val pairByFolder = pairs.associateBy { it.driveFolderId }
-        for ((fileId, change) in changes) {
+        for (change in changes) {
+            val fileId = change.fileId
             val file = change.file
             if (change.removed || file == null || file.trashed) {
                 books.get(fileId)?.let {
@@ -132,9 +148,13 @@ class LibraryScanner(
                 }
                 continue
             }
-            if (file.id in pairByFolder) continue
             val pair = file.parents.firstNotNullOfOrNull { pairByFolder[it] }
+            if (isStatusFolder(file, pair, pairs)) continue
             if (pair != null) {
+                val known = books.get(file.id)
+                // Dossier en pause : ni nouveau livre ni mise à jour. Seul un livre qui y arrive
+                // depuis un autre statut voit son statut suivre Drive.
+                if (!pair.enabled && (known == null || known.parentId == pair.driveFolderId)) continue
                 classify(file)?.let { upsertFromDrive(file, pair, it, ctx) }
                 continue
             }
@@ -169,6 +189,7 @@ class LibraryScanner(
                 parsedAuthor = parsed.author,
                 parsedNarrator = parsed.narrator,
                 normalizedKey = TextNormalizer.key(parsed.title),
+                authorKey = TextNormalizer.keyOrNull(parsed.author),
                 sizeBytes = if (kind == BookKind.FOLDER) 0 else file.size ?: 0,
                 trackCount = if (kind == BookKind.SINGLE_FILE) 1 else 0,
                 addedAt = file.createdTime ?: now,
@@ -193,10 +214,17 @@ class LibraryScanner(
         }
         if (existing.name != file.name) {
             val parsed = FolderNameParser.parse(file.name, isFile = kind != BookKind.FOLDER)
-            books.updateDriveName(file.id, file.name, parsed.title, parsed.author, parsed.narrator, TextNormalizer.key(parsed.title))
+            books.updateDriveName(
+                file.id, file.name, parsed.title, parsed.author, parsed.narrator,
+                TextNormalizer.key(parsed.title), TextNormalizer.keyOrNull(parsed.author),
+            )
+        } else if (existing.authorKey != existing.expectedAuthorKey) {
+            // Clé d'auteur absente (base antérieure) ou périmée.
+            books.setAuthorKey(file.id, existing.expectedAuthorKey)
         }
         if (existing.modifiedAt != file.modifiedTime) books.updateModifiedAt(file.id, file.modifiedTime)
         if (kind != BookKind.FOLDER && file.size != null && file.size != existing.sizeBytes) books.updateSize(file.id, file.size)
+        if (kind == BookKind.SINGLE_FILE) refreshSingleTrack(file)
         if (existing.parentId != pair.driveFolderId) {
             val pairs = pairsDao.all()
             db.withTransaction {
@@ -218,6 +246,24 @@ class LibraryScanner(
         }
     }
 
+    /** Piste isolée modifiée dans Drive (taille, checksum, nom) : l'ancienne copie locale est écartée. */
+    private suspend fun refreshSingleTrack(file: DriveFile) {
+        val fresh = singleTrack(file)
+        val old = tracks.get(file.id)
+        if (old == null) {
+            tracks.upsertAll(listOf(fresh))
+            return
+        }
+        val contentChanged = (file.md5 != null && old.md5 != null && old.md5 != file.md5) || old.sizeBytes != fresh.sizeBytes
+        if (!contentChanged && old.md5 == fresh.md5 && old.name == fresh.name) return
+        if (contentChanged) {
+            localFiles.deleteTrackFiles(old, updateDb = false)
+            tracks.update(fresh)
+        } else {
+            tracks.update(old.copy(name = fresh.name, title = fresh.title, md5 = fresh.md5 ?: old.md5, modifiedAt = fresh.modifiedAt))
+        }
+    }
+
     private suspend fun reconcileMissing(drive: DriveService, book: BookEntity, pairs: List<SyncPairEntity>, ctx: RunContext) {
         try {
             val file = drive.getFile(book.driveId)
@@ -232,8 +278,32 @@ class LibraryScanner(
         }
     }
 
-    /** Livre disparu de Drive : on retire ses fichiers locaux ; sa progression est conservée. */
+    /** Retraits reportés pendant l'écoute : refaits dès que le livre n'est plus dans le lecteur. */
+    private suspend fun reconcileDeferred(drive: DriveService, pairs: List<SyncPairEntity>, ctx: RunContext) {
+        for (id in deferredRemovals.toList()) {
+            if (isBookInUse(id)) continue
+            deferredRemovals -= id
+            books.get(id)?.let { reconcileMissing(drive, it, pairs, ctx) }
+        }
+    }
+
+    /**
+     * Livre disparu de Drive : on retire ses fichiers locaux ; sa progression est conservée. Le
+     * livre en cours de lecture est gardé jusqu'à la fin de l'écoute (retrait reporté).
+     */
     suspend fun removeBook(book: BookEntity, reason: String, ctx: RunContext?) {
+        if (isBookInUse(book.driveId)) {
+            if (deferredRemovals.add(book.driveId)) {
+                history.log(
+                    type = SyncEventType.LIBRARY_CHANGE,
+                    path = book.name,
+                    book = book,
+                    message = "${reason.replaceFirstChar { it.uppercase() }} : livre gardé jusqu'à la fin de l'écoute en cours",
+                    runId = ctx?.runId,
+                )
+            }
+            return
+        }
         var freed = 0L
         tracks.forBook(book.driveId).forEach { freed += localFiles.deleteTrackFiles(it, updateDb = false) }
         book.coverPath?.let { path -> if (path.startsWith(storage.coversDir().path)) File(path).delete() }
@@ -261,6 +331,15 @@ class LibraryScanner(
             else -> null
         }
 
+        /**
+         * Dossier de statut ou de collection (« _Nouveaux », « _meditations »…) : jamais un livre,
+         * même si sa paire a été retirée. À la racine, les dossiers « _… » sont réservés aux statuts.
+         */
+        fun isStatusFolder(file: DriveFile, parentPair: SyncPairEntity?, pairs: List<SyncPairEntity>): Boolean =
+            pairs.any { it.driveFolderId == file.id } ||
+                file.id in DriveLibraryDefaults.FOLDER_IDS ||
+                (file.isFolder && file.name.startsWith("_") && parentPair?.status == BookStatus.UNSORTED)
+
         fun singleTrack(file: DriveFile): TrackEntity {
             val parsed = TrackNameParser.parse(file.name)
             return TrackEntity(
@@ -282,6 +361,18 @@ class LibraryScanner(
     }
 }
 
+/** Livres traités par une passe du [MetadataProber]. */
+enum class ProbeScope {
+    /** Livres à télécharger (_En écoute, collections en réception complète) : avant les transferts. */
+    DOWNLOADS,
+
+    /** Le reste de la bibliothèque, après les transferts. */
+    LIBRARY,
+
+    /** Tout (dossier « à l'ouverture »). */
+    ALL,
+}
+
 /**
  * Métadonnées des livres non téléchargés : liste des pistes, durée estimée à partir des
  * premiers Ko de la première piste (débit), voix lue dans les tags ID3, pochette.
@@ -296,32 +387,54 @@ class MetadataProber(
     private val books = db.bookDao()
     private val tracks = db.trackDao()
 
-    /** [onlyPair] : inventaire d'un dossier « à l'ouverture ». */
-    suspend fun run(drive: DriveService, ctx: RunContext?, onlyPair: SyncPairEntity? = null, progress: (String) -> Unit = {}) {
+    /**
+     * [onlyPair] : inventaire d'un dossier « à l'ouverture ». [allowContent] faux (réseau mesuré
+     * en mode « Wi-Fi uniquement ») : listes des pistes seulement, sans échantillon audio ni
+     * pochette. Retourne vrai si du contenu reste à lire au retour du Wi-Fi.
+     */
+    suspend fun run(
+        drive: DriveService,
+        ctx: RunContext?,
+        onlyPair: SyncPairEntity? = null,
+        scope: ProbeScope = ProbeScope.ALL,
+        allowContent: Boolean = true,
+        progress: (String) -> Unit = {},
+    ): Boolean {
         val pairs = db.syncPairDao().all()
         val eligible: Set<String> = if (onlyPair != null) {
             setOf(onlyPair.driveFolderId)
         } else {
             pairs.filter { it.enabled && it.mode != PairMode.ON_OPEN }.map { it.driveFolderId }.toSet()
         }
+        val fullFolders = pairs.filter { it.enabled && it.mode == PairMode.FULL }.map { it.driveFolderId }.toSet()
         fun isEligible(b: BookEntity) = b.parentId in eligible || b.effectiveParentId in eligible
+        fun isDownloaded(b: BookEntity) = b.effectiveParentId in fullFolders
+        fun inScope(b: BookEntity) = when (scope) {
+            ProbeScope.DOWNLOADS -> isDownloaded(b)
+            ProbeScope.LIBRARY -> !isDownloaded(b)
+            ProbeScope.ALL -> true
+        }
 
         val toList = books.all().filter { b ->
-            b.kind == BookKind.FOLDER && isEligible(b) &&
+            b.kind == BookKind.FOLDER && isEligible(b) && inScope(b) &&
                 (b.tracksSyncedAt == null || b.effectiveStatus == BookStatus.IN_PROGRESS)
         }
         toList.forEachIndexed { i, book ->
             progress("Pistes ${i + 1}/${toList.size} : ${book.displayTitle}")
-            guarded(book, ctx) { inventoryTracks(drive, book) }
+            guarded(book, ctx) { inventoryTracks(drive, book, withCover = allowContent) }
         }
 
+        // Les livres téléchargés ont leur durée exacte à l'arrivée des pistes : pas d'échantillon.
+        if (scope == ProbeScope.DOWNLOADS) return false
         val toProbe = books.all().filter { b ->
-            isEligible(b) && b.kind != BookKind.ZIP && b.probedAt == null && b.trackCount > 0 && !b.durationExact
+            isEligible(b) && inScope(b) && b.kind != BookKind.ZIP && b.probedAt == null && b.trackCount > 0 && !b.durationExact
         }
+        if (!allowContent) return toProbe.isNotEmpty()
         toProbe.forEachIndexed { i, book ->
             progress("Durées ${i + 1}/${toProbe.size} : ${book.displayTitle}")
             guarded(book, ctx) { probe(drive, book) }
         }
+        return false
     }
 
     private suspend fun guarded(book: BookEntity, ctx: RunContext?, block: suspend () -> Unit) {
@@ -331,60 +444,64 @@ class MetadataProber(
             throw e
         } catch (e: DriveAuthException) {
             throw e
-        } catch (e: java.io.IOException) {
-            if (e !is com.julienmiquel.audiotheque.sync.drive.DriveHttpException) throw e // réseau : on arrête
+        } catch (e: IOException) {
+            if (e !is DriveHttpException) throw e // réseau : on arrête
             history.log(SyncEventType.ERROR, book.name, book, result = EventResult.ERROR, message = e.message, runId = ctx?.runId)
             ctx?.errors?.incrementAndGet()
         }
     }
 
     /** Liste les pistes d'un livre (sous-dossiers « CD1 », « CD2 »… compris). */
-    suspend fun inventoryTracks(drive: DriveService, book: BookEntity) {
+    suspend fun inventoryTracks(drive: DriveService, book: BookEntity, withCover: Boolean = true) {
         val files = listRecursive(drive, book.driveId, "", 0)
         val audio = files.filter { it.second.isAudio }
         val fileById = audio.associate { it.second.id to it.second }
-        val existing = tracks.forBook(book.driveId).associateBy { it.driveId }
         val sorted = TrackOrdering.sort(audio.map { TrackCandidate(it.second.id, it.first, it.second.name) })
-        val entities = sorted.mapIndexed { index, (candidate, parsed) ->
-            val f = fileById.getValue(candidate.id)
-            val old = existing[candidate.id]
-            val changed = old != null && ((f.md5 != null && old.md5 != null && old.md5 != f.md5) || old.sizeBytes != (f.size ?: 0))
-            if (changed && old != null) localFiles.deleteTrackFiles(old, updateDb = false)
-            val keep = old != null && !changed
-            TrackEntity(
-                driveId = candidate.id,
-                bookId = book.driveId,
-                name = f.name,
-                relativePath = candidate.relativePath,
-                sortIndex = index,
-                number = parsed.number,
-                part = parsed.part,
-                chapter = parsed.chapter,
-                title = parsed.title,
-                durationMs = if (keep) old?.durationMs else null,
-                durationExact = if (keep) old?.durationExact ?: false else false,
-                sizeBytes = f.size ?: 0,
-                md5 = f.md5,
-                mimeType = f.mimeType,
-                localPath = if (keep) old?.localPath else null,
-                state = if (keep) old?.state ?: TrackState.ABSENT else TrackState.ABSENT,
-                downloadedBytes = if (keep) old?.downloadedBytes ?: 0 else 0,
-                modifiedAt = f.modifiedTime,
-            )
-        }
-        existing.values.filter { it.driveId !in fileById }.forEach { localFiles.deleteTrackFiles(it, updateDb = false) }
-        // Durées manquantes : proportionnelles à la taille, d'après les pistes déjà connues.
-        val known = entities.filter { (it.durationMs ?: 0) > 0 }
-        val msPerByte = if (known.isNotEmpty() && known.sumOf { it.sizeBytes } > 0) {
-            known.sumOf { it.durationMs!! }.toDouble() / known.sumOf { it.sizeBytes }
-        } else {
-            null
-        }
-        val completed = entities.map { t ->
-            if (t.durationMs == null && msPerByte != null) t.copy(durationMs = (t.sizeBytes * msPerByte).toLong()) else t
-        }
-        val totalDuration = completed.mapNotNull { it.durationMs }.sum().takeIf { completed.all { t -> t.durationMs != null } && completed.isNotEmpty() }
+        val staleFiles = mutableListOf<TrackEntity>()
         db.withTransaction {
+            // Pistes relues dans la transaction : un téléchargement ou une durée exacte enregistrés
+            // pendant la lecture de Drive ne sont pas écrasés par une copie périmée.
+            if (books.get(book.driveId) == null) return@withTransaction
+            val existing = tracks.forBook(book.driveId).associateBy { it.driveId }
+            val entities = sorted.mapIndexed { index, (candidate, parsed) ->
+                val f = fileById.getValue(candidate.id)
+                val old = existing[candidate.id]
+                val changed = old != null && ((f.md5 != null && old.md5 != null && old.md5 != f.md5) || old.sizeBytes != (f.size ?: 0))
+                if (changed && old != null) staleFiles += old
+                val keep = old != null && !changed
+                TrackEntity(
+                    driveId = candidate.id,
+                    bookId = book.driveId,
+                    name = f.name,
+                    relativePath = candidate.relativePath,
+                    sortIndex = index,
+                    number = parsed.number,
+                    part = parsed.part,
+                    chapter = parsed.chapter,
+                    title = parsed.title,
+                    durationMs = if (keep) old?.durationMs else null,
+                    durationExact = if (keep) old?.durationExact ?: false else false,
+                    sizeBytes = f.size ?: 0,
+                    md5 = f.md5,
+                    mimeType = f.mimeType,
+                    localPath = if (keep) old?.localPath else null,
+                    state = if (keep) old?.state ?: TrackState.ABSENT else TrackState.ABSENT,
+                    downloadedBytes = if (keep) old?.downloadedBytes ?: 0 else 0,
+                    modifiedAt = f.modifiedTime,
+                )
+            }
+            existing.values.filter { it.driveId !in fileById }.forEach { staleFiles += it }
+            // Durées manquantes : proportionnelles à la taille, d'après les pistes déjà connues.
+            val known = entities.filter { (it.durationMs ?: 0) > 0 }
+            val msPerByte = if (known.isNotEmpty() && known.sumOf { it.sizeBytes } > 0) {
+                known.sumOf { it.durationMs!! }.toDouble() / known.sumOf { it.sizeBytes }
+            } else {
+                null
+            }
+            val completed = entities.map { t ->
+                if (t.durationMs == null && msPerByte != null) t.copy(durationMs = (t.sizeBytes * msPerByte).toLong()) else t
+            }
+            val totalDuration = completed.mapNotNull { it.durationMs }.sum().takeIf { completed.all { t -> t.durationMs != null } && completed.isNotEmpty() }
             tracks.upsertAll(completed)
             tracks.deleteMissing(book.driveId, completed.map { it.driveId })
             books.updateTrackStats(
@@ -396,9 +513,11 @@ class MetadataProber(
                 syncedAt = clock.now(),
             )
         }
-        val image = files.filter { it.second.isImage }.minByOrNull { coverRank(it.second.name) }?.second
-        if (image != null && book.coverPath?.let { File(it).exists() } != true) {
-            saveCover(drive, book, image)
+        // Fichiers périmés (piste remplacée ou retirée dans Drive) supprimés hors transaction.
+        staleFiles.forEach { localFiles.deleteTrackFiles(it, updateDb = false) }
+        if (withCover) {
+            val image = files.filter { it.second.isImage }.minByOrNull { coverRank(it.second.name) }?.second
+            if (image != null && book.coverPath?.let { File(it).exists() } != true) saveCover(drive, book, image)
         }
     }
 
@@ -434,6 +553,11 @@ class MetadataProber(
 
     /** Lit les premiers Ko de la première piste pour connaître le débit, puis estime la durée. */
     suspend fun probe(drive: DriveService, book: BookEntity) {
+        // Pochette du dossier pas encore lue (liste faite sur réseau mesuré) : une requête légère.
+        if (book.kind == BookKind.FOLDER && book.coverPath == null) {
+            drive.listChildren(book.driveId).filter { it.isImage }.minByOrNull { coverRank(it.name) }?.let { saveCover(drive, book, it) }
+        }
+        val fresh = books.get(book.driveId) ?: return
         val bookTracks = tracks.forBook(book.driveId)
         val first = bookTracks.firstOrNull() ?: return
         val isMp3 = first.mimeType == "audio/mpeg" || first.name.endsWith(".mp3", ignoreCase = true)
@@ -454,7 +578,7 @@ class MetadataProber(
             var total = 0L
             var allExact = true
             db.withTransaction {
-                for (t in bookTracks) {
+                for (t in tracks.forBook(book.driveId)) {
                     if (t.durationExact && t.durationMs != null) {
                         total += t.durationMs!!
                     } else {
@@ -468,7 +592,7 @@ class MetadataProber(
             }
         }
         val picture = info.tags?.picture
-        if (picture != null && book.coverPath?.let { File(it).exists() } != true) {
+        if (picture != null && fresh.coverPath?.let { File(it).exists() } != true) {
             val ext = if (info.tags?.pictureMime?.contains("png") == true) "png" else "jpg"
             val file = File(storage.coversDir(), "${book.driveId}.$ext")
             file.writeBytes(picture)

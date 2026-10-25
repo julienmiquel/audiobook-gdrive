@@ -17,6 +17,9 @@ object DriveLibraryDefaults {
 
     const val ROOT_PATH = "/AudioBook"
 
+    /** Dossiers de statut et de collection : jamais des livres, même si leur paire est retirée. */
+    val FOLDER_IDS: Set<String> = setOf(ROOT_ID, NEW_ID, IN_PROGRESS_ID, LATER_ID, DONE_ID, ARCHIVES_ID, MEDITATIONS_ID)
+
     /** Une paire par statut, créée par défaut dans l'écran Dossiers synchronisés. */
     fun defaultPairs(): List<SyncPairEntity> = listOf(
         pair(BookStatus.IN_PROGRESS, "_En écoute", IN_PROGRESS_ID, PairMode.FULL, 0),

@@ -54,6 +54,7 @@ object Labels {
         SyncTrigger.MANUAL -> "manuelle"
         SyncTrigger.FOLDER_OPEN -> "ouverture d'un dossier"
         SyncTrigger.PLAYBACK -> "lecture"
+        SyncTrigger.WIFI -> "retour du Wi-Fi"
     }
 
     fun result(result: SyncResult): String = when (result) {
@@ -79,11 +80,21 @@ object Labels {
         EventResult.CANCELLED -> "Annulé"
     }
 
-    /** Nom affiché d'une paire : « _meditations » → « Méditations ». */
+    /**
+     * Nom affiché d'une paire : « _A écouter plus tard » → « À écouter plus tard » (capitales
+     * accentuées), « _meditations » → « Méditations ». Le nom du dossier Drive ne change pas.
+     */
     fun pairTitle(pair: SyncPairEntity): String = when {
-        pair.driveFolderId == DriveLibraryDefaults.MEDITATIONS_ID -> "Méditations"
         pair.status == BookStatus.UNSORTED -> "Non classés (racine)"
-        else -> pair.name.trimStart('_').replaceFirstChar { it.titlecase(Locale.FRENCH) }
+        else -> when (pair.driveFolderId) {
+            DriveLibraryDefaults.IN_PROGRESS_ID -> "En écoute"
+            DriveLibraryDefaults.NEW_ID -> "Nouveaux"
+            DriveLibraryDefaults.LATER_ID -> "À écouter plus tard"
+            DriveLibraryDefaults.DONE_ID -> "Écouté"
+            DriveLibraryDefaults.ARCHIVES_ID -> "Archives"
+            DriveLibraryDefaults.MEDITATIONS_ID -> "Méditations"
+            else -> pair.name.trimStart('_').replaceFirstChar { it.titlecase(Locale.FRENCH) }
+        }
     }
 
     /** Destination d'un déplacement (« Déplacer vers… »). */

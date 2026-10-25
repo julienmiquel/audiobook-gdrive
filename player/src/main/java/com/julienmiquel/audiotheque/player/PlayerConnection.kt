@@ -2,11 +2,13 @@ package com.julienmiquel.audiotheque.player
 
 import android.content.ComponentName
 import android.content.Context
+import android.util.Log
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -43,7 +45,10 @@ data class PlayerUiState(
  */
 class PlayerConnection(private val context: Context) {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.Main.immediate +
+            CoroutineExceptionHandler { _, e -> Log.w("PlayerConnection", "Service de lecture injoignable", e) },
+    )
     private val mutex = Mutex()
     private var controller: MediaController? = null
     private var ticker: Job? = null
@@ -98,16 +103,6 @@ class PlayerConnection(private val context: Context) {
         }
     }
 
-    /** Charge un livre sans lancer la lecture (écran Lecteur ouvert sur un livre). */
-    fun loadBook(bookId: String) {
-        scope.launch {
-            val c = controller()
-            if (currentBookId(c) == bookId) return@launch
-            c.setMediaItem(MediaItem.Builder().setMediaId(MediaIds.bookRequest(bookId)).build())
-            c.prepare()
-        }
-    }
-
     fun togglePlayPause() = withController { c -> if (c.isPlaying) c.pause() else c.play() }
 
     fun pause() = withController { it.pause() }
@@ -142,9 +137,6 @@ class PlayerConnection(private val context: Context) {
     private fun withController(block: (MediaController) -> Unit) {
         scope.launch { block(controller()) }
     }
-
-    private fun currentBookId(c: Player): String? =
-        c.currentMediaItem?.mediaId?.let { MediaIds.parseTrack(it)?.bookId }
 
     private fun startTicker() {
         ticker?.cancel()

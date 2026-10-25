@@ -40,8 +40,6 @@ class StatusGesturesTest {
         override fun requestSync(trigger: SyncTrigger) {
             requests += trigger
         }
-
-        override fun requestFolderRefresh(pairId: Long) = Unit
     }
     private var now = 1_000_000L
     private val clock = Clock { now }
@@ -99,8 +97,11 @@ class StatusGesturesTest {
         gestures.undo(result)
 
         val b = db.bookDao().get("police")!!
-        assertThat(b.pendingStatus).isNull()
         assertThat(b.effectiveStatus).isEqualTo(BookStatus.NEW)
+        // Le déplacement aller est peut-être en cours : le statut reste « en attente » (vers le
+        // dossier d'origine) jusqu'à ce que le moteur ait vérifié Drive, sans changer de date.
+        assertThat(b.pendingParentId).isEqualTo(DriveLibraryDefaults.NEW_ID)
+        assertThat(b.pendingSince).isEqualTo(b.statusChangedAt)
         // L'opération restante vise le dossier d'origine : sans effet dans Drive.
         db.pendingOperationDao().all().forEach { assertThat(it.toParentId).isEqualTo(DriveLibraryDefaults.NEW_ID) }
     }
@@ -147,6 +148,69 @@ class StatusGesturesTest {
         assertThat(p.finished).isFalse()
         assertThat(p.positionMs).isEqualTo(0)
         assertThat(p.speed).isEqualTo(1.3f) // vitesse mémorisée par livre
+    }
+
+    @Test
+    fun `Réécouter un livre pas fini garde sa position`() = runBlocking<Unit> {
+        // « Les guerriers de l'hiver » : dans _Ecouté à 46 % (exemple de la spécification).
+        book("guerriers", "Les guerriers de l'hiver", DriveLibraryDefaults.DONE_ID, BookStatus.DONE)
+        val account = settings.current().accountKey
+        db.progressDao().upsert(ProgressEntity(bookId = "guerriers", account = account, trackIndex = 5, positionMs = 61_000, percent = 46f, updatedAt = 1))
+
+        gestures.apply("guerriers", Gesture.REECOUTER)
+
+        val p = db.progressDao().get("guerriers", account)!!
+        assertThat(p.trackIndex).isEqualTo(5)
+        assertThat(p.positionMs).isEqualTo(61_000)
+        assertThat(db.bookDao().get("guerriers")!!.effectiveStatus).isEqualTo(BookStatus.IN_PROGRESS)
+    }
+
+    @Test
+    fun `Annuler rétablit la progression modifiée par le geste`() = runBlocking<Unit> {
+        book("civ", "Civilisations", DriveLibraryDefaults.IN_PROGRESS_ID, BookStatus.IN_PROGRESS)
+        val account = settings.current().accountKey
+        db.progressDao().upsert(ProgressEntity(bookId = "civ", account = account, trackIndex = 4, positionMs = 9_000, percent = 52f, updatedAt = 1))
+
+        val marked = gestures.apply("civ", Gesture.MARQUER_ECOUTE)!!
+        assertThat(db.progressDao().get("civ", account)!!.finished).isTrue()
+        now += 3_000
+        gestures.undo(marked)
+
+        val p = db.progressDao().get("civ", account)!!
+        assertThat(p.finished).isFalse()
+        assertThat(p.positionMs).isEqualTo(9_000)
+        assertThat(db.bookDao().get("civ")!!.effectiveStatus).isEqualTo(BookStatus.IN_PROGRESS)
+
+        val setAside = gestures.apply("civ", Gesture.METTRE_DE_COTE)!!
+        assertThat(db.progressDao().get("civ", account)!!.setAsideAtPercent).isEqualTo(52f)
+        gestures.undo(setAside)
+        assertThat(db.progressDao().get("civ", account)!!.setAsideAtPercent).isNull()
+    }
+
+    @Test
+    fun `Annuler remet le livre dans son dossier de départ, pas le premier du même statut`() = runBlocking<Unit> {
+        val contesId = db.syncPairDao().insert(
+            com.julienmiquel.audiotheque.core.db.SyncPairEntity(
+                status = BookStatus.COLLECTION,
+                name = "_contes",
+                driveFolderId = "contes-folder",
+                drivePath = "/AudioBook/_contes",
+                mode = com.julienmiquel.audiotheque.core.model.PairMode.ON_OPEN,
+                position = 7,
+            ),
+        )
+        book("conte", "Le petit prince", "contes-folder", BookStatus.COLLECTION)
+
+        val moved = gestures.moveTo("conte", BookStatus.LATER)!!
+        assertThat(moved.fromParentId).isEqualTo("contes-folder")
+        gestures.undo(moved)
+
+        val b = db.bookDao().get("conte")!!
+        assertThat(b.parentId).isEqualTo("contes-folder")
+        // Pas _meditations, la première paire « collection ».
+        assertThat(b.pendingParentId).isEqualTo("contes-folder")
+        assertThat(db.pendingOperationDao().all().single().toParentId).isEqualTo("contes-folder")
+        assertThat(db.syncPairDao().get(contesId)).isNotNull()
     }
 
     @Test
@@ -197,5 +261,30 @@ class StatusGesturesTest {
         // La recherche porte sur toute la bibliothèque, quel que soit l'onglet.
         assertThat(LibraryRepository.filter(items, BookStatus.UNSORTED, query = "gary").map { it.id }).containsExactly("c")
         assertThat(LibraryRepository.filter(items, BookStatus.NEW, narrator = "thierry blanc").map { it.id }).containsExactly("c")
+    }
+
+    @Test
+    fun `doublons - même titre, sauf si les deux auteurs connus diffèrent`() = runBlocking<Unit> {
+        fun entity(id: String, title: String, author: String?) = BookEntity(
+            driveId = id, name = listOfNotNull(author, title).joinToString(" - "), parentId = DriveLibraryDefaults.NEW_ID,
+            status = BookStatus.NEW, statusChangedAt = 0, parsedTitle = title, parsedAuthor = author,
+            normalizedKey = TextNormalizer.key(title), authorKey = TextNormalizer.keyOrNull(author), addedAt = 0,
+        )
+        db.bookDao().upsertAll(
+            listOf(
+                entity("dune-herbert", "Dune", "Frank Herbert"),
+                entity("dune-autre", "Dune", "Autre Auteur"),
+                entity("abri-1", "Abri de fortune", "Paul Cassidy"),
+                entity("abri-2", "Abri de fortune", null),
+            ),
+        )
+        val repo = LibraryRepository(db, settings)
+        val items = repo.observeLibrary().first().associateBy { it.id }
+
+        assertThat(items.getValue("dune-herbert").isDuplicate).isFalse()
+        assertThat(items.getValue("dune-autre").isDuplicate).isFalse()
+        assertThat(items.getValue("abri-1").isDuplicate).isTrue()
+        assertThat(items.getValue("abri-2").isDuplicate).isTrue()
+        assertThat(repo.duplicatesOf(db.bookDao().get("abri-1")!!).map { it.driveId }).containsExactly("abri-2")
     }
 }

@@ -78,6 +78,8 @@ data class SyncState(
     val driveQuotaUsed: Long? = null,
     val driveQuotaLimit: Long? = null,
     val quotaUpdatedAt: Long? = null,
+    /** Autorisation Google Drive refusée ou expirée : à renouveler depuis l'app. */
+    val authRequired: Boolean = false,
 )
 
 class SettingsRepository(private val dataStore: DataStore<Preferences>) {
@@ -130,6 +132,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val quotaUsed = longPreferencesKey("drive_quota_used")
         val quotaLimit = longPreferencesKey("drive_quota_limit")
         val quotaUpdatedAt = longPreferencesKey("drive_quota_updated")
+        val authRequired = booleanPreferencesKey("drive_auth_required")
     }
 
     private fun Preferences.toSettings(): AppSettings {
@@ -184,6 +187,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         driveQuotaUsed = this[K.quotaUsed],
         driveQuotaLimit = this[K.quotaLimit],
         quotaUpdatedAt = this[K.quotaUpdatedAt],
+        authRequired = this[K.authRequired] ?: false,
     )
 
     private fun SyncState.writeTo(p: MutablePreferences) {
@@ -193,6 +197,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p.putOrRemove(K.quotaUsed, driveQuotaUsed)
         p.putOrRemove(K.quotaLimit, driveQuotaLimit)
         p.putOrRemove(K.quotaUpdatedAt, quotaUpdatedAt)
+        p[K.authRequired] = authRequired
     }
 
     private fun <T> MutablePreferences.putOrRemove(key: Preferences.Key<T>, value: T?) {

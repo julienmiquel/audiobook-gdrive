@@ -1,8 +1,12 @@
 package com.julienmiquel.audiotheque
 
 import android.app.Application
+import android.app.PendingIntent
+import android.content.Intent
 import android.os.Build
+import com.julienmiquel.audiotheque.auth.DriveAuthorization
 import com.julienmiquel.audiotheque.auth.GoogleAuthManager
+import com.julienmiquel.audiotheque.auth.authErrorMessage
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.model.Accounts
@@ -23,7 +27,6 @@ import com.julienmiquel.audiotheque.player.PlayerConnection
 import com.julienmiquel.audiotheque.player.PlayerDependencies
 import com.julienmiquel.audiotheque.player.PlayerDependenciesProvider
 import com.julienmiquel.audiotheque.sync.demo.FakeDriveService
-import com.julienmiquel.audiotheque.sync.drive.AccessTokenProvider
 import com.julienmiquel.audiotheque.sync.drive.DriveAbout
 import com.julienmiquel.audiotheque.sync.drive.RestDriveService
 import com.julienmiquel.audiotheque.sync.engine.AndroidNetworkStatus
@@ -40,7 +43,9 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -50,6 +55,10 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.OkHttpClient
 
 /** Assemblage des modules (injection manuelle). */
@@ -165,10 +174,6 @@ class AppContainer(private val app: Application) {
         appScope.launch { gestures.undo(result) }
     }
 
-    fun selectBook(bookId: String) {
-        _selectedBookId.value = bookId
-    }
-
     /** Lecture (fichiers locaux uniquement) ; sans [autoPlay], le livre est seulement positionné. */
     fun playBook(bookId: String, trackId: String? = null, positionMs: Long? = null, autoPlay: Boolean = true) {
         _selectedBookId.value = bookId
@@ -203,52 +208,148 @@ class AppContainer(private val app: Application) {
         }
     }
 
-    /** Adresse du compte autorisé (about.get), quand l'autorisation ne la fournit pas. */
-    suspend fun identify(accessToken: String): DriveAbout? = runCatching {
-        val tokenProvider = object : AccessTokenProvider {
-            override suspend fun accessToken(): String = accessToken
-            override suspend fun invalidate(token: String) = Unit
+    /**
+     * Adresse du compte qui vient d'autoriser Drive, quand l'autorisation ne la donne pas : about.get
+     * par le moteur (seul accès à Drive), avec le jeton qui vient d'être accordé.
+     */
+    suspend fun identify(): DriveAbout? = engine.identifyAccount(restDrive)
+
+    /** Autorisation Google Drive refusée ou expirée : bandeau « Renouveler » jusqu'à la prochaine synchro réussie. */
+    val authRequired: Flow<Boolean> = settings.syncState.map { it.authRequired }.distinctUntilChanged()
+
+    /** Bandeau « Renouveler » : autorisation silencieuse si possible, sinon écran de consentement Google. */
+    suspend fun renewAuthorization(): AuthRenewal {
+        val s = settings.current()
+        if (s.demoMode) {
+            demoDrive.authExpired = false
+            return renewed()
         }
-        RestDriveService(http, tokenProvider, maxAttempts = 1).about()
-    }.getOrNull()
+        val email = s.accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
+        return runCatching { auth.authorize(email) }.fold(
+            onSuccess = { authorization -> onAuthorization(authorization, email, consentShown = false) },
+            onFailure = { AuthRenewal.Failed(authErrorMessage(it)) },
+        )
+    }
+
+    /** Retour de l'écran de consentement Google ouvert par [renewAuthorization]. */
+    suspend fun completeRenewal(accepted: Boolean, data: Intent?): AuthRenewal {
+        if (!accepted) return AuthRenewal.Failed("Autorisation Google Drive refusée : la synchro reste en pause.")
+        val email = settings.current().accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
+        return runCatching { auth.consentResult(data) }.fold(
+            onSuccess = { authorization -> onAuthorization(authorization, email, consentShown = true) },
+            onFailure = { AuthRenewal.Failed(authErrorMessage(it)) },
+        )
+    }
+
+    private suspend fun onAuthorization(authorization: DriveAuthorization, email: String, consentShown: Boolean): AuthRenewal =
+        when (authorization) {
+            is DriveAuthorization.NeedsConsent ->
+                if (consentShown) AuthRenewal.Failed("Autorisation incomplète : réessayez.") else AuthRenewal.NeedsConsent(authorization.pendingIntent)
+            is DriveAuthorization.Granted -> {
+                val granted = authorization.email
+                if (granted != null && !granted.equals(email, ignoreCase = true)) {
+                    // Jamais le Drive d'un autre compte face à cette bibliothèque.
+                    auth.invalidate(authorization.accessToken)
+                    AuthRenewal.Failed("Choisissez le compte $email : la bibliothèque synchronisée est la sienne.")
+                } else {
+                    renewed()
+                }
+            }
+        }
+
+    /** Sans interruption : effacer le drapeau retire le bandeau, et avec lui la portée qui l'appelle. */
+    private suspend fun renewed(): AuthRenewal = withContext(NonCancellable) {
+        settings.updateSyncState { it.copy(authRequired = false) }
+        syncNotifications.dismissAuthRequired()
+        // Déplacements en file et progression : envoyés aussitôt.
+        scheduler.requestSync(SyncTrigger.MANUAL)
+        AuthRenewal.Done
+    }
+
+    /** Connexion, sortie du mode démo et déconnexion ne se chevauchent pas. */
+    private val accountLock = Mutex()
 
     /** Compte connecté : la progression locale lui est rattachée. */
-    suspend fun onSignedIn(email: String, name: String?) {
+    suspend fun onSignedIn(email: String, name: String?) = accountLock.withLock {
         settings.update { it.copy(accountEmail = email, accountName = name, demoMode = false, onboardingDone = true) }
         database.progressDao().migrateAccount(Accounts.LOCAL, email)
-        settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null) }
+        settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
+        syncNotifications.dismissAuthRequired()
         scheduler.schedulePeriodic(settings.current())
         scheduler.requestSync(SyncTrigger.LAUNCH)
     }
 
-    /** Mode démo : Drive simulé, aucune donnée ne quitte le téléphone. */
-    suspend fun startDemo() {
+    /** Mode démo : Drive simulé, sans compte Google. */
+    suspend fun startDemo() = accountLock.withLock {
         demoDrive.reset()
         settings.update { it.copy(demoMode = true, onboardingDone = true) }
-        settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null) }
+        settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
+        syncNotifications.dismissAuthRequired()
         scheduler.schedulePeriodic(settings.current())
         scheduler.requestSync(SyncTrigger.LAUNCH)
     }
 
-    /** Déconnexion ou sortie du mode démo : la bibliothèque locale est vidée, les fichiers aussi. */
-    suspend fun signOut() {
+    /**
+     * Déconnexion ou sortie du mode démo : plus aucune tâche de fond, fin de la synchro en cours,
+     * progression écrite une dernière fois dans l'espace caché du compte, puis bibliothèque locale
+     * et pistes effacées du téléphone. La progression (propre à chaque compte) et les signets
+     * restent ; ceux du mode démo sont effacés avec lui.
+     */
+    suspend fun signOut() = accountLock.withLock {
+        val wasDemo = settings.current().demoMode
         scheduler.cancelAll()
+        syncNotifications.dismissAuthRequired()
         player.stopAndClear()
         BookInUse.set(null)
         _selectedBookId.value = null
+        withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.pushProgressBeforeSignOut() }
+        // Plus de compte : aucune synchro ne peut repartir pendant l'effacement.
+        settings.update { it.copy(accountEmail = null, accountName = null, demoMode = false, lastPlayedBookId = null) }
+        withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.awaitIdle() }
         auth.signOut()
-        val tracks = database.trackDao().withLocalData()
-        tracks.forEach { t ->
-            t.localPath?.let { path ->
-                File(path).delete()
-                File("$path.part").delete()
+        withContext(Dispatchers.IO) {
+            val dirs = mutableSetOf<File>()
+            database.trackDao().withLocalData().forEach { t ->
+                t.localPath?.let { path ->
+                    File(path).delete()
+                    File("$path.part").delete()
+                    File(path).parentFile?.let(dirs::add)
+                }
             }
+            // Dossiers de livres vidés, jusqu'à la racine Audiobooks (gardée), et pochettes locales.
+            dirs.forEach { start ->
+                var dir: File? = start
+                while (dir != null && dir.name != LocalStorage.ROOT_NAME && dir.isDirectory && dir.list()?.isEmpty() == true) {
+                    dir.delete()
+                    dir = dir.parentFile
+                }
+            }
+            storage.coversDir().listFiles()?.forEach { it.delete() }
         }
-        database.clearAllTables()
-        settings.update { it.copy(accountEmail = null, accountName = null, demoMode = false, onboardingDone = false, lastPlayedBookId = null) }
+        if (wasDemo) {
+            database.bookmarkDao().deleteForLibraryBooks()
+            database.progressDao().deleteForAccount(Accounts.DEMO)
+        }
+        database.clearLibrary()
         settings.updateSyncState { SyncState() }
+        settings.update { it.copy(onboardingDone = false) }
         engine.ensureDefaultPairs()
     }
+
+    companion object {
+        /** Attente maximale de la fin de la synchro et de l'écriture de la progression. */
+        private const val SIGN_OUT_WAIT_MS = 20_000L
+    }
+}
+
+/** Issue du renouvellement de l'autorisation Drive lancé depuis le bandeau. */
+sealed interface AuthRenewal {
+    data object Done : AuthRenewal
+
+    /** Écran de consentement Google à ouvrir (choix du compte, autorisations drive et drive.appdata). */
+    data class NeedsConsent(val pendingIntent: PendingIntent) : AuthRenewal
+
+    data class Failed(val message: String) : AuthRenewal
 }
 
 class AudiothequeApp : Application(), SyncComponentProvider, PlayerDependenciesProvider {

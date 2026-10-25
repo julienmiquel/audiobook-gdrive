@@ -12,9 +12,6 @@ import kotlinx.coroutines.flow.asStateFlow
 interface SyncRequester {
     /** Synchro immédiate (au lancement, à chaque changement de statut…). */
     fun requestSync(trigger: SyncTrigger)
-
-    /** Métadonnées d'un dossier « à l'ouverture » (archives, méditations, racine). */
-    fun requestFolderRefresh(pairId: Long)
 }
 
 /** Horloge injectable pour les tests. */

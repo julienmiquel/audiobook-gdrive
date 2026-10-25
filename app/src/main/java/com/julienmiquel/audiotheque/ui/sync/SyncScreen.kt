@@ -76,9 +76,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -111,6 +113,7 @@ import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import com.julienmiquel.audiotheque.ui.common.Tag
 import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -123,6 +126,7 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class SyncUiState(
     val engine: EngineStatus = EngineStatus(),
@@ -251,7 +255,8 @@ class SyncViewModel(private val c: AppContainer) : ViewModel() {
 
     fun removePair(pair: SyncPairEntity) {
         viewModelScope.launch {
-            c.engine.removePair(pair.id)
+            // Fichiers locaux supprimés : hors du thread principal.
+            withContext(Dispatchers.IO) { c.engine.removePair(pair.id) }
             c.message("Paire « ${pair.name} » retirée (rien n'est supprimé dans Drive)")
         }
     }
@@ -337,8 +342,8 @@ fun SyncScreen(onOpenSettings: () -> Unit, contentPadding: PaddingValues) {
     ) { inner ->
         Column(Modifier.padding(inner).fillMaxSize()) {
             PrimaryTabRow(selectedTabIndex = tab) {
-                listOf("Suivi", "Historique", "Dossiers").forEachIndexed { i, label ->
-                    Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label) })
+                listOf("Suivi", "Historique", "Dossiers synchronisés").forEachIndexed { i, label ->
+                    Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label, textAlign = TextAlign.Center, maxLines = 2) })
                 }
             }
             when (tab) {
@@ -553,11 +558,18 @@ private fun EventRow(e: SyncEventEntity) {
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Icon(icon, contentDescription = null, tint = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, modifier = Modifier.size(20.dp))
+        Icon(
+            icon,
+            contentDescription = if (error) "Erreur" else null,
+            tint = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(20.dp),
+        )
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
+            // L'erreur est dite en toutes lettres, pas seulement par la couleur.
+            val kind = if (error && e.type != SyncEventType.ERROR) "Erreur · ${Labels.eventType(e.type)}" else Labels.eventType(e.type)
             Text(
-                listOfNotNull(Labels.eventType(e.type), e.bookTitle).joinToString(" · "),
+                listOfNotNull(kind, e.bookTitle).joinToString(" · "),
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = FontWeight.Medium,
                 color = if (error) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurface,
@@ -698,7 +710,11 @@ private fun PairCard(pair: SyncPairEntity, localRoot: String?, onClick: () -> Un
                 Text(Labels.pairTitle(pair), style = MaterialTheme.typography.titleMedium)
                 Tag(Labels.status(pair.status))
             }
-            Switch(checked = pair.enabled, onCheckedChange = onToggle)
+            Switch(
+                checked = pair.enabled,
+                onCheckedChange = onToggle,
+                modifier = Modifier.semantics { contentDescription = "Synchroniser ${Labels.pairTitle(pair)}" },
+            )
         }
         InfoRow("Drive", pair.drivePath)
         InfoRow("Téléphone", if (pair.mode == PairMode.FULL) (localRoot ?: "Audiobooks") else "Métadonnées uniquement")
