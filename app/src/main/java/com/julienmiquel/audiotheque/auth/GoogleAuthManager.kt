@@ -137,13 +137,25 @@ class GoogleAuthManager(
     }
 }
 
+/**
+ * Google ne reconnaît pas l'app : aucun ID client OAuth Android pour ce nom de paquet et cette
+ * empreinte SHA-1 (DEVELOPER_ERROR, ou code 8 avec le statut UNREGISTERED_ON_API_CONSOLE).
+ */
+private fun Throwable.isUnregisteredApp(): Boolean {
+    val code = (this as? ApiException)?.statusCode
+    val text = message.orEmpty()
+    return code == CommonStatusCodes.DEVELOPER_ERROR ||
+        "UNREGISTERED_ON_API_CONSOLE" in text ||
+        (code == null && ("10:" in text || "DEVELOPER_ERROR" in text))
+}
+
 /** Message d'erreur lisible pour une connexion ou une autorisation Google qui échoue. */
 internal fun authErrorMessage(e: Throwable): String {
     val code = (e as? ApiException)?.statusCode
     val text = e.message.orEmpty()
     return when {
-        code == CommonStatusCodes.DEVELOPER_ERROR || (code == null && ("10:" in text || "DEVELOPER_ERROR" in text)) ->
-            "Application non enregistrée auprès de Google : créez l'ID client OAuth Android (paquet com.julienmiquel.audiotheque + empreinte SHA-1 de la clé de signature) dans Google Cloud. Voir le README."
+        e.isUnregisteredApp() ->
+            "Google ne reconnaît pas l'app (UNREGISTERED_ON_API_CONSOLE) : elle doit être déclarée dans Google Cloud par un ID client OAuth de type Android, avec le nom de paquet et l'empreinte SHA-1 ci-dessous."
         code == CommonStatusCodes.NETWORK_ERROR || (code == null && ("7:" in text || "NETWORK" in text.uppercase())) ->
             "Réseau indisponible : la connexion Google nécessite Internet."
         else -> "Connexion Google impossible : ${text.ifBlank { e.javaClass.simpleName }}"
@@ -151,23 +163,26 @@ internal fun authErrorMessage(e: Throwable): String {
 }
 
 /**
- * Écran d'autorisation Google fermé sans accord. Google ne donne souvent aucune raison : une
+ * Écran d'autorisation Google fermé sans accord. Google ne donne pas toujours de raison : une
  * annulation et une app non déclarée dans Google Cloud (ID client OAuth Android absent) se
- * ressemblent, l'écran se refermant alors aussitôt.
+ * ressemblent alors, l'écran se refermant aussitôt.
  */
-internal fun consentFailureMessage(reason: Throwable?, firstSignIn: Boolean): String = when ((reason as? ApiException)?.statusCode) {
-    CommonStatusCodes.DEVELOPER_ERROR, CommonStatusCodes.NETWORK_ERROR -> authErrorMessage(reason!!)
-    null, CommonStatusCodes.CANCELED ->
-        if (firstSignIn) {
-            "L'autorisation Google Drive n'a pas abouti. Si l'écran Google s'est refermé sans vous laisser choisir de compte, l'app n'est pas encore déclarée dans Google Cloud : voir ci-dessous."
-        } else {
-            "Autorisation Google Drive refusée : la synchro reste en pause."
-        }
-    else -> "Autorisation Google Drive impossible (code ${(reason as ApiException).statusCode} : ${reason.message.orEmpty()})."
+internal fun consentFailureMessage(reason: Throwable?, firstSignIn: Boolean): String {
+    val code = (reason as? ApiException)?.statusCode
+    return when {
+        reason != null && (reason.isUnregisteredApp() || code == CommonStatusCodes.NETWORK_ERROR) -> authErrorMessage(reason)
+        code == null || code == CommonStatusCodes.CANCELED ->
+            if (firstSignIn) {
+                "L'autorisation Google Drive n'a pas abouti. Si l'écran Google s'est refermé sans vous laisser choisir de compte, l'app n'est pas encore déclarée dans Google Cloud : voir ci-dessous."
+            } else {
+                "Autorisation Google Drive refusée : la synchro reste en pause."
+            }
+        else -> "Autorisation Google Drive impossible (code $code : ${reason?.message.orEmpty()})."
+    }
 }
 
 /** Échec qui vient très probablement de la configuration Google Cloud (ID client OAuth Android). */
 internal fun isSetupProblem(reason: Throwable?, consentClosed: Boolean): Boolean {
-    val code = (reason as? ApiException)?.statusCode
-    return code == CommonStatusCodes.DEVELOPER_ERROR || (consentClosed && code != CommonStatusCodes.NETWORK_ERROR)
+    if (reason?.isUnregisteredApp() == true) return true
+    return consentClosed && (reason as? ApiException)?.statusCode != CommonStatusCodes.NETWORK_ERROR
 }
