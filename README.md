@@ -8,45 +8,29 @@ Implémentation de la spécification
 [`Spécification — App de synchro et lecture d’audiobooks.md`](Spécification%20—%20App%20de%20synchro%20et%20lecture%20d’audiobooks.md)
 (MVP et v2).
 
-| Bibliothèque | Lecteur | Fin du livre | Synchro › Historique |
-| :---: | :---: | :---: | :---: |
-| ![Bibliothèque](docs/screens/bibliotheque.jpg) | ![Lecteur](docs/screens/lecteur.jpg) | ![Fin du livre](docs/screens/fin_du_livre.jpg) | ![Historique](docs/screens/historique.jpg) |
-
-| Accueil | Fiche livre | Synchro › Suivi | Dossiers synchronisés | Réglages |
-| :---: | :---: | :---: | :---: | :---: |
-| ![Accueil](docs/screens/accueil.jpg) | ![Fiche](docs/screens/fiche.jpg) | ![Suivi](docs/screens/suivi.jpg) | ![Dossiers](docs/screens/dossiers.jpg) | ![Réglages](docs/screens/reglages.jpg) |
+L'app travaille uniquement sur la vraie bibliothèque : elle appelle l'API Google Drive v3 depuis le
+téléphone, avec le compte Google connecté. Aucun Drive simulé, aucune bibliothèque ni piste fictive
+n'est livrée dans l'app.
 
 ## Démarrage rapide
 
-Prérequis : Android Studio (JDK 21 fourni), SDK Android 36, un téléphone ou émulateur Android 13+.
+Prérequis : Android Studio (JDK 21 fourni), SDK Android 36, un téléphone Android 13+ et la
+configuration Google Cloud ci-dessous (sans elle, la connexion Google échoue).
 
 ```bash
 export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"   # macOS
-./gradlew assembleDebug          # APK : app/build/outputs/apk/debug/app-debug.apk
-./gradlew testDebugUnitTest      # tests unitaires des 5 modules
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+./gradlew assembleRelease        # APK : app/build/outputs/apk/release/app-release.apk
+./gradlew testDebugUnitTest      # tests unitaires
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
-Au premier lancement, deux choix :
+Au premier lancement : **Se connecter avec Google**, choisir le compte qui possède `/AudioBook`
+et accepter les deux autorisations (Drive et espace caché de l'app). La première synchro fait
+l'inventaire complet des dossiers de statut et télécharge `_En écoute`.
 
-- **Essayer en mode démo** : un Drive simulé reproduit la bibliothèque du 25/10/2026 (dossiers de
-  statut et leurs IDs, *Civilisations* dans `_En écoute`, 16 Nouveaux, doublons, zip, piste isolée,
-  dossiers qui ne sont pas des livres, *Les guerriers de l'hiver* rangé à tort dans `_Ecouté` avec sa
-  progression à 46 %). Les pistes sont de courts mp3 de démonstration (voix de synthèse, textes
-  originaux qui présentent l'app ; le livre lui-même n'est pas inclus). Aucune donnée ne quitte le
-  téléphone.
-- **Se connecter avec Google** : la vraie bibliothèque, après la configuration Google Cloud ci-dessous.
-
-Parcours du critère de sortie du MVP en mode démo : onglet *En écoute* → ▶ *Civilisations* → écoute
-jusqu'au bout (2 min 40, ou 1 min 20 à 2,0×) → « Marquer comme écouté » → le dossier passe dans
-`_Ecouté` (Synchro › Historique : « Déplacement Drive ») sans ouvrir Drive.
-
-Builds debug uniquement : en mode démo, simuler une autorisation Google expirée pour voir le bandeau
-« Renouveler » et la notification (le bouton du bandeau rétablit l'accès simulé) :
-
-```bash
-adb shell am broadcast -n com.julienmiquel.audiotheque/.DebugAuthReceiver
-```
+Parcours du critère de sortie du MVP : onglet *En écoute* → ▶ *Civilisations* → écoute jusqu'au
+bout → « Marquer comme écouté » → le dossier passe dans `_Ecouté` sur Drive (Synchro › Historique :
+« Déplacement Drive ») sans ouvrir Drive.
 
 ## Configuration Google (vraie bibliothèque)
 
@@ -104,7 +88,7 @@ flowchart LR
     end
     subgraph SYNC[":sync · Moteur de synchro, seul accès Drive"]
         ENG["SyncEngine + WorkManager"]
-        API["Drive API v3 : REST ou Drive simulé"]
+        API["Google Drive API v3 (REST)"]
     end
     DB[("Room :core · livres, pistes, progression, file d'opérations, historique")]
     GD[("Google Drive · /AudioBook + appDataFolder")]
@@ -133,7 +117,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | `:core` | Base Room (livres, pistes, progression, signets, historique, synchros, file d'opérations, paires), réglages DataStore, découpage des noms de dossiers et de pistes, lecture des premiers Ko d'un mp3 (ID3, débit), mise en forme française | [Entities.kt](core/src/main/java/com/julienmiquel/audiotheque/core/db/Entities.kt), [FolderNameParser.kt](core/src/main/java/com/julienmiquel/audiotheque/core/parse/FolderNameParser.kt), [TrackNameParser.kt](core/src/main/java/com/julienmiquel/audiotheque/core/parse/TrackNameParser.kt), [Mp3Probe.kt](core/src/main/java/com/julienmiquel/audiotheque/core/parse/Mp3Probe.kt) |
 | `:library` | Gestes de statut mis en file + « Annuler », déplacement vers n'importe quel statut, corrections titre/auteur/voix (le dossier n'est jamais renommé), recherche, filtre « Lu par », doublons, Google Books | [Library.kt](library/src/main/java/com/julienmiquel/audiotheque/library/Library.kt), [GoogleBooks.kt](library/src/main/java/com/julienmiquel/audiotheque/library/GoogleBooks.kt) |
-| `:sync` | Client Drive v3 (REST) et Drive simulé, inventaire complet puis flux de modifications, file de déplacements avec nouvelles tentatives espacées, téléchargements (3 en parallèle, `.part`, Range, taille + md5), nettoyage par statut, progression dans `appDataFolder`, WorkManager | [SyncEngine.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/engine/SyncEngine.kt), [Transfers.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/engine/Transfers.kt), [RestDriveService.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/drive/RestDriveService.kt), [SyncWork.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/work/SyncWork.kt) |
+| `:sync` | Client Google Drive API v3 (REST), inventaire complet puis flux de modifications, file de déplacements avec nouvelles tentatives espacées, téléchargements (3 en parallèle, `.part`, Range, taille + md5), nettoyage par statut, progression dans `appDataFolder`, WorkManager | [SyncEngine.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/engine/SyncEngine.kt), [Transfers.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/engine/Transfers.kt), [RestDriveService.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/drive/RestDriveService.kt), [SyncWork.kt](sync/src/main/java/com/julienmiquel/audiotheque/sync/work/SyncWork.kt) |
 | `:player` | Media3 ExoPlayer + MediaLibraryService : reprise −5 s, sauvegarde toutes les 10 s et à chaque pause, saut réglable, vitesse par livre, minuterie, fin du livre, notification, écran verrouillé, casque, Android Auto | [PlaybackService.kt](player/src/main/java/com/julienmiquel/audiotheque/player/PlaybackService.kt), [PlayerConnection.kt](player/src/main/java/com/julienmiquel/audiotheque/player/PlayerConnection.kt) |
 | `:app` | Interface Compose Material 3 (thème sombre à accent vert, thème clair en option), navigation à 3 onglets, connexion Google | [AudiothequeRoot.kt](app/src/main/java/com/julienmiquel/audiotheque/ui/AudiothequeRoot.kt), [AudiothequeApp.kt](app/src/main/java/com/julienmiquel/audiotheque/AudiothequeApp.kt) |
 
@@ -178,22 +162,18 @@ flowchart LR
 ./gradlew testDebugUnitTest
 ```
 
-68 tests unitaires (JUnit, Robolectric, MockWebServer) :
+68 tests unitaires (JUnit, Robolectric, MockWebServer). Les doubles de test (Drive en mémoire,
+serveur HTTP local) et les fichiers de `testdata/audio` n'existent que dans les tests : ils ne sont
+pas compilés dans l'app, qui ne parle qu'à la vraie API Google Drive.
 
 | Suite | Couverture |
 | :--- | :--- |
 | `core` · `FolderNameParserTest`, `TrackNameParserTest` | Toutes les anomalies de noms de la spécification, motif « 091_P4_04_… », ordre naturel |
-| `core` · `Mp3ProbeTest`, `ProgressMathTest` | Tags ID3 et pochette d'un vrai mp3, durée par le débit, pourcentage et temps restant, formats français |
+| `core` · `Mp3ProbeTest`, `ProgressMathTest` | Tags ID3 et pochette d'un fichier mp3, durée par le débit, pourcentage et temps restant, formats français |
 | `library` · `StatusGesturesTest` | Gestes mis en file, « Annuler » (dossier de départ, progression rétablie), gestes hors ligne, position gardée, « Réécouter » d'un livre pas fini, corrections, recherche, « Lu par », doublons titre + auteur |
-| `sync` · `SyncEngineTest` | Moteur de bout en bout sur le Drive simulé : inventaire, téléchargements vérifiés, Marquer écouté → `_Ecouté` puis nettoyage 24 h, rien de supprimé avant confirmation de Drive (+10 min), Drive fait foi (y compris face à un geste en file), « Annuler » pendant un déplacement, hors ligne, refus 403, autorisation expirée sans boucle (bandeau « Renouveler », geste envoyé après renouvellement), Wi-Fi uniquement sur réseau mesuré, espace insuffisant, reprise Range, livre en cours de lecture jamais retiré, dossier de statut jamais pris pour un livre, progression appData (fichier le plus récent) |
-| `sync` · `RestDriveServiceTest` | Chaque appel du tableau Drive API v3 contre un serveur simulé, jeton renouvelé, limites de débit |
+| `sync` · `SyncEngineTest` | Moteur contre un double de test de Drive peuplé avec l'inventaire de la spécification : inventaire, téléchargements vérifiés, Marquer écouté → `_Ecouté` puis nettoyage 24 h, rien de supprimé avant confirmation de Drive (+10 min), Drive fait foi (y compris face à un geste en file), « Annuler » pendant un déplacement, hors ligne, refus 403, autorisation expirée sans boucle (bandeau « Renouveler », geste envoyé après renouvellement), Wi-Fi uniquement sur réseau mesuré, espace insuffisant, reprise Range, livre en cours de lecture jamais retiré, dossier de statut jamais pris pour un livre, progression appData (fichier le plus récent) |
+| `sync` · `RestDriveServiceTest` | Chaque appel du tableau Drive API v3 contre un serveur HTTP local (MockWebServer), jeton renouvelé, limites de débit |
 | `player` · `PlayerLogicTest` | Identifiants média, chapitres par partie, minuterie, bornes de vitesse |
-
-## Régénérer les mp3 de démonstration
-
-```bash
-./tools/make_demo_audio.sh   # macOS : say + ffmpeg ; pochettes dans tools/demo-art/
-```
 
 ## Hors périmètre
 

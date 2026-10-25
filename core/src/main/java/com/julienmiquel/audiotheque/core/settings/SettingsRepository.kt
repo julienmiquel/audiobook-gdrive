@@ -27,7 +27,6 @@ enum class ThemeMode { DARK, LIGHT, SYSTEM }
 data class AppSettings(
     val accountEmail: String? = null,
     val accountName: String? = null,
-    val demoMode: Boolean = false,
     val onboardingDone: Boolean = false,
     /** Synchro auto activée par défaut toutes les 6 h, en Wi-Fi uniquement, batterie non faible. */
     val autoSync: Boolean = true,
@@ -53,13 +52,9 @@ data class AppSettings(
 ) {
     /** Clé de compte de la progression (propre à chaque utilisateur). */
     val accountKey: String
-        get() = when {
-            demoMode -> Accounts.DEMO
-            !accountEmail.isNullOrBlank() -> accountEmail
-            else -> Accounts.LOCAL
-        }
+        get() = if (accountEmail.isNullOrBlank()) Accounts.LOCAL else accountEmail
 
-    val isConnected: Boolean get() = demoMode || !accountEmail.isNullOrBlank()
+    val isConnected: Boolean get() = !accountEmail.isNullOrBlank()
 
     companion object {
         val SKIP_CHOICES = listOf(10, 15, 30)
@@ -109,7 +104,6 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
     private object K {
         val accountEmail = stringPreferencesKey("account_email")
         val accountName = stringPreferencesKey("account_name")
-        val demoMode = booleanPreferencesKey("demo_mode")
         val onboardingDone = booleanPreferencesKey("onboarding_done")
         val autoSync = booleanPreferencesKey("auto_sync")
         val wifiOnly = booleanPreferencesKey("wifi_only")
@@ -140,7 +134,6 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         return AppSettings(
             accountEmail = this[K.accountEmail],
             accountName = this[K.accountName],
-            demoMode = this[K.demoMode] ?: d.demoMode,
             onboardingDone = this[K.onboardingDone] ?: d.onboardingDone,
             autoSync = this[K.autoSync] ?: d.autoSync,
             wifiOnly = this[K.wifiOnly] ?: d.wifiOnly,
@@ -162,7 +155,6 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
     private fun AppSettings.writeTo(p: MutablePreferences) {
         p.putOrRemove(K.accountEmail, accountEmail)
         p.putOrRemove(K.accountName, accountName)
-        p[K.demoMode] = demoMode
         p[K.onboardingDone] = onboardingDone
         p[K.autoSync] = autoSync
         p[K.wifiOnly] = wifiOnly

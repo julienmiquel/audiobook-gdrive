@@ -7,6 +7,7 @@ import android.os.Build
 import com.julienmiquel.audiotheque.auth.DriveAuthorization
 import com.julienmiquel.audiotheque.auth.GoogleAuthManager
 import com.julienmiquel.audiotheque.auth.authErrorMessage
+import com.julienmiquel.audiotheque.auth.consentFailureMessage
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.model.Accounts
@@ -26,7 +27,6 @@ import com.julienmiquel.audiotheque.library.StatusGestures
 import com.julienmiquel.audiotheque.player.PlayerConnection
 import com.julienmiquel.audiotheque.player.PlayerDependencies
 import com.julienmiquel.audiotheque.player.PlayerDependenciesProvider
-import com.julienmiquel.audiotheque.sync.demo.FakeDriveService
 import com.julienmiquel.audiotheque.sync.drive.DriveAbout
 import com.julienmiquel.audiotheque.sync.drive.RestDriveService
 import com.julienmiquel.audiotheque.sync.engine.AndroidNetworkStatus
@@ -39,7 +39,6 @@ import com.julienmiquel.audiotheque.sync.work.SyncComponentProvider
 import com.julienmiquel.audiotheque.sync.work.SyncNotifications
 import com.julienmiquel.audiotheque.sync.work.SyncScheduler
 import java.io.File
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -77,31 +76,14 @@ class AppContainer(private val app: Application) {
     val auth = GoogleAuthManager(app, settings)
     val storage = LocalStorage(app, settings)
 
-    private val demoAssets = ConcurrentHashMap<String, ByteArray>()
-
-    /** Drive simulé du mode démo (bibliothèque calquée sur la spécification). */
-    val demoDrive: FakeDriveService by lazy {
-        FakeDriveService(
-            content = { asset -> demoAssets.getOrPut(asset) { app.assets.open("demo/$asset").use { it.readBytes() } } },
-            stateFile = File(app.filesDir, "demo-drive.json"),
-            clock = clock,
-        )
-    }
-
+    /** Google Drive API v3, appelée directement depuis le téléphone avec le jeton du compte connecté. */
     private val restDrive: RestDriveService by lazy { RestDriveService(http, auth) }
 
     /** Seul accès à Drive : celui du moteur de synchro. */
     val engine = SyncEngine(
         db = database,
         settings = settings,
-        driveProvider = DriveProvider {
-            val s = settings.current()
-            when {
-                s.demoMode -> demoDrive
-                !s.accountEmail.isNullOrBlank() -> restDrive
-                else -> null
-            }
-        },
+        driveProvider = DriveProvider { if (settings.current().accountEmail.isNullOrBlank()) null else restDrive },
         storage = storage,
         network = AndroidNetworkStatus(app),
         inspector = MediaMetadataInspector(),
@@ -219,12 +201,7 @@ class AppContainer(private val app: Application) {
 
     /** Bandeau « Renouveler » : autorisation silencieuse si possible, sinon écran de consentement Google. */
     suspend fun renewAuthorization(): AuthRenewal {
-        val s = settings.current()
-        if (s.demoMode) {
-            demoDrive.authExpired = false
-            return renewed()
-        }
-        val email = s.accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
+        val email = settings.current().accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
         return runCatching { auth.authorize(email) }.fold(
             onSuccess = { authorization -> onAuthorization(authorization, email, consentShown = false) },
             onFailure = { AuthRenewal.Failed(authErrorMessage(it)) },
@@ -233,7 +210,10 @@ class AppContainer(private val app: Application) {
 
     /** Retour de l'écran de consentement Google ouvert par [renewAuthorization]. */
     suspend fun completeRenewal(accepted: Boolean, data: Intent?): AuthRenewal {
-        if (!accepted) return AuthRenewal.Failed("Autorisation Google Drive refusée : la synchro reste en pause.")
+        if (!accepted) {
+            val reason = data?.let { runCatching { auth.consentResult(it) }.exceptionOrNull() }
+            return AuthRenewal.Failed(consentFailureMessage(reason))
+        }
         val email = settings.current().accountEmail ?: return AuthRenewal.Failed("Aucun compte connecté")
         return runCatching { auth.consentResult(data) }.fold(
             onSuccess = { authorization -> onAuthorization(authorization, email, consentShown = true) },
@@ -266,12 +246,12 @@ class AppContainer(private val app: Application) {
         AuthRenewal.Done
     }
 
-    /** Connexion, sortie du mode démo et déconnexion ne se chevauchent pas. */
+    /** Connexion et déconnexion ne se chevauchent pas. */
     private val accountLock = Mutex()
 
     /** Compte connecté : la progression locale lui est rattachée. */
     suspend fun onSignedIn(email: String, name: String?) = accountLock.withLock {
-        settings.update { it.copy(accountEmail = email, accountName = name, demoMode = false, onboardingDone = true) }
+        settings.update { it.copy(accountEmail = email, accountName = name, onboardingDone = true) }
         database.progressDao().migrateAccount(Accounts.LOCAL, email)
         settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
         syncNotifications.dismissAuthRequired()
@@ -279,24 +259,12 @@ class AppContainer(private val app: Application) {
         scheduler.requestSync(SyncTrigger.LAUNCH)
     }
 
-    /** Mode démo : Drive simulé, sans compte Google. */
-    suspend fun startDemo() = accountLock.withLock {
-        demoDrive.reset()
-        settings.update { it.copy(demoMode = true, onboardingDone = true) }
-        settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
-        syncNotifications.dismissAuthRequired()
-        scheduler.schedulePeriodic(settings.current())
-        scheduler.requestSync(SyncTrigger.LAUNCH)
-    }
-
     /**
-     * Déconnexion ou sortie du mode démo : plus aucune tâche de fond, fin de la synchro en cours,
-     * progression écrite une dernière fois dans l'espace caché du compte, puis bibliothèque locale
-     * et pistes effacées du téléphone. La progression (propre à chaque compte) et les signets
-     * restent ; ceux du mode démo sont effacés avec lui.
+     * Déconnexion : plus aucune tâche de fond, fin de la synchro en cours, progression écrite une
+     * dernière fois dans l'espace caché du compte, puis bibliothèque locale et pistes effacées du
+     * téléphone. La progression (propre à chaque compte) et les signets restent.
      */
     suspend fun signOut() = accountLock.withLock {
-        val wasDemo = settings.current().demoMode
         scheduler.cancelAll()
         syncNotifications.dismissAuthRequired()
         player.stopAndClear()
@@ -304,7 +272,7 @@ class AppContainer(private val app: Application) {
         _selectedBookId.value = null
         withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.pushProgressBeforeSignOut() }
         // Plus de compte : aucune synchro ne peut repartir pendant l'effacement.
-        settings.update { it.copy(accountEmail = null, accountName = null, demoMode = false, lastPlayedBookId = null) }
+        settings.update { it.copy(accountEmail = null, accountName = null, lastPlayedBookId = null) }
         withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.awaitIdle() }
         auth.signOut()
         withContext(Dispatchers.IO) {
@@ -325,10 +293,6 @@ class AppContainer(private val app: Application) {
                 }
             }
             storage.coversDir().listFiles()?.forEach { it.delete() }
-        }
-        if (wasDemo) {
-            database.bookmarkDao().deleteForLibraryBooks()
-            database.progressDao().deleteForAccount(Accounts.DEMO)
         }
         database.clearLibrary()
         settings.updateSyncState { SyncState() }

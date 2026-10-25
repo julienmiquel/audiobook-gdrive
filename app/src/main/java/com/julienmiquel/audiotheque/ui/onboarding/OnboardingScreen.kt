@@ -27,7 +27,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -49,12 +48,13 @@ import com.julienmiquel.audiotheque.auth.GoogleIdentity
 import com.julienmiquel.audiotheque.auth.GoogleSignIn
 import com.julienmiquel.audiotheque.auth.SignInOutcome
 import com.julienmiquel.audiotheque.auth.authErrorMessage
+import com.julienmiquel.audiotheque.auth.consentFailureMessage
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import kotlinx.coroutines.launch
 
 /**
  * Premier lancement : connexion Google (Credential Manager si un ID client web est configuré,
- * puis AuthorizationClient pour le consentement Drive : drive et drive.appdata) ou mode démo.
+ * puis AuthorizationClient pour le consentement Drive : drive et drive.appdata).
  */
 @Composable
 fun OnboardingScreen() {
@@ -79,7 +79,8 @@ fun OnboardingScreen() {
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
         scope.launch {
             if (result.resultCode != Activity.RESULT_OK) {
-                error = "Autorisation Google Drive refusée. Elle est nécessaire pour lire la bibliothèque et déplacer les dossiers."
+                val reason = result.data?.let { data -> runCatching { container.auth.consentResult(data) }.exceptionOrNull() }
+                error = consentFailureMessage(reason)
                 busy = false
                 return@launch
             }
@@ -160,14 +161,6 @@ fun OnboardingScreen() {
                 }
                 Text("Se connecter avec Google")
             }
-            OutlinedButton(
-                onClick = {
-                    busy = true
-                    scope.launch { container.startDemo() }
-                },
-                enabled = !busy,
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Essayer en mode démo") }
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center) }
             Text(
                 "Accès demandés : Google Drive (déplacer les dossiers de livres que l'app n'a pas créés) et l'espace caché de l'app (votre progression, un fichier par livre).",

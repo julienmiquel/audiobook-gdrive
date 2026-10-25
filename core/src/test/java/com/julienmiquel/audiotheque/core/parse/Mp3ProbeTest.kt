@@ -2,18 +2,22 @@ package com.julienmiquel.audiotheque.core.parse
 
 import com.google.common.truth.Truth.assertThat
 import java.io.File
-import org.junit.Assume.assumeTrue
+import org.junit.Before
 import org.junit.Test
 
-/** Analyse des premiers Ko d'un vrai mp3 de démonstration (tags ID3, pochette, débit). */
+/** Analyse des premiers Ko d'un fichier mp3 de test (tags ID3, pochette, débit). */
 class Mp3ProbeTest {
 
-    private val asset = File("../app/src/main/assets/demo/civilisations_01.mp3")
+    private val mp3 = File("../testdata/audio/civilisations_01.mp3")
+
+    @Before
+    fun fixturePresent() {
+        check(mp3.exists()) { "Fichier de test absent : ${mp3.absolutePath}" }
+    }
 
     @Test
     fun `tags ID3, voix et pochette intégrée`() {
-        assumeTrue("asset de démonstration absent", asset.exists())
-        val bytes = asset.readBytes()
+        val bytes = mp3.readBytes()
         val head = bytes.copyOf(minOf(bytes.size, Mp3Probe.MAX_TAG_BYTES))
         val info = Mp3Probe.parse(head)
         val tags = info.tags!!
@@ -27,8 +31,7 @@ class Mp3ProbeTest {
 
     @Test
     fun `durée estimée à partir des premiers Ko`() {
-        assumeTrue("asset de démonstration absent", asset.exists())
-        val bytes = asset.readBytes()
+        val bytes = mp3.readBytes()
         val info = Mp3Probe.parse(bytes.copyOf(minOf(bytes.size, Mp3Probe.MAX_TAG_BYTES)))
         val duration = info.durationMs(bytes.size.toLong())!!
         // ffprobe : 27,44 s.

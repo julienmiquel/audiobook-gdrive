@@ -24,7 +24,6 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.Science
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -61,11 +60,9 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.BuildConfig
-import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.settings.ThemeMode
-import com.julienmiquel.audiotheque.sync.demo.DemoLibrary
 import com.julienmiquel.audiotheque.ui.common.InfoCard
 import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
@@ -121,29 +118,6 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
             }
         }
     }
-
-    /** Démo de « Drive fait foi » : un livre déplacé depuis le web change de statut à la synchro suivante. */
-    fun simulateExternalMove() {
-        viewModelScope.launch {
-            val id = c.demoDrive.findBookId(DemoLibrary.UNFINISHED_BOOK)
-            if (id == null) {
-                c.message("Livre de démonstration introuvable")
-                return@launch
-            }
-            val current = c.library.book(id)
-            val target = if (current?.parentId == DriveLibraryDefaults.LATER_ID) DriveLibraryDefaults.DONE_ID else DriveLibraryDefaults.LATER_ID
-            c.demoDrive.simulateExternalMove(id, target)
-            c.requestSync(SyncTrigger.MANUAL)
-            c.message("« Les guerriers de l'hiver » déplacé dans Drive (simulé) : synchro en cours")
-        }
-    }
-
-    fun resetDemo() {
-        c.appScope.launch {
-            c.signOut()
-            c.startDemo()
-        }
-    }
 }
 
 @Composable
@@ -156,7 +130,6 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
     val signingOut by vm.signingOut.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmSignOut by remember { mutableStateOf(false) }
-    var confirmReset by remember { mutableStateOf(false) }
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshStorage() }
 
@@ -180,36 +153,20 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             InfoCard(title = "Compte Google") {
-                if (s.demoMode) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.Science, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Column {
-                            Text("Mode démo · Drive simulé", style = MaterialTheme.typography.bodyLarge)
-                            Text(
-                                "Bibliothèque fictive calquée sur /AudioBook, sans compte Google. Seuls le titre et l'auteur confirmés partent vers Google Books, si l'option est activée.",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Filled.AccountCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(12.dp))
+                    Column {
+                        Text(s.accountName ?: s.accountEmail ?: "—", style = MaterialTheme.typography.bodyLarge)
+                        s.accountEmail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
-                    if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Quitter le mode démo") }
-                } else {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Icon(Icons.Filled.AccountCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Spacer(Modifier.width(12.dp))
-                        Column {
-                            Text(s.accountName ?: s.accountEmail ?: "—", style = MaterialTheme.typography.bodyLarge)
-                            s.accountEmail?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                        }
-                    }
-                    Text(
-                        "Autorisations : Drive (déplacer les dossiers de livres) et espace caché de l'app (progression, un fichier par livre, propre à votre compte).",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                    if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
                 }
+                Text(
+                    "Autorisations : Drive (déplacer les dossiers de livres) et espace caché de l'app (progression, un fichier par livre, propre à votre compte).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
             }
 
             InfoCard(title = "Nettoyage du téléphone") {
@@ -281,17 +238,6 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                 Text("Les livres déjà téléchargés restent où ils sont. Changer de statut ne déplace rien sur le téléphone.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
 
-            if (s.demoMode) {
-                InfoCard(title = "Démonstration") {
-                    Text(
-                        "« Drive fait foi » : simule un déplacement fait depuis le web ou par un autre membre de la famille. Le statut local suit à la synchro suivante.",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                    OutlinedButton(onClick = vm::simulateExternalMove) { Text("Déplacer « Les guerriers de l'hiver » dans Drive") }
-                    TextButton(onClick = { confirmReset = true }) { Text("Réinitialiser la démo") }
-                }
-            }
-
             InfoCard(title = "Confidentialité") {
                 Text(
                     "Aucun serveur tiers, aucune publicité, aucune télémétrie. Les données restent sur le téléphone et sur le Drive de votre compte.",
@@ -304,40 +250,21 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
     }
 
     if (confirmSignOut) {
-        val demo = settings?.demoMode == true
         AlertDialog(
             onDismissRequest = { confirmSignOut = false },
-            title = { Text(if (demo) "Quitter le mode démo ?" else "Se déconnecter ?") },
+            title = { Text("Se déconnecter ?") },
             text = {
                 Text(
-                    if (demo) {
-                        "La bibliothèque de démonstration et ses pistes seront effacées du téléphone."
-                    } else {
-                        "La bibliothèque locale et les pistes téléchargées seront effacées du téléphone. Votre progression est d'abord enregistrée dans votre Drive, et vos signets restent sur le téléphone. Rien n'est supprimé dans Drive."
-                    },
+                    "La bibliothèque locale et les pistes téléchargées seront effacées du téléphone. Votre progression est d'abord enregistrée dans votre Drive, et vos signets restent sur le téléphone. Rien n'est supprimé dans Drive.",
                 )
             },
             confirmButton = {
                 TextButton(onClick = {
                     confirmSignOut = false
                     vm.signOut()
-                }) { Text(if (demo) "Quitter" else "Se déconnecter") }
+                }) { Text("Se déconnecter") }
             },
             dismissButton = { TextButton(onClick = { confirmSignOut = false }) { Text("Annuler") } },
-        )
-    }
-    if (confirmReset) {
-        AlertDialog(
-            onDismissRequest = { confirmReset = false },
-            title = { Text("Réinitialiser la démo ?") },
-            text = { Text("La bibliothèque de démonstration revient à son état initial (Civilisations dans _En écoute).") },
-            confirmButton = {
-                TextButton(onClick = {
-                    confirmReset = false
-                    vm.resetDemo()
-                }) { Text("Réinitialiser") }
-            },
-            dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Annuler") } },
         )
     }
 }

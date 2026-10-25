@@ -64,7 +64,7 @@ data class SyncOutcome(
     val nextCleanupAt: Long? = null,
 )
 
-/** Service Drive du compte courant : réel, ou simulé en mode démo ; null si personne n'est connecté. */
+/** Google Drive du compte connecté (API REST v3) ; null si personne n'est connecté. */
 fun interface DriveProvider {
     suspend fun get(): DriveService?
 }
@@ -221,7 +221,7 @@ class SyncEngine(
      */
     suspend fun pushProgressBeforeSignOut(): Boolean = mutex.withLock {
         val s = settings.current()
-        if (s.demoMode || s.accountKey == Accounts.LOCAL) return@withLock true
+        if (s.accountKey == Accounts.LOCAL) return@withLock true
         val drive = driveProvider.get() ?: return@withLock false
         try {
             progressSync.run(drive, s.accountKey)
@@ -430,7 +430,7 @@ class SyncEngine(
             settings.updateSyncState {
                 it.copy(driveQuotaUsed = about.quotaUsage, driveQuotaLimit = about.quotaLimit, quotaUpdatedAt = clock.now())
             }
-            if (!s.demoMode && about.email != null && s.accountEmail.isNullOrBlank()) {
+            if (about.email != null && s.accountEmail.isNullOrBlank()) {
                 settings.update { it.copy(accountEmail = about.email, accountName = about.displayName) }
             }
         } catch (e: CancellationException) {

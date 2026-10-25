@@ -49,7 +49,4 @@ val TrackEntity.partLabel: String?
 object Accounts {
     /** Progression locale avant toute connexion Google. */
     const val LOCAL = "local"
-
-    /** Mode démo (Drive simulé). */
-    const val DEMO = "demo"
 }

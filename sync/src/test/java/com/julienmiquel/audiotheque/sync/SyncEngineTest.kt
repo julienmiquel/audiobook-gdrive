@@ -7,7 +7,6 @@ import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.PendingOperationEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
-import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.CleanupPolicy
@@ -19,8 +18,8 @@ import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.parse.Mp3Probe
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
-import com.julienmiquel.audiotheque.sync.demo.DemoLibrary
-import com.julienmiquel.audiotheque.sync.demo.FakeDriveService
+import com.julienmiquel.audiotheque.sync.testing.LibraryFixture
+import com.julienmiquel.audiotheque.sync.testing.FakeDriveService
 import com.julienmiquel.audiotheque.sync.drive.DriveContent
 import com.julienmiquel.audiotheque.sync.drive.DriveFile
 import com.julienmiquel.audiotheque.sync.drive.DriveService
@@ -36,7 +35,6 @@ import java.util.Collections
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
-import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
@@ -46,9 +44,10 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 /**
- * Moteur de synchro de bout en bout sur le Drive simulé (bibliothèque de la spécification) avec
- * les vrais mp3 de démonstration : inventaire, téléchargements, gestes, Drive fait foi, hors
- * ligne, refus définitif, nettoyage, espace, reprise de transfert et progression appData.
+ * Tests unitaires du moteur de synchro, contre un double de test de Drive (en mémoire, peuplé
+ * avec l'inventaire de la spécification) et les mp3 de `testdata/audio` : inventaire,
+ * téléchargements, gestes, Drive fait foi, hors ligne, refus définitif, nettoyage, espace,
+ * reprise de transfert et progression appData. L'app, elle, n'utilise que l'API Google Drive.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -57,7 +56,7 @@ class SyncEngineTest {
     @get:Rule
     val tmp = TemporaryFolder()
 
-    private val assets = File("../app/src/main/assets/demo")
+    private val fixtures = File("../testdata/audio")
     private lateinit var db: AppDatabase
     private lateinit var settings: SettingsRepository
     private lateinit var fake: FakeDriveService
@@ -99,18 +98,18 @@ class SyncEngineTest {
 
     @Before
     fun setUp() = runBlocking<Unit> {
-        assumeTrue("assets de démonstration absents", File(assets, "civilisations_01.mp3").exists())
+        check(File(fixtures, "civilisations_01.mp3").exists()) { "Fichiers de test absents : ${fixtures.absolutePath}" }
         val context = ApplicationProvider.getApplicationContext<Context>()
         db = AppDatabase.inMemory(context)
         settings = SettingsRepository.forFile(File(tmp.root, "settings.preferences_pb"))
-        settings.update { it.copy(demoMode = true, onboardingDone = true) }
+        settings.update { it.copy(accountEmail = FakeDriveService.ACCOUNT, onboardingDone = true) }
         root = tmp.newFolder("Audiobooks")
         val storage = object : LocalStorage(context, settings) {
             override fun sharedStorageGranted(): Boolean = false
             override suspend fun root(): File = root
             override fun freeBytes(dir: File): Long = free
         }
-        fake = FakeDriveService(content = { File(assets, it).readBytes() }, clock = clock, latencyMs = 0, bytesPerSecond = 0)
+        fake = FakeDriveService(content = { File(fixtures, it).readBytes() }, clock = clock)
         drive = RecordingDrive(fake)
         val network = object : NetworkStatus {
             override fun isConnected() = true
@@ -155,7 +154,7 @@ class SyncEngineTest {
         assertThat(all.count { it.kind == BookKind.ZIP }).isEqualTo(3)
         assertThat(all.count { it.kind == BookKind.SINGLE_FILE }).isEqualTo(1)
 
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         assertThat(civ.status).isEqualTo(BookStatus.IN_PROGRESS)
         val tracks = db.trackDao().forBook(civ.driveId)
         assertThat(tracks).hasSize(10)
@@ -197,7 +196,7 @@ class SyncEngineTest {
     @Test
     fun `Marquer écouté - dossier déplacé dans Drive, pistes supprimées 24 h après`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
 
         queueMove(civ, BookStatus.DONE, D.DONE_ID)
         engine.sync(SyncTrigger.STATUS_CHANGE)
@@ -222,7 +221,7 @@ class SyncEngineTest {
     fun `Commencer - le livre descend en entier, en commençant à la position d'écoute`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
         val police = book("Police - Hugo Boris")
-        db.progressDao().upsert(ProgressEntity(bookId = police.driveId, account = Accounts.DEMO, trackIndex = 2, updatedAt = now))
+        db.progressDao().upsert(ProgressEntity(bookId = police.driveId, account = FakeDriveService.ACCOUNT, trackIndex = 2, updatedAt = now))
         drive.opened.clear()
 
         queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
@@ -237,10 +236,10 @@ class SyncEngineTest {
     @Test
     fun `Drive fait foi - un dossier déplacé depuis le web change de statut`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        val guerriers = book(DemoLibrary.UNFINISHED_BOOK)
+        val guerriers = book(LibraryFixture.UNFINISHED_BOOK)
         assertThat(guerriers.status).isEqualTo(BookStatus.DONE)
 
-        fake.simulateExternalMove(guerriers.driveId, D.LATER_ID)
+        fake.externalMove(guerriers.driveId, D.LATER_ID)
         engine.sync(SyncTrigger.PERIODIC)
 
         assertThat(db.bookDao().get(guerriers.driveId)!!.status).isEqualTo(BookStatus.LATER)
@@ -294,7 +293,7 @@ class SyncEngineTest {
         free = 100_000_000L // < taille du livre + 500 Mo
         val outcome = engine.sync(SyncTrigger.LAUNCH)
         assertThat(outcome.result).isEqualTo(SyncResult.PARTIAL)
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
         assertThat(events().any { it.type == SyncEventType.ERROR && it.message.orEmpty().startsWith("Espace insuffisant") }).isTrue()
     }
@@ -303,9 +302,9 @@ class SyncEngineTest {
     fun `reprise après coupure - le fichier part est complété par une requête Range`() = runBlocking<Unit> {
         free = 1L
         engine.sync(SyncTrigger.LAUNCH) // inventaire seulement : pas de place
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         val first = db.trackDao().forBook(civ.driveId).first()
-        val bytes = File(assets, "civilisations_01.mp3").readBytes()
+        val bytes = File(fixtures, "civilisations_01.mp3").readBytes()
         val dir = File(root, "CIVILISATIONS - Laurent BINET").apply { mkdirs() }
         File(dir, first.relativePath + ".part").writeBytes(bytes.copyOf(10_000))
         free = Long.MAX_VALUE
@@ -321,15 +320,15 @@ class SyncEngineTest {
     @Test
     fun `progression par utilisateur dans l'espace caché de l'app`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        // Progression de démonstration importée : livre rangé à tort dans _Ecouté, pas fini.
-        val guerriers = book(DemoLibrary.UNFINISHED_BOOK)
-        val imported = db.progressDao().get(guerriers.driveId, Accounts.DEMO)!!
+        // Progression déjà dans l'espace caché, importée : livre rangé à tort dans _Ecouté, pas fini.
+        val guerriers = book(LibraryFixture.UNFINISHED_BOOK)
+        val imported = db.progressDao().get(guerriers.driveId, FakeDriveService.ACCOUNT)!!
         assertThat(imported.percent).isEqualTo(46f)
         assertThat(imported.finished).isFalse()
         assertThat(imported.dirty).isFalse()
 
-        val civ = book(DemoLibrary.civilisations.name)
-        db.progressDao().upsert(ProgressEntity(bookId = civ.driveId, account = Accounts.DEMO, trackIndex = 4, positionMs = 12_000, speed = 1.3f, percent = 42f, updatedAt = now))
+        val civ = book(LibraryFixture.civilisations.name)
+        db.progressDao().upsert(ProgressEntity(bookId = civ.driveId, account = FakeDriveService.ACCOUNT, trackIndex = 4, positionMs = 12_000, speed = 1.3f, percent = 42f, updatedAt = now))
         engine.sync(SyncTrigger.MANUAL)
 
         val file = fake.listAppData().single { it.name == ProgressJson.fileName(civ.driveId) }
@@ -337,7 +336,7 @@ class SyncEngineTest {
         assertThat(json.trackIndex).isEqualTo(4)
         assertThat(json.positionMs).isEqualTo(12_000)
         assertThat(json.speed).isEqualTo(1.3f)
-        assertThat(db.progressDao().get(civ.driveId, Accounts.DEMO)!!.dirty).isFalse()
+        assertThat(db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!.dirty).isFalse()
     }
 
     @Test
@@ -354,7 +353,7 @@ class SyncEngineTest {
     @Test
     fun `nettoyage - rien n'est supprimé avant que Drive confirme le déplacement, puis 10 min de grâce`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
 
         // Archiver, mais Drive refuse passagèrement le déplacement : rien ne bouge sur le téléphone.
@@ -383,7 +382,7 @@ class SyncEngineTest {
         engine.sync(SyncTrigger.LAUNCH)
         val police = book("Police - Hugo Boris")
         queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID) // geste fait hors ligne
-        fake.simulateExternalMove(police.driveId, D.DONE_ID) // déplacé depuis le web entre-temps
+        fake.externalMove(police.driveId, D.DONE_ID) // déplacé depuis le web entre-temps
 
         engine.sync(SyncTrigger.STATUS_CHANGE)
 
@@ -462,7 +461,7 @@ class SyncEngineTest {
 
         engine.sync(SyncTrigger.MANUAL)
 
-        val p = db.progressDao().get(police.driveId, Accounts.DEMO)!!
+        val p = db.progressDao().get(police.driveId, FakeDriveService.ACCOUNT)!!
         assertThat(p.positionMs).isEqualTo(77_000)
         assertThat(p.dirty).isFalse()
     }
@@ -482,7 +481,7 @@ class SyncEngineTest {
     fun `Wi-Fi uniquement sur réseau mesuré - transferts reportés, repris au retour du Wi-Fi`() = runBlocking<Unit> {
         unmetered = false
         val metered = engine.sync(SyncTrigger.LAUNCH)
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         assertThat(db.trackDao().forBook(civ.driveId)).hasSize(10) // pistes listées quand même
         assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
         assertThat(metered.waitingForWifi).isTrue()
@@ -501,9 +500,9 @@ class SyncEngineTest {
     @Test
     fun `livre en cours de lecture - retiré de la bibliothèque seulement après l'écoute`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        val civ = book(DemoLibrary.civilisations.name)
+        val civ = book(LibraryFixture.civilisations.name)
         inUse = civ.driveId
-        fake.simulateExternalMove(civ.driveId, "dossier-hors-bibliotheque")
+        fake.externalMove(civ.driveId, "dossier-hors-bibliotheque")
 
         engine.sync(SyncTrigger.PERIODIC)
         assertThat(db.bookDao().get(civ.driveId)).isNotNull()

@@ -9,7 +9,7 @@ import org.junit.After
 import org.junit.Before
 import org.junit.Test
 
-/** Appels Drive API v3 de la spécification, contre un serveur simulé. */
+/** Appels Drive API v3 de la spécification, contre un serveur HTTP local (MockWebServer). */
 class RestDriveServiceTest {
 
     private lateinit var server: MockWebServer

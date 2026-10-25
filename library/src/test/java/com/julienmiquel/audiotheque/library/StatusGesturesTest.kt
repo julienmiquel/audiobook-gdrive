@@ -49,7 +49,7 @@ class StatusGesturesTest {
     fun setUp() = runBlocking<Unit> {
         db = AppDatabase.inMemory(ApplicationProvider.getApplicationContext())
         settings = SettingsRepository.forFile(tmp.newFile("settings.preferences_pb").also { it.delete() })
-        settings.update { it.copy(demoMode = true, onboardingDone = true) }
+        settings.update { it.copy(accountEmail = "lecteur@example.com", onboardingDone = true) }
         db.syncPairDao().insertAll(DriveLibraryDefaults.defaultPairs())
         gestures = StatusGestures(db, settings, sync, clock)
     }

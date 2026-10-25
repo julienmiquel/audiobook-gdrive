@@ -8,6 +8,8 @@ import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.api.identity.AuthorizationRequest
 import com.google.android.gms.auth.api.identity.AuthorizationResult
 import com.google.android.gms.auth.api.identity.Identity
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.common.api.CommonStatusCodes
 import com.google.android.gms.common.api.Scope
 import com.julienmiquel.audiotheque.BuildConfig
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
@@ -122,11 +124,23 @@ class GoogleAuthManager(
 
 /** Message d'erreur lisible pour une connexion ou une autorisation Google qui échoue. */
 internal fun authErrorMessage(e: Throwable): String {
+    val code = (e as? ApiException)?.statusCode
     val text = e.message.orEmpty()
     return when {
-        "10:" in text || "DEVELOPER_ERROR" in text ->
-            "Client OAuth Android non configuré pour cette app (nom de paquet + empreinte SHA-1). Voir le README."
-        "7:" in text || "NETWORK" in text.uppercase() -> "Réseau indisponible : la connexion Google nécessite Internet."
+        code == CommonStatusCodes.DEVELOPER_ERROR || (code == null && ("10:" in text || "DEVELOPER_ERROR" in text)) ->
+            "Application non enregistrée auprès de Google : créez l'ID client OAuth Android (paquet com.julienmiquel.audiotheque + empreinte SHA-1 de la clé de signature) dans Google Cloud. Voir le README."
+        code == CommonStatusCodes.NETWORK_ERROR || (code == null && ("7:" in text || "NETWORK" in text.uppercase())) ->
+            "Réseau indisponible : la connexion Google nécessite Internet."
         else -> "Connexion Google impossible : ${text.ifBlank { e.javaClass.simpleName }}"
     }
+}
+
+/**
+ * Écran d'autorisation Google fermé sans accord : annulation par l'utilisateur, ou refus de Google
+ * (app non enregistrée, réseau…) dont la raison est lue dans le résultat.
+ */
+internal fun consentFailureMessage(reason: Throwable?): String = when ((reason as? ApiException)?.statusCode) {
+    CommonStatusCodes.DEVELOPER_ERROR, CommonStatusCodes.NETWORK_ERROR -> authErrorMessage(reason!!)
+    null, CommonStatusCodes.CANCELED -> "Autorisation Google Drive refusée. Elle est nécessaire pour lire la bibliothèque et déplacer les dossiers."
+    else -> "Autorisation Google Drive refusée ou impossible (code ${(reason as ApiException).statusCode} : ${reason.message.orEmpty()})."
 }

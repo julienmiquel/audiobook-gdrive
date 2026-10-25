@@ -264,9 +264,6 @@ interface ProgressDao {
     )
     suspend fun migrateAccount(from: String, to: String)
 
-    @Query("DELETE FROM progress WHERE account = :account")
-    suspend fun deleteForAccount(account: String)
-
     /** Déplacement vers _Ecouté abandonné : « terminé » est retiré si le livre n'était pas fini. */
     @Query("UPDATE progress SET finished = 0, dirty = 1, updatedAt = :now WHERE bookId = :bookId AND finished = 1 AND percent < 99")
     suspend fun clearFinishedUnlessAtEnd(bookId: String, now: Long)
@@ -285,10 +282,6 @@ interface BookmarkDao {
 
     @Query("DELETE FROM bookmarks WHERE id = :id")
     suspend fun delete(id: Long)
-
-    /** Signets des livres de la bibliothèque actuelle (sortie du mode démo). */
-    @Query("DELETE FROM bookmarks WHERE bookId IN (SELECT driveId FROM books)")
-    suspend fun deleteForLibraryBooks()
 }
 
 @Dao

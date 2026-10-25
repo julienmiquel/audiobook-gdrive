@@ -1,16 +1,14 @@
-package com.julienmiquel.audiotheque.sync.demo
+package com.julienmiquel.audiotheque.sync.testing
 
 import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults as D
 
 /**
- * Bibliothèque de démonstration calquée sur l'inventaire du 25/10/2026 (cf. spécification) :
- * dossiers de statut, noms hétérogènes, doublons, zip, piste isolée, dossiers qui ne sont pas
- * des livres et statut faux (« Les guerriers de l'hiver » dans _Ecouté alors qu'il n'est pas fini).
- *
- * Les pistes pointent vers de courts mp3 de démonstration (voix de synthèse) livrés dans les
- * assets ; elles sont servies par [FakeDriveService] comme le ferait Drive.
+ * Données de test des tests unitaires du moteur : inventaire de /AudioBook du 25/10/2026 décrit
+ * dans la spécification (dossiers de statut, noms hétérogènes, doublons, zip, piste isolée,
+ * dossiers qui ne sont pas des livres, « Les guerriers de l'hiver » dans _Ecouté sans être fini).
+ * Le contenu des fichiers vient de `testdata/audio` (mp3 avec tags ID3 et pochettes).
  */
-object DemoLibrary {
+object LibraryFixture {
 
     sealed interface Entry {
         val name: String
@@ -20,9 +18,9 @@ object DemoLibrary {
     data class Folder(override val name: String, val tracks: List<Track>, val cover: String? = null) : Entry
 
     /** Une piste isolée ou un zip directement dans un dossier de statut. */
-    data class File(override val name: String, val asset: String, val mimeType: String) : Entry
+    data class File(override val name: String, val fixture: String, val mimeType: String) : Entry
 
-    data class Track(val fileName: String, val asset: String)
+    data class Track(val fileName: String, val fixture: String)
 
     private fun generic(prefix: (Int) -> String, count: Int = 3): List<Track> =
         (1..count).map { Track("${prefix(it)}.mp3", "chapitre_${(it - 1) % 3 + 1}.mp3") }
@@ -125,7 +123,7 @@ object DemoLibrary {
         D.MEDITATIONS_ID to "_meditations",
     )
 
-    /** Progression de démonstration : le livre classé à tort dans _Ecouté n'est pas fini. */
+    /** Progression déjà dans l'espace caché : le livre classé à tort dans _Ecouté n'est pas fini. */
     const val UNFINISHED_BOOK = "Les guerriers de l'hiver - Olivier Norek"
     const val UNFINISHED_TRACK_INDEX = 1
     const val UNFINISHED_POSITION_MS = 9_000L
