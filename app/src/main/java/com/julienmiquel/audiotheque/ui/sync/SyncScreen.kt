@@ -549,6 +549,7 @@ private fun EventRow(e: SyncEventEntity) {
         SyncEventType.DRIVE_MOVE -> Icons.AutoMirrored.Filled.DriveFileMove
         SyncEventType.STATUS_FROM_DRIVE -> Icons.Filled.Sync
         SyncEventType.LIBRARY_CHANGE -> Icons.AutoMirrored.Filled.LibraryBooks
+        SyncEventType.PROGRESS -> Icons.Filled.History
         SyncEventType.ERROR -> Icons.Filled.Error
     }
     Row(

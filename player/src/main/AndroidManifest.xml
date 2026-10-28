@@ -25,5 +25,14 @@
                 <action android:name="android.intent.action.MEDIA_BUTTON" />
             </intent-filter>
         </receiver>
+
+        <!-- Pochettes lisibles par Android Auto et la vignette de reprise du système (autres
+             processus) : non exporté, droit de lecture accordé par le service à chaque
+             application qui se connecte (voir CoverArtProvider.grantTo). -->
+        <provider
+            android:name=".CoverArtProvider"
+            android:authorities="${applicationId}.covers"
+            android:exported="false"
+            android:grantUriPermissions="true" />
     </application>
 </manifest>

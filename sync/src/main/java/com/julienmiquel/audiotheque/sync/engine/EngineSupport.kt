@@ -223,8 +223,10 @@ fun File.md5Hex(): String {
 }
 
 /**
- * Progression d'un livre telle qu'écrite dans l'espace caché de l'app sur le Drive de chaque
- * compte : un JSON par livre, indexé par l'ID du dossier (qui ne change pas quand on le déplace).
+ * Progression d'un livre telle qu'écrite dans son dossier Drive : un petit fichier JSON par
+ * compte (« .audiotheque-progress-<compte>.json »), visible dans Drive à côté des pistes. Le
+ * dossier garde son ID quand il change de statut : le fichier suit le livre. Un livre sans
+ * dossier (piste isolée) a son fichier dans le dossier de statut, nommé d'après l'ID du livre.
  */
 @Serializable
 data class ProgressJson(
@@ -237,19 +239,30 @@ data class ProgressJson(
     val lastListenedAt: Long? = null,
     val finished: Boolean = false,
     val setAsideAtPercent: Float? = null,
+    /** Date d'enregistrement sur le téléphone : la plus récente l'emporte entre deux appareils. */
     val updatedAt: Long,
+    /** Appareil qui a écrit la position (« Google Pixel 9 »). */
     val device: String? = null,
-    val version: Int = 1,
+    /** Compte propriétaire de la position (lisibilité dans Drive). */
+    val account: String? = null,
+    /** Titre affiché (lisibilité dans Drive). */
+    val title: String? = null,
+    val version: Int = 2,
 ) {
     companion object {
+        const val MIME = "application/json"
         private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-        private const val PREFIX = "progress-"
+        private const val PREFIX = ".audiotheque-progress-"
         private const val SUFFIX = ".json"
 
-        fun fileName(bookId: String) = "$PREFIX$bookId$SUFFIX"
+        /** Nom du fichier dans le dossier du livre : un par compte. */
+        fun fileName(account: String): String = "$PREFIX${account.lowercase()}$SUFFIX"
 
-        fun bookIdFromFileName(name: String): String? =
-            if (name.startsWith(PREFIX) && name.endsWith(SUFFIX)) name.removePrefix(PREFIX).removeSuffix(SUFFIX) else null
+        /** Livre sans dossier (piste isolée) : fichier dans le dossier de statut, nommé d'après le livre. */
+        fun fileName(account: String, bookId: String): String = "$PREFIX${account.lowercase()}-$bookId$SUFFIX"
+
+        /** Fichier écrit par l'app (jamais une piste ni une pochette). */
+        fun isProgressFile(name: String): Boolean = name.startsWith(PREFIX) && name.endsWith(SUFFIX)
 
         fun encode(progress: ProgressJson): ByteArray = json.encodeToString(serializer(), progress).toByteArray()
 

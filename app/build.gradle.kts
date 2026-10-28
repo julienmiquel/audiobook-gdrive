@@ -15,11 +15,17 @@ val localProperties = Properties().apply {
     providers.fileContents(rootProject.layout.projectDirectory.file("local.properties"))
         .asText.orNull?.let { load(it.reader()) }
 }
-val webClientId: String = (
-    localProperties.getProperty("audiotheque.webClientId")
-        ?: providers.gradleProperty("audiotheque.webClientId").orNull
-        ?: ""
-    ).trim()
+
+/** Propriété facultative : local.properties, sinon -P<nom>=…, sinon vide. */
+fun optionalProperty(name: String): String =
+    (localProperties.getProperty(name) ?: providers.gradleProperty(name).orNull ?: "").trim()
+
+val webClientId: String = optionalProperty("audiotheque.webClientId")
+
+// Recherche d'images Google (API Custom Search JSON) pour les pochettes introuvables dans les
+// catalogues : clé d'API et identifiant du moteur programmable (facultatifs).
+val customSearchKey: String = optionalProperty("audiotheque.customSearchKey")
+val customSearchCx: String = optionalProperty("audiotheque.customSearchCx")
 
 android {
     namespace = "com.julienmiquel.audiotheque"
@@ -33,6 +39,8 @@ android {
         versionName = "1.0.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "WEB_CLIENT_ID", "\"$webClientId\"")
+        buildConfigField("String", "CUSTOM_SEARCH_KEY", "\"$customSearchKey\"")
+        buildConfigField("String", "CUSTOM_SEARCH_CX", "\"$customSearchCx\"")
     }
 
     buildTypes {

@@ -5,7 +5,9 @@ import androidx.room.AutoMigration
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.AutoMigrationSpec
 import androidx.room.withTransaction
+import androidx.sqlite.db.SupportSQLiteDatabase
 
 /** Base locale partagée par les trois modules (bibliothèque, synchro, lecture). */
 @Database(
@@ -19,11 +21,15 @@ import androidx.room.withTransaction
         PendingOperationEntity::class,
         SyncPairEntity::class,
     ],
-    version = 2,
+    version = 4,
     exportSchema = true,
     autoMigrations = [
         // v2 : clé d'auteur pour les doublons (colonne facultative, remplie au fil des synchros).
         AutoMigration(from = 1, to = 2),
+        // v3 : pochette à déposer dans Drive ; progression désormais dans le dossier Drive du livre.
+        AutoMigration(from = 2, to = 3, spec = AppDatabase.ProgressInBookFolder::class),
+        // v4 : suppression d'un doublon (dossier mis à la corbeille Drive par la file d'opérations).
+        AutoMigration(from = 3, to = 4),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -35,6 +41,17 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun syncRunDao(): SyncRunDao
     abstract fun pendingOperationDao(): PendingOperationDao
     abstract fun syncPairDao(): SyncPairDao
+
+    /**
+     * v3 : la progression quitte l'espace caché (appDataFolder) pour un fichier dans le dossier
+     * Drive de chaque livre. Toutes les positions connues sont à renvoyer ; la plus récente
+     * l'emportera quand les téléphones se rencontreront dans Drive.
+     */
+    class ProgressInBookFolder : AutoMigrationSpec {
+        override fun onPostMigrate(db: SupportSQLiteDatabase) {
+            db.execSQL("UPDATE progress SET dirty = 1, remoteFileId = NULL, remoteSyncedAt = NULL")
+        }
+    }
 
     /**
      * Déconnexion : la bibliothèque du compte est vidée (livres, pistes, file d'opérations,

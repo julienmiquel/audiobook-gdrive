@@ -89,7 +89,7 @@ class DriveRangeNotSatisfiableException(message: String) : DriveHttpException(41
 /** Jeton absent ou refusé : il faut se (re)connecter ou accorder l'accès à Drive. */
 class DriveAuthException(message: String, val needsUserAction: Boolean = true) : IOException(message)
 
-/** Fournit le jeton OAuth (autorisations drive et drive.appdata). */
+/** Fournit le jeton OAuth (autorisation drive). */
 interface AccessTokenProvider {
     /** Lève [DriveAuthException] si un consentement de l'utilisateur est nécessaire. */
     suspend fun accessToken(): String
@@ -100,11 +100,18 @@ interface AccessTokenProvider {
 
 /**
  * Accès à Google Drive API v3. Seul le moteur de synchro l'utilise. L'app ne fait que lire,
- * télécharger, déplacer des dossiers de livres et écrire la progression dans l'espace caché.
+ * télécharger, déplacer des dossiers de livres et déposer dans le dossier de chaque livre deux
+ * petits fichiers : sa progression (un par compte) et, à défaut d'image, sa pochette.
  */
 interface DriveService {
     /** files.list avec q = « '<ID du dossier>' in parents and trashed = false » (toutes les pages). */
     suspend fun listChildren(folderId: String): List<DriveFile>
+
+    /** files.list avec q = « '<ID du dossier>' in parents and name = '<nom>' and trashed = false ». */
+    suspend fun findChildren(folderId: String, name: String): List<DriveFile>
+
+    /** files.list avec q = « name = '<nom>' and trashed = false » : les fichiers de ce nom de tous les dossiers, en une requête. */
+    suspend fun findByName(name: String): List<DriveFile>
 
     /** files.get (champs size et md5Checksum compris). */
     suspend fun getFile(fileId: String): DriveFile
@@ -121,17 +128,17 @@ interface DriveService {
     /** files.update avec addParents = nouveau statut, removeParents = ancien. */
     suspend fun move(fileId: String, addParent: String, removeParents: List<String>): DriveFile
 
+    /** files.update avec trashed = true : corbeille Drive (restaurable 30 jours), jamais de suppression définitive. */
+    suspend fun trash(fileId: String): DriveFile
+
     /** about.get : compte et champ storageQuota. */
     suspend fun about(): DriveAbout
 
-    /** Fichiers JSON de progression dans appDataFolder (espace caché de l'app). */
-    suspend fun listAppData(): List<DriveFile>
+    /** files.create (envoi multipart) : petit fichier dans un dossier (progression, pochette). */
+    suspend fun createFile(name: String, parentId: String, content: ByteArray, mimeType: String): DriveFile
 
-    suspend fun readAppData(fileId: String): ByteArray
-
-    suspend fun createAppData(name: String, content: ByteArray): DriveFile
-
-    suspend fun updateAppData(fileId: String, content: ByteArray): DriveFile
+    /** files.update avec uploadType=media : remplace le contenu d'un fichier créé par l'app. */
+    suspend fun updateContent(fileId: String, content: ByteArray, mimeType: String): DriveFile
 }
 
 /** Lit au plus [max] octets d'un contenu. */
@@ -147,3 +154,6 @@ fun DriveContent.readUpTo(max: Int): ByteArray = use { content ->
     }
     out.toByteArray()
 }
+
+/** Contenu entier d'un petit fichier (progression JSON), plafonné à [max] octets. */
+suspend fun DriveService.readSmallFile(fileId: String, max: Int = 256 * 1024): ByteArray = openContent(fileId).readUpTo(max)

@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkAdd
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
@@ -51,8 +52,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -85,6 +88,7 @@ import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.core.db.BookmarkEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.AudioPreset
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.TrackState
@@ -137,7 +141,10 @@ data class PlayerScreenState(
     val isPlaying: Boolean = false,
     val buffering: Boolean = false,
     val currentTrack: TrackEntity? = null,
+    /** Position dans le chapitre en cours. */
     val positionMs: Long = 0,
+    /** Durée du chapitre en cours (0 si inconnue) : réelle quand le lecteur l'a, sinon estimée. */
+    val chapterDurationMs: Long = 0,
     val globalMs: Long = 0,
     val totalMs: Long = 0,
     val percent: Float = 0f,
@@ -147,8 +154,15 @@ data class PlayerScreenState(
     val playlistTrackIds: List<String> = emptyList(),
     val sleep: SleepTimerState = SleepTimerState.Off,
     val skipSeconds: Int = 30,
+    /** Durée de conservation des pistes d'un livre mis de côté (réglage). */
+    val laterRetentionDays: Int = 7,
     val anotherBookPlaying: Boolean = false,
+    /** Préréglage audio en cours (pour tous les livres). */
+    val audioPreset: AudioPreset = AudioPreset.NONE,
 )
+
+/** Sous-ensemble des réglages utiles à l'écran de lecture. */
+private data class PlayerPrefs(val skipSeconds: Int, val laterRetentionDays: Int, val audioPreset: AudioPreset)
 
 class PlayerViewModel(private val c: AppContainer) : ViewModel() {
 
@@ -178,13 +192,13 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         data,
         c.player.state,
         PlayerRuntime.sleepTimer,
-        c.settings.settings.map { it.skipSeconds }.distinctUntilChanged(),
-    ) { (id, book), player, sleep, skip -> build(id, book, player, sleep, skip) }
+        c.settings.settings.map { PlayerPrefs(it.skipSeconds, it.laterRetentionDays, it.audioPreset) }.distinctUntilChanged(),
+    ) { (id, book), player, sleep, prefs -> build(id, book, player, sleep, prefs) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlayerScreenState())
 
-    private fun build(id: String?, book: BookData?, player: PlayerUiState, sleep: SleepTimerState, skip: Int): PlayerScreenState {
+    private fun build(id: String?, book: BookData?, player: PlayerUiState, sleep: SleepTimerState, prefs: PlayerPrefs): PlayerScreenState {
         if (id == null || book == null) {
-            return PlayerScreenState(loaded = true, sleep = sleep, skipSeconds = skip)
+            return PlayerScreenState(loaded = true, sleep = sleep, skipSeconds = prefs.skipSeconds, laterRetentionDays = prefs.laterRetentionDays, audioPreset = prefs.audioPreset)
         }
         val tracks = book.tracks
         val isCurrent = player.bookId == id && player.playlistTrackIds.isNotEmpty()
@@ -213,6 +227,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             buffering = isCurrent && player.buffering,
             currentTrack = current,
             positionMs = position,
+            chapterDurationMs = durations.getOrElse(index) { 0L },
             globalMs = ProgressMath.globalPosition(durations, index, position),
             totalMs = ProgressMath.total(durations),
             percent = if (book.progress?.finished == true && !isCurrent) 100f else ProgressMath.percent(durations, index, position),
@@ -221,8 +236,10 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             durations = durations,
             playlistTrackIds = if (isCurrent) player.playlistTrackIds else emptyList(),
             sleep = sleep,
-            skipSeconds = skip,
+            skipSeconds = prefs.skipSeconds,
+            laterRetentionDays = prefs.laterRetentionDays,
             anotherBookPlaying = player.isPlaying && player.bookId != null && player.bookId != id,
+            audioPreset = prefs.audioPreset,
         )
     }
 
@@ -257,12 +274,10 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         if (state.value.isCurrent) action() else ensureLoaded()
     }
 
-    /** Barre de progression sur le livre entier. */
-    fun seekGlobal(globalMs: Long) {
-        val s = state.value
-        if (s.durations.isEmpty()) return
-        val (index, position) = ProgressMath.locate(s.durations, globalMs)
-        s.tracks.getOrNull(index)?.let { jumpTo(it, position) }
+    /** Barre du chapitre en cours : position dans ce chapitre. */
+    fun seekInChapter(positionMs: Long) {
+        val track = state.value.currentTrack ?: return
+        jumpTo(track, positionMs.coerceIn(0L, state.value.chapterDurationMs.coerceAtLeast(0L)))
     }
 
     fun jumpTo(track: TrackEntity, positionMs: Long = 0) {
@@ -280,6 +295,11 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         val id = s.bookId ?: return
         val value = ((speed * 10).roundToInt() / 10f).coerceIn(PlaybackService.MIN_SPEED, PlaybackService.MAX_SPEED)
         if (s.isCurrent) c.player.setSpeed(value) else viewModelScope.launch { c.library.setSpeed(id, value) }
+    }
+
+    /** Préréglage audio, mémorisé pour tous les livres ; pris en compte aussitôt par le lecteur. */
+    fun setAudioPreset(preset: AudioPreset) {
+        viewModelScope.launch { c.settings.update { it.copy(audioPreset = preset) } }
     }
 
     fun startTimer(minutes: Int) = PlayerRuntime.startTimer(minutes)
@@ -359,6 +379,7 @@ fun PlayerScreen(onOpenBook: (String) -> Unit, onOpenLibrary: () -> Unit, conten
             sheet = null
         }, onDismiss = { sheet = null })
         SHEET_BOOKMARKS -> BookmarksSheet(state, vm, onDismiss = { sheet = null })
+        SHEET_SOUND -> SoundSheet(state.audioPreset, onSelect = vm::setAudioPreset, onDismiss = { sheet = null })
     }
 }
 
@@ -366,6 +387,7 @@ private const val SHEET_SPEED = "speed"
 private const val SHEET_TIMER = "timer"
 private const val SHEET_CHAPTERS = "chapters"
 private const val SHEET_BOOKMARKS = "bookmarks"
+private const val SHEET_SOUND = "sound"
 
 @Composable
 private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: PlayerViewModel, modifier: Modifier, onOpenSheet: (String) -> Unit) {
@@ -395,7 +417,8 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
             Text(track.title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
 
-        BookSeekBar(state, enabled = canPlay, onSeek = vm::seekGlobal)
+        ChapterSeekBar(state, enabled = canPlay, onSeek = vm::seekInChapter)
+        BookProgressBar(state)
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -437,9 +460,10 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
             SleepButton(state.sleep) { onOpenSheet(SHEET_TIMER) }
             ToolButton(Icons.AutoMirrored.Filled.FormatListBulleted, "Chapitres", "Chapitres") { onOpenSheet(SHEET_CHAPTERS) }
             ToolButton(Icons.Filled.Bookmark, "Signets", "Signets") { onOpenSheet(SHEET_BOOKMARKS) }
+            ToolButton(Icons.Filled.GraphicEq, "Son", "Son : ${state.audioPreset.label}") { onOpenSheet(SHEET_SOUND) }
         }
 
-        StatusAction(item, state, vm)
+        StatusAction(item, vm)
 
         if (state.presentCount < item.trackCount && !item.isZip) {
             DownloadStatus(state, item)
@@ -454,13 +478,28 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
     }
 }
 
+/**
+ * Avancement dans le chapitre en cours (écoulé à gauche, restant à droite), déplaçable : plus
+ * précis que la barre du livre entier sur un livre de dix heures. Masquée tant que la durée du
+ * chapitre n'est pas connue.
+ */
 @Composable
-private fun BookSeekBar(state: PlayerScreenState, enabled: Boolean, onSeek: (Long) -> Unit) {
+private fun ChapterSeekBar(state: PlayerScreenState, enabled: Boolean, onSeek: (Long) -> Unit) {
+    val total = state.chapterDurationMs
+    if (total <= 0L) return
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(0f) }
-    val total = state.totalMs.coerceAtLeast(1L).toFloat()
-    val shown = if (dragging) dragValue else state.globalMs.toFloat().coerceIn(0f, total)
+    val shown = if (dragging) dragValue else state.positionMs.toFloat().coerceIn(0f, total.toFloat())
     Column(Modifier.fillMaxWidth()) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Chapitre", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
+            Spacer(Modifier.weight(1f))
+            Text(
+                "${Formats.clock(shown.toLong())} · reste ${Formats.clock((total - shown.toLong()).coerceAtLeast(0))}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
         Slider(
             value = shown,
             onValueChange = {
@@ -471,18 +510,55 @@ private fun BookSeekBar(state: PlayerScreenState, enabled: Boolean, onSeek: (Lon
                 onSeek(dragValue.toLong())
                 dragging = false
             },
-            valueRange = 0f..total,
-            enabled = enabled && state.totalMs > 0,
-            modifier = Modifier.semantics {
-                contentDescription = "Position dans le livre"
-                stateDescription = "${Formats.clock(shown.toLong())} sur ${Formats.clock(state.totalMs)}"
-            },
+            valueRange = 0f..total.toFloat(),
+            enabled = enabled,
+            colors = SliderDefaults.colors(
+                thumbColor = MaterialTheme.colorScheme.secondary,
+                activeTrackColor = MaterialTheme.colorScheme.secondary,
+            ),
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(24.dp)
+                .semantics {
+                    contentDescription = "Position dans le chapitre"
+                    stateDescription = "${Formats.clock(shown.toLong())} sur ${Formats.clock(total)}"
+                },
         )
-        Row(Modifier.fillMaxWidth()) {
-            Text(Formats.clock(shown.toLong()), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/**
+ * Avancement dans le livre entier, en lecture seule : sur un livre de dix heures, un simple
+ * effleurement d'un curseur suffirait à perdre sa page. Pour se déplacer, on utilise la barre du
+ * chapitre ou les boutons.
+ *
+ * La ligne « Livre · … » est placée **au-dessus** de la barre : la zone tactile du curseur du
+ * chapitre fait 48 dp de haut et déborde de 12 dp sous sa piste ; sans cet écart, toucher la
+ * barre du livre déplacerait encore la lecture dans le chapitre.
+ */
+@Composable
+private fun BookProgressBar(state: PlayerScreenState) {
+    val total = state.totalMs.coerceAtLeast(1L).toFloat()
+    val shown = state.globalMs.toFloat().coerceIn(0f, total)
+    val fraction = if (state.totalMs > 0) shown / total else 0f
+    Column(Modifier.fillMaxWidth().padding(top = 8.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Text("Livre · ${Formats.clock(shown.toLong())}", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.weight(1f))
             Text(Formats.clock(state.totalMs), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        Spacer(Modifier.height(6.dp))
+        LinearProgressIndicator(
+            progress = { fraction },
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(6.dp)
+                .semantics {
+                    contentDescription = "Position dans le livre"
+                    stateDescription = "${Formats.clock(shown.toLong())} sur ${Formats.clock(state.totalMs)}"
+                },
+        )
+        Spacer(Modifier.height(8.dp))
         Text(
             "${Formats.percent(state.percent)} · reste ${Formats.duration(state.remainingMs)} à ${Formats.speed(state.speed)}",
             style = MaterialTheme.typography.bodyMedium,
@@ -527,18 +603,27 @@ private fun SleepButton(sleep: SleepTimerState, onClick: () -> Unit) {
 private fun remainingOf(sleep: SleepTimerState): Long =
     (sleep as? SleepTimerState.Countdown)?.let { (it.endsAt - System.currentTimeMillis()).coerceAtLeast(0) } ?: 0L
 
+/**
+ * Bouton de statut du lecteur, seulement pour ramener un livre dans « En écoute » (Reprendre,
+ * Commencer). « Mettre de côté » et « Marquer écouté » restent dans la fiche livre et le menu
+ * d'appui long de la bibliothèque : pas de bouton de rangement sur l'écran d'écoute.
+ */
 @Composable
-private fun StatusAction(item: LibraryItem, state: PlayerScreenState, vm: PlayerViewModel) {
+private fun StatusAction(item: LibraryItem, vm: PlayerViewModel) {
     val gesture = when (item.status) {
-        BookStatus.IN_PROGRESS -> Gesture.METTRE_DE_COTE
         BookStatus.LATER -> Gesture.REPRENDRE
         BookStatus.NEW, BookStatus.UNSORTED -> Gesture.COMMENCER
         else -> null
     } ?: return
     OutlinedButton(onClick = { vm.gesture(gesture) }) { Text(gesture.label) }
-    if (gesture == Gesture.METTRE_DE_COTE && state.progress != null) {
+    val hint = when (gesture) {
+        Gesture.REPRENDRE -> "Le dossier revient dans « En écoute » : ses pistes sont (re)téléchargées et la lecture reprend à la position gardée."
+        Gesture.COMMENCER -> "Le dossier passe dans « En écoute » : toutes ses pistes sont téléchargées pour une écoute hors ligne."
+        else -> null
+    }
+    hint?.let {
         Text(
-            "La position est gardée : le livre reprendra là où il s'est arrêté.",
+            it,
             style = MaterialTheme.typography.labelSmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
@@ -603,6 +688,45 @@ private fun SpeedSheet(speed: Float, onSpeed: (Float) -> Unit, onDismiss: () -> 
                 }
             }
             Text("Mémorisée pour ce livre", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/** Préréglages audio : un seul à la fois, mémorisé pour tous les livres (téléphone, voiture, montre). */
+@Composable
+private fun SoundSheet(current: AudioPreset, onSelect: (AudioPreset) -> Unit, onDismiss: () -> Unit) {
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(
+            Modifier
+                .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .navigationBarsPadding()
+                .padding(bottom = 16.dp),
+        ) {
+            Text("Son", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 24.dp).semantics { heading() })
+            Text(
+                "Traitement appliqué à la lecture, pour tous les livres — aussi en voiture et sur la montre.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+            )
+            AudioPreset.entries.forEach { preset ->
+                val selected = preset == current
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(onClickLabel = "Choisir ${preset.label}") { onSelect(preset) }
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    RadioButton(selected = selected, onClick = null)
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(preset.label, style = MaterialTheme.typography.bodyLarge, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
+                        Text(preset.description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
         }
     }
 }

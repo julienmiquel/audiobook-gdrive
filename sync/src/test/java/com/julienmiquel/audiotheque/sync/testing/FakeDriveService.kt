@@ -39,16 +39,16 @@ class FakeDriveService(
         val createdTime: Long,
         var modifiedTime: Long,
         var trashed: Boolean = false,
+        /** Contenu d'un fichier créé par l'app (progression, pochette), sans fixture. */
+        var bytes: ByteArray? = null,
     )
-
-    private class AppDataFile(val id: String, val name: String, var bytes: ByteArray, var modifiedTime: Long)
 
     private val mutex = Mutex()
     private val nodes = LinkedHashMap<String, Node>()
     private val changeLog = ArrayList<String>()
-    private val appData = LinkedHashMap<String, AppDataFile>()
     private val fixtureInfo = HashMap<String, Pair<Long, String>>()
     private var loaded = false
+    private var created = 0
 
     /** Réseau coupé : chaque appel échoue comme sans connexion. */
     @Volatile
@@ -68,6 +68,14 @@ class FakeDriveService(
 
     override suspend fun listChildren(folderId: String): List<DriveFile> = op {
         nodes.values.filter { folderId in it.parents && !it.trashed }.map { it.toFile() }
+    }
+
+    override suspend fun findChildren(folderId: String, name: String): List<DriveFile> = op {
+        nodes.values.filter { folderId in it.parents && it.name == name && !it.trashed }.map { it.toFile() }
+    }
+
+    override suspend fun findByName(name: String): List<DriveFile> = op {
+        nodes.values.filter { it.name == name && !it.trashed }.map { it.toFile() }
     }
 
     override suspend fun getFile(fileId: String): DriveFile = op {
@@ -91,10 +99,8 @@ class FakeDriveService(
 
     override suspend fun openContent(fileId: String, fromByte: Long, toByteInclusive: Long?): DriveContent {
         val bytes = op {
-            appData[fileId]?.bytes ?: run {
-                val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
-                content(node.fixture ?: throw DriveHttpException(403, "fileNotDownloadable", "Dossier"))
-            }
+            val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
+            node.bytes ?: content(node.fixture ?: throw DriveHttpException(403, "fileNotDownloadable", "Dossier"))
         }
         if (fromByte >= bytes.size && bytes.isNotEmpty()) {
             throw DriveRangeNotSatisfiableException("Plage hors du fichier")
@@ -118,6 +124,22 @@ class FakeDriveService(
         node.toFile()
     }
 
+    override suspend fun trash(fileId: String): DriveFile = op {
+        if (fileId in forbiddenMoves) throw DriveHttpException(403, "insufficientFilePermissions", "Drive 403 : permission refusée")
+        val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
+        // Dans Drive, le contenu d'un dossier mis à la corbeille disparaît avec lui des listes.
+        fun trashTree(id: String) {
+            nodes[id]?.let { n ->
+                n.trashed = true
+                n.modifiedTime = clock.now()
+                changeLog += id
+            }
+            nodes.values.filter { id in it.parents }.forEach { trashTree(it.id) }
+        }
+        trashTree(fileId)
+        node.toFile()
+    }
+
     override suspend fun about(): DriveAbout = op {
         DriveAbout(
             email = ACCOUNT,
@@ -127,27 +149,21 @@ class FakeDriveService(
         )
     }
 
-    override suspend fun listAppData(): List<DriveFile> = op {
-        appData.values.map {
-            DriveFile(it.id, it.name, "application/json", listOf("appDataFolder"), it.bytes.size.toLong(), modifiedTime = it.modifiedTime)
-        }
+    override suspend fun createFile(name: String, parentId: String, content: ByteArray, mimeType: String): DriveFile = op {
+        if (nodes[parentId]?.mimeType != DriveFile.FOLDER_MIME) throw DriveNotFoundException("Dossier introuvable : $parentId")
+        created++
+        val node = Node("created-$created-${name.hashCode().toUInt()}", name, mimeType, listOf(parentId), createdTime = clock.now(), modifiedTime = clock.now(), bytes = content)
+        nodes[node.id] = node
+        changeLog += node.id
+        node.toFile()
     }
 
-    override suspend fun readAppData(fileId: String): ByteArray = op {
-        (appData[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")).bytes
-    }
-
-    override suspend fun createAppData(name: String, content: ByteArray): DriveFile = op {
-        val file = AppDataFile("appdata-${appData.size + 1}-${name.hashCode().toUInt()}", name, content, clock.now())
-        appData[file.id] = file
-        DriveFile(file.id, name, "application/json", listOf("appDataFolder"), content.size.toLong(), modifiedTime = file.modifiedTime)
-    }
-
-    override suspend fun updateAppData(fileId: String, content: ByteArray): DriveFile = op {
-        val file = appData[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
-        file.bytes = content
-        file.modifiedTime = clock.now()
-        DriveFile(file.id, file.name, "application/json", listOf("appDataFolder"), content.size.toLong(), modifiedTime = file.modifiedTime)
+    override suspend fun updateContent(fileId: String, content: ByteArray, mimeType: String): DriveFile = op {
+        val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
+        node.bytes = content
+        node.modifiedTime = clock.now()
+        changeLog += fileId
+        node.toFile()
     }
 
     // ------------------------------------------------------------------ cas de test
@@ -161,6 +177,26 @@ class FakeDriveService(
             node.modifiedTime = clock.now()
             changeLog += bookId
         }
+    }
+
+    /** Contenu d'un fichier créé par l'app (progression, pochette). */
+    suspend fun bytesOf(fileId: String): ByteArray = op {
+        nodes[fileId]?.bytes ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
+    }
+
+    /**
+     * Un autre téléphone écrit la progression du compte dans le dossier du livre, à la date
+     * [at] (modifiedTime Drive) : crée ou remplace le fichier.
+     */
+    suspend fun writeProgressFromOtherDevice(bookId: String, progress: ProgressJson, at: Long = clock.now()): DriveFile = mutex.withLock {
+        ensureLoaded()
+        val name = ProgressJson.fileName(ACCOUNT)
+        val existing = nodes.values.firstOrNull { bookId in it.parents && it.name == name && !it.trashed }
+        val node = existing ?: Node("other-${bookId.takeLast(6)}", name, ProgressJson.MIME, listOf(bookId), createdTime = at, modifiedTime = at).also { nodes[it.id] = it }
+        node.bytes = ProgressJson.encode(progress)
+        node.modifiedTime = at
+        changeLog += node.id
+        node.toFile()
     }
 
     // ------------------------------------------------------------------ interne
@@ -181,7 +217,7 @@ class FakeDriveService(
             name = name,
             mimeType = mimeType,
             parents = parents,
-            size = info?.first,
+            size = info?.first ?: bytes?.size?.toLong(),
             md5 = info?.second,
             createdTime = createdTime,
             modifiedTime = modifiedTime,
@@ -239,9 +275,11 @@ class FakeDriveService(
                 }
             }
         }
-        // Progression déjà enregistrée dans l'espace caché : livre rangé à tort dans _Ecouté.
+        // Progression déjà écrite par un autre téléphone dans le dossier du livre : livre rangé à
+        // tort dans _Ecouté, pas fini.
         nodes.values.firstOrNull { it.name == LibraryFixture.UNFINISHED_BOOK }?.let { book ->
             val firstTrack = nodes.values.filter { book.id in it.parents }.minByOrNull { it.name }
+            val at = clock.now() - 20L * 24 * 3600 * 1000
             val progress = ProgressJson(
                 bookId = book.id,
                 trackId = firstTrack?.id,
@@ -249,13 +287,15 @@ class FakeDriveService(
                 positionMs = LibraryFixture.UNFINISHED_POSITION_MS,
                 speed = 1.2f,
                 percent = 46f,
-                lastListenedAt = clock.now() - 20L * 24 * 3600 * 1000,
+                lastListenedAt = at,
                 finished = false,
                 setAsideAtPercent = null,
-                updatedAt = clock.now() - 20L * 24 * 3600 * 1000,
+                updatedAt = at,
+                device = OTHER_DEVICE,
+                account = ACCOUNT,
             )
-            val name = ProgressJson.fileName(book.id)
-            appData["appdata-seed"] = AppDataFile("appdata-seed", name, ProgressJson.encode(progress), progress.updatedAt)
+            val id = "progress-seed"
+            nodes[id] = Node(id, ProgressJson.fileName(ACCOUNT), ProgressJson.MIME, listOf(book.id), createdTime = at, modifiedTime = at, bytes = ProgressJson.encode(progress))
         }
     }
 
@@ -269,5 +309,8 @@ class FakeDriveService(
     companion object {
         /** Compte Google des tests. */
         const val ACCOUNT = "lecteur@example.com"
+
+        /** L'autre téléphone du même compte. */
+        const val OTHER_DEVICE = "Google Pixel 9"
     }
 }

@@ -33,6 +33,18 @@ class PlayerLogicTest {
     }
 
     @Test
+    fun `vignette système - numéro de piste ou chapitre, jamais le nom de fichier`() {
+        fun t(i: Int, part: Int?, chapter: Int?) = TrackEntity(
+            driveId = "t$i", bookId = "b", name = "9791035411947 00$i.mp3", relativePath = "$i.mp3", sortIndex = i,
+            part = part, chapter = chapter, title = "9791035411947 00$i mp3", sizeBytes = 1, mimeType = "audio/mpeg",
+        )
+        assertThat(Chapters.label(t(3, null, null), total = 51)).isEqualTo("Piste 4 / 51")
+        assertThat(Chapters.label(t(3, null, null), total = 0)).isEqualTo("Piste 4")
+        assertThat(Chapters.label(t(3, null, 12), total = 51)).isEqualTo("Chapitre 12")
+        assertThat(Chapters.label(t(3, 2, 4), total = 51)).isEqualTo("Partie 2 · chapitre 4")
+    }
+
+    @Test
     fun `minuterie de sommeil - 15 à 60 min, fin du chapitre, prolongeable de 10 min`() {
         assertThat(PlayerRuntime.TIMER_CHOICES_MINUTES).containsExactly(15, 30, 45, 60).inOrder()
         PlayerRuntime.startTimer(15, now = 0)

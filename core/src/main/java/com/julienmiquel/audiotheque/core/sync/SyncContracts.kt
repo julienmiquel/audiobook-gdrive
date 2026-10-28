@@ -14,6 +14,32 @@ interface SyncRequester {
     fun requestSync(trigger: SyncTrigger)
 }
 
+/** Position adoptée depuis Drive, enregistrée par un autre téléphone. */
+data class RemoteProgress(
+    val bookId: String,
+    /** Nom de l'appareil qui l'a enregistrée (« Google Pixel 9 »), s'il est connu. */
+    val device: String?,
+    val percent: Float,
+    val finished: Boolean,
+)
+
+/**
+ * Progression échangée avec Drive en dehors des synchros complètes, pour commencer un livre sur
+ * un téléphone et le continuer sur l'autre : envoi après une pause, réception juste avant une
+ * lecture. Mis en œuvre par le moteur de synchro (seul accès à Drive), consommé par le lecteur.
+ */
+interface ProgressSyncRequester {
+    /**
+     * Avant la lecture d'un livre : relit sa position dans Drive, au plus [timeoutMs]. Retourne la
+     * position adoptée si un autre appareil en a enregistré une plus récente, sinon null (position
+     * locale à jour, hors ligne, délai dépassé).
+     */
+    suspend fun pullProgress(bookId: String, timeoutMs: Long): RemoteProgress?
+
+    /** Après une pause, un déplacement ou en arrière-plan : envoie la progression locale sans attendre. */
+    fun pushProgress(bookId: String?)
+}
+
 /** Horloge injectable pour les tests. */
 fun interface Clock {
     fun now(): Long

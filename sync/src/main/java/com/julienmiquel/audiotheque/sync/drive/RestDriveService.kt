@@ -35,12 +35,22 @@ class RestDriveService(
     private val json = Json { ignoreUnknownKeys = true; explicitNulls = false }
     private val jsonType = "application/json; charset=UTF-8".toMediaType()
 
-    override suspend fun listChildren(folderId: String): List<DriveFile> {
+    override suspend fun listChildren(folderId: String): List<DriveFile> =
+        listAll("'${escape(folderId)}' in parents and trashed = false")
+
+    override suspend fun findChildren(folderId: String, name: String): List<DriveFile> =
+        listAll("'${escape(folderId)}' in parents and name = '${escape(name)}' and trashed = false")
+
+    override suspend fun findByName(name: String): List<DriveFile> =
+        listAll("name = '${escape(name)}' and trashed = false")
+
+    /** files.list paginé pour une requête q donnée. */
+    private suspend fun listAll(q: String): List<DriveFile> {
         val result = mutableListOf<DriveFile>()
         var pageToken: String? = null
         do {
             val url = api("drive/v3/files")
-                .addQueryParameter("q", "'${folderId.replace("'", "\\'")}' in parents and trashed = false")
+                .addQueryParameter("q", q)
                 .addQueryParameter("fields", "nextPageToken,files($FILE_FIELDS)")
                 .addQueryParameter("pageSize", "1000")
                 .addQueryParameter("supportsAllDrives", "true")
@@ -129,6 +139,15 @@ class RestDriveService(
         return send<FileDto>(request, retry = true).toModel()
     }
 
+    override suspend fun trash(fileId: String): DriveFile {
+        val url = api("drive/v3/files/$fileId")
+            .addQueryParameter("fields", FILE_FIELDS)
+            .addQueryParameter("supportsAllDrives", "true")
+            .build()
+        val request = Request.Builder().url(url).patch("""{"trashed":true}""".toRequestBody(jsonType))
+        return send<FileDto>(request, retry = true).toModel()
+    }
+
     override suspend fun about(): DriveAbout {
         val url = api("drive/v3/about")
             .addQueryParameter("fields", "user(emailAddress,displayName),storageQuota(limit,usage)")
@@ -142,52 +161,37 @@ class RestDriveService(
         )
     }
 
-    override suspend fun listAppData(): List<DriveFile> {
-        val result = mutableListOf<DriveFile>()
-        var pageToken: String? = null
-        do {
-            val url = api("drive/v3/files")
-                .addQueryParameter("spaces", "appDataFolder")
-                .addQueryParameter("fields", "nextPageToken,files($FILE_FIELDS)")
-                .addQueryParameter("pageSize", "1000")
-                .apply { pageToken?.let { addQueryParameter("pageToken", it) } }
-                .build()
-            val page = getJson<FileListDto>(url)
-            page.files.mapTo(result) { it.toModel() }
-            pageToken = page.nextPageToken
-        } while (pageToken != null)
-        return result
-    }
-
-    override suspend fun readAppData(fileId: String): ByteArray =
-        openContent(fileId).use { it.stream.readBytes() }
-
-    override suspend fun createAppData(name: String, content: ByteArray): DriveFile {
+    override suspend fun createFile(name: String, parentId: String, content: ByteArray, mimeType: String): DriveFile {
         val url = api("upload/drive/v3/files")
             .addQueryParameter("uploadType", "multipart")
             .addQueryParameter("fields", FILE_FIELDS)
+            .addQueryParameter("supportsAllDrives", "true")
             .build()
-        val metadata = json.encodeToString(NewFileDto.serializer(), NewFileDto(name, listOf("appDataFolder")))
+        val metadata = json.encodeToString(NewFileDto.serializer(), NewFileDto(name, listOf(parentId), mimeType))
         val body = MultipartBody.Builder()
             .setType("multipart/related".toMediaType())
             .addPart(metadata.toRequestBody(jsonType))
-            .addPart(content.toRequestBody(jsonType))
+            .addPart(content.toRequestBody(mimeType.toMediaType()))
             .build()
         // Une création n'est pas idempotente : pas de nouvelle tentative automatique.
         return send<FileDto>(Request.Builder().url(url).post(body), retry = false).toModel()
     }
 
-    override suspend fun updateAppData(fileId: String, content: ByteArray): DriveFile {
+    override suspend fun updateContent(fileId: String, content: ByteArray, mimeType: String): DriveFile {
         val url = api("upload/drive/v3/files/$fileId")
             .addQueryParameter("uploadType", "media")
             .addQueryParameter("fields", FILE_FIELDS)
+            .addQueryParameter("supportsAllDrives", "true")
             .build()
-        return send<FileDto>(Request.Builder().url(url).patch(content.toRequestBody(jsonType)), retry = true).toModel()
+        return send<FileDto>(Request.Builder().url(url).patch(content.toRequestBody(mimeType.toMediaType())), retry = true).toModel()
     }
 
     // ------------------------------------------------------------------ plomberie HTTP
 
     private fun api(path: String): HttpUrl.Builder = base.newBuilder().addPathSegments(path)
+
+    /** Valeur entre apostrophes dans une requête q (files.list). */
+    private fun escape(value: String): String = value.replace("\\", "\\\\").replace("'", "\\'")
 
     private suspend inline fun <reified T> getJson(url: HttpUrl): T =
         send(Request.Builder().url(url).get(), retry = true)
@@ -329,7 +333,7 @@ internal data class UserDto(val emailAddress: String? = null, val displayName: S
 internal data class QuotaDto(val limit: String? = null, val usage: String? = null)
 
 @Serializable
-internal data class NewFileDto(val name: String, val parents: List<String>)
+internal data class NewFileDto(val name: String, val parents: List<String>, val mimeType: String? = null)
 
 @Serializable
 internal data class ErrorEnvelopeDto(val error: ErrorDto? = null)

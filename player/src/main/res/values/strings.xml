@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="player_channel_name">Lecture</string>
-    <string name="player_root_title">En écoute</string>
+    <string name="player_root_title">Audiothèque</string>
+    <string name="player_tab_in_progress">En écoute</string>
+    <string name="player_tab_later">Plus tard</string>
     <string name="player_seek_back">Reculer de %1$d secondes</string>
     <string name="player_seek_forward">Avancer de %1$d secondes</string>
+    <string name="player_speed">Vitesse %1$s</string>
+    <string name="player_chapter_duration">%1$s · %2$s</string>
+    <string name="player_downloaded_tracks">%1$d/%2$d pistes sur le téléphone</string>
 </resources>

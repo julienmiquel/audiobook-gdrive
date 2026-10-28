@@ -41,10 +41,10 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE COALESCE(pendingStatus, status) = :status")
     fun observeByEffectiveStatus(status: BookStatus): Flow<List<BookEntity>>
 
-    /** Autres exemplaires : même titre, auteurs identiques ou inconnus (cf. [BookEntity.authorKey]). */
+    /** Autres exemplaires : même titre, auteurs identiques ou inconnus (cf. [BookEntity.authorKey]), hors suppressions en attente. */
     @Query(
         """
-        SELECT * FROM books WHERE normalizedKey = :key AND driveId != :excludeId
+        SELECT * FROM books WHERE normalizedKey = :key AND driveId != :excludeId AND trashPending = 0
           AND (:authorKey IS NULL OR authorKey IS NULL OR authorKey = :authorKey)
         """,
     )
@@ -117,6 +117,16 @@ interface BookDao {
     @Query("UPDATE books SET coverPath = :path WHERE driveId = :id")
     suspend fun setCoverPath(id: String, path: String?)
 
+    /** Pochette obtenue en ligne : enregistrée localement et, si demandé, à déposer dans le dossier Drive. */
+    @Query("UPDATE books SET coverPath = :path, coverUploadPending = :uploadPending WHERE driveId = :id")
+    suspend fun setCover(id: String, path: String?, uploadPending: Boolean)
+
+    @Query("SELECT * FROM books WHERE coverUploadPending = 1")
+    suspend fun withCoverToUpload(): List<BookEntity>
+
+    @Query("UPDATE books SET coverUploadPending = :pending WHERE driveId = :id")
+    suspend fun setCoverUploadPending(id: String, pending: Boolean)
+
     @Query("UPDATE books SET localDirName = :name WHERE driveId = :id")
     suspend fun setLocalDirName(id: String, name: String)
 
@@ -129,10 +139,11 @@ interface BookDao {
     @Query("UPDATE books SET tracksSyncedAt = NULL WHERE parentId IN (:parentIds)")
     suspend fun invalidateTracksIn(parentIds: List<String>)
 
+    // Titre ou auteur corrigés / confirmés : la recherche de pochette repart (elle cherche autre chose).
     @Query(
         """
         UPDATE books SET customTitle = :title, customAuthor = :author, customNarrator = :narrator,
-          titleConfirmed = :confirmed, normalizedKey = :key, authorKey = :authorKey
+          titleConfirmed = :confirmed, normalizedKey = :key, authorKey = :authorKey, enrichedAt = NULL
         WHERE driveId = :id
         """,
     )
@@ -141,10 +152,13 @@ interface BookDao {
     @Query("UPDATE books SET hidden = :hidden WHERE driveId = :id")
     suspend fun setHidden(id: String, hidden: Boolean)
 
+    @Query("UPDATE books SET trashPending = :pending WHERE driveId = :id")
+    suspend fun setTrashPending(id: String, pending: Boolean)
+
     @Query("UPDATE books SET coverUrl = :coverUrl, summary = :summary, enrichedAt = :at WHERE driveId = :id")
     suspend fun setEnrichment(id: String, coverUrl: String?, summary: String?, at: Long)
 
-    // Doublons : même titre, sauf si les deux auteurs sont connus et diffèrent.
+    // Doublons : même titre, sauf si les deux auteurs sont connus et diffèrent (suppressions en attente exclues).
 
     @Query(
         """
@@ -153,7 +167,7 @@ interface BookDao {
           p.percent AS percent,
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
-          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey
+          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey AND d.trashPending = 0
              AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account
@@ -168,7 +182,7 @@ interface BookDao {
           p.percent AS percent,
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
-          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey
+          (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey AND d.trashPending = 0
              AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account

@@ -123,7 +123,7 @@ object LibraryFixture {
         D.MEDITATIONS_ID to "_meditations",
     )
 
-    /** Progression déjà dans l'espace caché : le livre classé à tort dans _Ecouté n'est pas fini. */
+    /** Progression déjà écrite par l'autre téléphone dans le dossier du livre : classé à tort dans _Ecouté, pas fini. */
     const val UNFINISHED_BOOK = "Les guerriers de l'hiver - Olivier Norek"
     const val UNFINISHED_TRACK_INDEX = 1
     const val UNFINISHED_POSITION_MS = 9_000L

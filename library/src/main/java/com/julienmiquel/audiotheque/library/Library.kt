@@ -11,6 +11,7 @@ import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayAuthor
@@ -65,9 +66,9 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
 
     private val account: Flow<String> = settings.settings.map { it.accountKey }.distinctUntilChanged()
 
-    /** Bibliothèque affichée. Les écritures sans effet visible (avancement d'un téléchargement) sont ignorées. */
+    /** Bibliothèque affichée (suppressions en attente exclues). Les écritures sans effet visible (avancement d'un téléchargement) sont ignorées. */
     fun observeLibrary(): Flow<List<LibraryItem>> =
-        account.flatMapLatest { db.bookDao().observeLibrary(it) }.distinctUntilChanged().map { rows -> rows.map(::toItem) }
+        account.flatMapLatest { db.bookDao().observeLibrary(it) }.distinctUntilChanged().map { rows -> rows.filter { !it.book.trashPending }.map(::toItem) }
 
     fun observeItem(bookId: String): Flow<LibraryItem?> =
         account.flatMapLatest { db.bookDao().observeRow(bookId, it) }.map { it?.let(::toItem) }
@@ -285,6 +286,8 @@ class StatusGestures(
             val from = book.effectiveStatus
             val fromParentId = book.effectiveParentId
             val existing = ops.latestForBook(bookId)
+            // Suppression en file : plus de geste de statut sur ce livre.
+            if (existing?.type == OperationType.TRASH_BOOK || book.trashPending) return@withTransaction null
             val now = clock.now()
             if (existing != null) {
                 // Un déplacement est déjà en file : on change sa cible (ou on revient au départ).
@@ -361,11 +364,61 @@ class StatusGestures(
         if (restored != current) dao.upsert(restored.copy(updatedAt = clock.now(), dirty = true))
     }
 
+    // ------------------------------------------------------------------ doublons
+
+    /**
+     * Supprime un exemplaire en double : son dossier part à la **corbeille Drive** (restaurable
+     * 30 jours depuis Drive, jamais de suppression définitive) par la file d'opérations, donc
+     * aussi hors ligne. Le livre disparaît aussitôt de la bibliothèque ; ses fichiers locaux sont
+     * supprimés quand Drive a confirmé. Refusé pour le livre chargé dans le lecteur.
+     */
+    suspend fun trash(bookId: String, isInUse: Boolean = false): TrashResult? {
+        if (isInUse) return null
+        return db.withTransaction {
+            val book = books.get(bookId) ?: return@withTransaction null
+            if (ops.latestForBook(bookId)?.type == OperationType.TRASH_BOOK) {
+                return@withTransaction TrashResult(bookId, book.displayTitle, book.name)
+            }
+            // Un déplacement encore en file n'a plus de sens : la corbeille le remplace.
+            ops.deleteForBook(bookId)
+            ops.insert(
+                PendingOperationEntity(
+                    type = OperationType.TRASH_BOOK,
+                    bookId = bookId,
+                    fromParentId = book.parentId,
+                    toParentId = book.parentId,
+                    fromStatus = book.status,
+                    toStatus = book.status,
+                    createdAt = clock.now(),
+                ),
+            )
+            books.setPending(bookId, null, null, null)
+            books.setTrashPending(bookId, true)
+            TrashResult(bookId, book.displayTitle, book.name)
+        }?.also { sync.requestSync(SyncTrigger.STATUS_CHANGE) }
+    }
+
+    /**
+     * « Annuler » après une suppression : possible tant que la file ne l'a pas exécutée. Retourne
+     * faux si le dossier est déjà à la corbeille Drive (restaurable depuis Drive).
+     */
+    suspend fun undoTrash(bookId: String): Boolean = db.withTransaction {
+        val book = books.get(bookId) ?: return@withTransaction false
+        if (!book.trashPending) return@withTransaction true
+        val op = ops.latestForBook(bookId)
+        if (op != null && op.type == OperationType.TRASH_BOOK) ops.delete(op.id)
+        books.setTrashPending(bookId, false)
+        true
+    }
+
     companion object {
         /** Au-delà, un livre est considéré comme fini (Réécouter repart du début). */
         const val FINISHED_PERCENT = 99f
     }
 }
+
+/** Suppression d'un doublon demandée : de quoi afficher « Annuler » pendant 10 s. */
+data class TrashResult(val bookId: String, val title: String, val folderName: String)
 
 /** Corrections de titre, d'auteur et de voix, stockées par l'app (le dossier n'est pas renommé). */
 class BookEditor(private val db: AppDatabase) {

@@ -63,7 +63,7 @@ import kotlinx.coroutines.launch
 
 /**
  * Premier lancement : connexion Google (Credential Manager si un ID client web est configuré,
- * puis AuthorizationClient pour le consentement Drive : drive et drive.appdata).
+ * puis AuthorizationClient pour le consentement Drive : autorisation drive).
  */
 @Composable
 fun OnboardingScreen() {
@@ -179,7 +179,7 @@ fun OnboardingScreen() {
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium, textAlign = TextAlign.Center) }
             if (setupHelp) GoogleCloudSetup(packageName = container.auth.packageName, sha1 = container.auth.signingSha1)
             Text(
-                "Accès demandés : Google Drive (déplacer les dossiers de livres que l'app n'a pas créés) et l'espace caché de l'app (votre progression, un fichier par livre).",
+                "Accès demandé : Google Drive, pour déplacer les dossiers de livres et écrire dans le dossier de chaque livre votre progression (un petit fichier par compte, pour continuer sur un autre téléphone) et sa pochette.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,

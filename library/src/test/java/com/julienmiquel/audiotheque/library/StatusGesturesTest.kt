@@ -7,6 +7,7 @@ import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
@@ -286,5 +287,53 @@ class StatusGesturesTest {
         assertThat(items.getValue("abri-1").isDuplicate).isTrue()
         assertThat(items.getValue("abri-2").isDuplicate).isTrue()
         assertThat(repo.duplicatesOf(db.bookDao().get("abri-1")!!).map { it.driveId }).containsExactly("abri-2")
+    }
+
+    @Test
+    fun `Supprimer un doublon - corbeille Drive en file, livre masqué aussitôt, Annuler possible`() = runBlocking<Unit> {
+        book("abri-1", "Abri de fortune", DriveLibraryDefaults.LATER_ID, BookStatus.LATER)
+        book("abri-2", "Abri de fortune", DriveLibraryDefaults.LATER_ID, BookStatus.LATER)
+        val repo = LibraryRepository(db, settings)
+        assertThat(repo.observeLibrary().first().filter { it.isDuplicate }.map { it.id }).containsExactly("abri-1", "abri-2")
+
+        // Jamais pour le livre chargé dans le lecteur.
+        assertThat(gestures.trash("abri-2", isInUse = true)).isNull()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+
+        val result = gestures.trash("abri-2")!!
+        assertThat(result.title).isEqualTo("Abri de fortune")
+        val op = db.pendingOperationDao().all().single()
+        assertThat(op.type).isEqualTo(OperationType.TRASH_BOOK)
+        assertThat(op.bookId).isEqualTo("abri-2")
+        assertThat(db.bookDao().get("abri-2")!!.trashPending).isTrue()
+        assertThat(requests).containsExactly(SyncTrigger.STATUS_CHANGE)
+        // Disparu de la bibliothèque sans attendre Drive ; l'autre exemplaire n'est plus un doublon.
+        val items = repo.observeLibrary().first()
+        assertThat(items.map { it.id }).containsExactly("abri-1")
+        assertThat(items.single().isDuplicate).isFalse()
+        // Un geste de statut sur un livre en cours de suppression est ignoré.
+        assertThat(gestures.moveTo("abri-2", BookStatus.DONE)).isNull()
+        assertThat(db.pendingOperationDao().all().single().type).isEqualTo(OperationType.TRASH_BOOK)
+
+        assertThat(gestures.undoTrash("abri-2")).isTrue()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        assertThat(db.bookDao().get("abri-2")!!.trashPending).isFalse()
+        assertThat(repo.observeLibrary().first().map { it.id }).containsExactly("abri-1", "abri-2")
+    }
+
+    @Test
+    fun `Supprimer un doublon remplace un déplacement encore en file`() = runBlocking<Unit> {
+        book("abri-2", "Abri de fortune", DriveLibraryDefaults.LATER_ID, BookStatus.LATER)
+        gestures.apply("abri-2", Gesture.REPRENDRE)
+        assertThat(db.bookDao().get("abri-2")!!.effectiveStatus).isEqualTo(BookStatus.IN_PROGRESS)
+
+        gestures.trash("abri-2")
+
+        val ops = db.pendingOperationDao().all()
+        assertThat(ops).hasSize(1)
+        assertThat(ops.single().type).isEqualTo(OperationType.TRASH_BOOK)
+        val b = db.bookDao().get("abri-2")!!
+        assertThat(b.pendingStatus).isNull()
+        assertThat(b.trashPending).isTrue()
     }
 }

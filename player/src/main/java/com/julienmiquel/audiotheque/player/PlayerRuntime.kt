@@ -2,7 +2,10 @@ package com.julienmiquel.audiotheque.player
 
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
+import com.julienmiquel.audiotheque.core.sync.ProgressSyncRequester
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -14,17 +17,27 @@ import kotlinx.coroutines.flow.asStateFlow
 interface PlayerDependencies {
     val database: AppDatabase
     val settings: SettingsRepository
+
+    /** Progression échangée avec Drive (null : aucun compte, ou tests). */
+    val progressSync: ProgressSyncRequester? get() = null
 }
 
 interface PlayerDependenciesProvider {
     val playerDependencies: PlayerDependencies
 }
 
-/** Identifiants des éléments média : livre (« b:… ») et piste (« t:livre:piste »). */
+/**
+ * Identifiants des éléments média : racine, onglet par statut (« tab:IN_PROGRESS »), livre
+ * (« b:… ») et piste (« t:livre:piste »).
+ */
 object MediaIds {
     const val ROOT = "root"
+    private const val TAB = "tab"
     private const val BOOK = "b"
     private const val TRACK = "t"
+
+    /** Onglet de la racine (Android Auto) : les livres écoutables d'un statut. */
+    fun tab(status: BookStatus): String = "$TAB:${status.name}"
 
     /** Demande de lecture d'un livre, éventuellement à une piste et une position données. */
     fun bookRequest(bookId: String, trackId: String? = null, positionMs: Long? = null): String =
@@ -35,6 +48,12 @@ object MediaIds {
 
     data class BookRequest(val bookId: String, val trackId: String?, val positionMs: Long?)
     data class TrackRef(val bookId: String, val trackId: String)
+
+    fun parseTab(mediaId: String): BookStatus? {
+        val parts = mediaId.split(':')
+        if (parts.size != 2 || parts[0] != TAB) return null
+        return BookStatus.entries.firstOrNull { it.name == parts[1] }
+    }
 
     fun parseBookRequest(mediaId: String): BookRequest? {
         val parts = mediaId.split(':')
@@ -63,6 +82,9 @@ sealed interface PlaybackEvent {
 
     /** Fin des pistes téléchargées : la suivante arrive (la lecture reprendra seule). */
     data class WaitingForDownload(val bookId: String) : PlaybackEvent
+
+    /** Lecture reprise à la position enregistrée par un autre téléphone. */
+    data class ProgressRestored(val bookId: String, val device: String?, val percent: Float) : PlaybackEvent
 }
 
 /** État partagé entre le service de lecture et l'interface (même processus). */
@@ -104,6 +126,17 @@ object PlayerRuntime {
 data class ChapterGroup(val label: String?, val tracks: List<TrackEntity>)
 
 object Chapters {
+    /**
+     * Repère d'une piste pour les commandes système (vignette, montre, autoradio) : partie et
+     * chapitre quand le nom de fichier les donne, sinon « Piste 4 / 51 » — jamais le nom de
+     * fichier brut.
+     */
+    fun label(track: TrackEntity, total: Int): String = when {
+        track.part != null || track.chapter != null -> track.chapterLabel
+        total > 0 -> "Piste ${track.sortIndex + 1} / $total"
+        else -> track.chapterLabel
+    }
+
     fun group(tracks: List<TrackEntity>): List<ChapterGroup> {
         if (tracks.none { it.part != null }) return listOf(ChapterGroup(null, tracks))
         val groups = mutableListOf<ChapterGroup>()

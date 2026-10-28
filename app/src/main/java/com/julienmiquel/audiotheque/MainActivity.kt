@@ -45,6 +45,8 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         container.player.connect()
+        // Positions enregistrées sur l'autre téléphone relues, les nôtres envoyées.
+        container.onForeground()
     }
 
     override fun onStop() {

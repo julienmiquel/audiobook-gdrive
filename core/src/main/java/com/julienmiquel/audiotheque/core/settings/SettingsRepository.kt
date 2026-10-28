@@ -13,6 +13,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import com.julienmiquel.audiotheque.core.model.Accounts
+import com.julienmiquel.audiotheque.core.model.AudioPreset
 import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
@@ -41,14 +42,16 @@ data class AppSettings(
     val theme: ThemeMode = ThemeMode.DARK,
     /** Aperçu des _Nouveaux : télécharger la première piste. */
     val previewNew: Boolean = false,
-    /** _archives est masqué par défaut. */
-    val showArchives: Boolean = false,
+    /** Onglet Archives (_archives) affiché ; masquable dans Réglages. */
+    val showArchives: Boolean = true,
     val showHidden: Boolean = false,
     /** Enregistrer dans [Stockage interne]/Audiobooks (si l'accès à tous les fichiers est accordé). */
     val useSharedStorage: Boolean = true,
     /** Enrichissement Google Books automatique après confirmation du titre et de l'auteur. */
     val googleBooksEnrichment: Boolean = true,
     val lastPlayedBookId: String? = null,
+    /** Préréglage audio du lecteur (normalisation, voix, niveau très bas, binaural), pour tous les livres. */
+    val audioPreset: AudioPreset = AudioPreset.NONE,
 ) {
     /** Clé de compte de la progression (propre à chaque utilisateur). */
     val accountKey: String
@@ -114,11 +117,12 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val skipSeconds = intPreferencesKey("skip_seconds")
         val theme = stringPreferencesKey("theme")
         val previewNew = booleanPreferencesKey("preview_new")
-        val showArchives = booleanPreferencesKey("show_archives")
+        val showArchives = booleanPreferencesKey("show_archives_tab")
         val showHidden = booleanPreferencesKey("show_hidden")
         val useSharedStorage = booleanPreferencesKey("use_shared_storage")
         val googleBooks = booleanPreferencesKey("google_books")
         val lastPlayedBookId = stringPreferencesKey("last_played_book")
+        val audioPreset = stringPreferencesKey("audio_preset")
 
         val pageToken = stringPreferencesKey("sync_page_token")
         val pageTokenAccount = stringPreferencesKey("sync_page_token_account")
@@ -149,6 +153,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             useSharedStorage = this[K.useSharedStorage] ?: d.useSharedStorage,
             googleBooksEnrichment = this[K.googleBooks] ?: d.googleBooksEnrichment,
             lastPlayedBookId = this[K.lastPlayedBookId],
+            audioPreset = AudioPreset.fromName(this[K.audioPreset]),
         )
     }
 
@@ -170,6 +175,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p[K.useSharedStorage] = useSharedStorage
         p[K.googleBooks] = googleBooksEnrichment
         p.putOrRemove(K.lastPlayedBookId, lastPlayedBookId)
+        p[K.audioPreset] = audioPreset.name
     }
 
     private fun Preferences.toSyncState() = SyncState(

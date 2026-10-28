@@ -124,10 +124,41 @@ class RestDriveServiceTest {
     }
 
     @Test
-    fun `progression - fichiers JSON dans appDataFolder`() = runBlocking<Unit> {
-        server.enqueue(MockResponse().setBody("""{"files":[{"id":"p1","name":"progress-civ.json","mimeType":"application/json","parents":["appDataFolder"]}]}"""))
-        val files = drive.listAppData()
-        assertThat(files.single().name).isEqualTo("progress-civ.json")
-        assertThat(server.takeRequest().requestUrl!!.queryParameter("spaces")).isEqualTo("appDataFolder")
+    fun `progression - fichier JSON cherché par nom dans le dossier du livre`() = runBlocking<Unit> {
+        server.enqueue(MockResponse().setBody("""{"files":[{"id":"p1","name":".audiotheque-progress-julien@example.com.json","mimeType":"application/json","parents":["civ"],"modifiedTime":"2026-10-25T08:00:00Z"}]}"""))
+        val files = drive.findChildren("civ", ".audiotheque-progress-julien@example.com.json")
+        assertThat(files.single().parents).containsExactly("civ")
+        assertThat(server.takeRequest().requestUrl!!.queryParameter("q"))
+            .isEqualTo("'civ' in parents and name = '.audiotheque-progress-julien@example.com.json' and trashed = false")
+    }
+
+    @Test
+    fun `progression - tous les dossiers en une requête par nom`() = runBlocking<Unit> {
+        server.enqueue(MockResponse().setBody("""{"files":[{"id":"p1","name":"x.json","parents":["a"]},{"id":"p2","name":"x.json","parents":["b"]}]}"""))
+        val files = drive.findByName("x.json")
+        assertThat(files.map { it.parents.single() }).containsExactly("a", "b")
+        assertThat(server.takeRequest().requestUrl!!.queryParameter("q")).isEqualTo("name = 'x.json' and trashed = false")
+    }
+
+    @Test
+    fun `dépôt dans le dossier du livre - files create multipart avec parents et type MIME`() = runBlocking<Unit> {
+        server.enqueue(MockResponse().setBody("""{"id":"new","name":"cover.jpg","mimeType":"image/jpeg","parents":["civ"]}"""))
+        val created = drive.createFile("cover.jpg", "civ", byteArrayOf(1, 2, 3), "image/jpeg")
+        assertThat(created.id).isEqualTo("new")
+        val request = server.takeRequest()
+        assertThat(request.method).isEqualTo("POST")
+        assertThat(request.requestUrl!!.encodedPath).isEqualTo("/upload/drive/v3/files")
+        assertThat(request.requestUrl!!.queryParameter("uploadType")).isEqualTo("multipart")
+        val body = request.body.readUtf8()
+        assertThat(body).contains("\"parents\":[\"civ\"]")
+        assertThat(body).contains("\"mimeType\":\"image/jpeg\"")
+        assertThat(body).contains("Content-Type: image/jpeg")
+
+        server.enqueue(MockResponse().setBody("""{"id":"new","name":"cover.jpg","mimeType":"image/jpeg","parents":["civ"]}"""))
+        drive.updateContent("new", byteArrayOf(4), "application/json")
+        val update = server.takeRequest()
+        assertThat(update.method).isEqualTo("PATCH")
+        assertThat(update.requestUrl!!.encodedPath).isEqualTo("/upload/drive/v3/files/new")
+        assertThat(update.requestUrl!!.queryParameter("uploadType")).isEqualTo("media")
     }
 }

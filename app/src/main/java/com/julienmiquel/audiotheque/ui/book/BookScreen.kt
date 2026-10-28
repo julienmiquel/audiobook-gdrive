@@ -2,6 +2,9 @@
 
 package com.julienmiquel.audiotheque.ui.book
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,16 +29,19 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteForever
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Downloading
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
+import androidx.compose.material.icons.filled.ImageSearch
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Visibility
@@ -66,6 +72,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -172,6 +179,8 @@ class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel
             }
         }
         viewModelScope.launch { localRoot.value = runCatching { c.storage.displayRoot() }.getOrNull() }
+        // Pochette encore absente (Google Books injoignable la dernière fois ?) : nouvel essai.
+        c.enrichIfNeeded(bookId)
     }
 
     fun gesture(gesture: Gesture) = c.applyGesture(bookId, gesture)
@@ -203,6 +212,18 @@ class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel
 
     fun enrich() = c.enrich(bookId, manual = true)
 
+    /** Supprime un exemplaire en double (cet exemplaire ou un autre) : corbeille Drive via la file d'opérations. */
+    fun trash(id: String = bookId) = c.trashBook(id)
+
+    /** Pochette choisie dans les photos du téléphone. */
+    fun setCoverFromPhotos(uri: android.net.Uri) = c.setCoverFromPhotos(bookId, uri)
+
+    /** Recherche Google Images ouverte dans le navigateur : titre, auteur, « livre audio couverture ». */
+    fun imageSearchUrl(item: LibraryItem): String {
+        val query = listOfNotNull(item.title, item.author, "livre audio couverture").joinToString(" ")
+        return "https://www.google.com/search?tbm=isch&q=" + java.net.URLEncoder.encode(query, "UTF-8")
+    }
+
     fun deleteBookmark(id: Long) {
         viewModelScope.launch { c.library.deleteBookmark(id) }
     }
@@ -216,7 +237,14 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
     var menu by remember { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
+
+    /** Exemplaire dont la suppression est à confirmer (cet exemplaire ou un autre). */
+    var trashing by remember { mutableStateOf<BookEntity?>(null) }
     val item = state.item
+    val uriHandler = LocalUriHandler.current
+    val pickCover = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null) vm.setCoverFromPhotos(uri)
+    }
 
     Scaffold(
         modifier = Modifier.padding(contentPadding),
@@ -249,11 +277,27 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                                     },
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Pochette et résumé (Google Books)") },
+                                    text = { Text("Pochette et résumé en ligne") },
                                     leadingIcon = { Icon(Icons.Filled.Image, null) },
                                     onClick = {
                                         menu = false
                                         vm.enrich()
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Chercher la pochette sur Google Images") },
+                                    leadingIcon = { Icon(Icons.Filled.ImageSearch, null) },
+                                    onClick = {
+                                        menu = false
+                                        uriHandler.openUri(vm.imageSearchUrl(item))
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Choisir une image dans mes photos…") },
+                                    leadingIcon = { Icon(Icons.Filled.AddPhotoAlternate, null) },
+                                    onClick = {
+                                        menu = false
+                                        pickCover.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                                     },
                                 )
                                 if (item.book.hidden) {
@@ -272,6 +316,16 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                                         onClick = {
                                             menu = false
                                             vm.setHidden(true)
+                                        },
+                                    )
+                                }
+                                if (state.duplicates.isNotEmpty()) {
+                                    DropdownMenuItem(
+                                        text = { Text("Supprimer ce doublon (corbeille Drive)…") },
+                                        leadingIcon = { Icon(Icons.Filled.DeleteForever, null) },
+                                        onClick = {
+                                            menu = false
+                                            trashing = item.book
                                         },
                                     )
                                 }
@@ -301,6 +355,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                 onConfirm = vm::confirmTitle,
                 onOpenBook = onOpenBook,
                 onDeleteBookmark = vm::deleteBookmark,
+                onTrash = { trashing = it },
             )
         }
     }
@@ -326,6 +381,30 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
             },
         )
     }
+    trashing?.let { target ->
+        val pair = state.pairs.firstOrNull { it.driveFolderId == target.effectiveParentId }
+        val isThis = target.driveId == bookId
+        AlertDialog(
+            onDismissRequest = { trashing = null },
+            icon = { Icon(Icons.Filled.DeleteForever, contentDescription = null) },
+            title = { Text("Supprimer ce doublon ?") },
+            text = {
+                Text(
+                    "Le dossier « ${target.name} » (${pair?.name ?: Labels.status(target.effectiveStatus)}) sera mis à la corbeille Drive " +
+                        "— restaurable pendant 30 jours depuis Drive — et ses pistes seront effacées du téléphone. " +
+                        (if (isThis) "L'autre exemplaire reste dans la bibliothèque." else "Cet exemplaire-ci reste dans la bibliothèque."),
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.trash(target.driveId)
+                    trashing = null
+                    if (isThis) onBack()
+                }) { Text("Mettre à la corbeille") }
+            },
+            dismissButton = { TextButton(onClick = { trashing = null }) { Text("Annuler") } },
+        )
+    }
 }
 
 @Composable
@@ -340,6 +419,7 @@ private fun BookContent(
     onConfirm: () -> Unit,
     onOpenBook: (String) -> Unit,
     onDeleteBookmark: (Long) -> Unit,
+    onTrash: (BookEntity) -> Unit,
 ) {
     val book = item.book
     val progress = state.progress
@@ -381,17 +461,46 @@ private fun BookContent(
         if (state.duplicates.isNotEmpty()) {
             item(key = "duplicates") {
                 InfoCard(title = "Doublon : ${state.duplicates.size + 1} exemplaires", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    Text(
+                        "Même titre dans plusieurs dossiers Drive. Supprimer un exemplaire le met à la corbeille Drive (restaurable 30 jours).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    fun details(b: BookEntity): String = listOfNotNull(
+                        b.trackCount.takeIf { it > 0 }?.let { "$it pistes" },
+                        b.sizeBytes.takeIf { it > 0 }?.let { Formats.size(it) },
+                        b.durationMs?.let { Formats.duration(it, approximate = !b.durationExact) },
+                    ).joinToString(" · ")
                     state.duplicates.forEach { other ->
                         val pair = state.pairs.firstOrNull { it.driveFolderId == other.effectiveParentId }
-                        Text(
-                            "${other.name} — ${pair?.name ?: Labels.status(other.effectiveStatus)}",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable(onClickLabel = "Ouvrir cet exemplaire") { onOpenBook(other.driveId) }
-                                .padding(vertical = 6.dp),
-                        )
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable(onClickLabel = "Ouvrir cet exemplaire") { onOpenBook(other.driveId) }
+                                    .padding(vertical = 6.dp),
+                            ) {
+                                Text(
+                                    "${other.name} — ${pair?.name ?: Labels.status(other.effectiveStatus)}",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                                details(other).takeIf { it.isNotEmpty() }?.let {
+                                    Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                            IconButton(onClick = { onTrash(other) }) {
+                                Icon(Icons.Filled.DeleteForever, contentDescription = "Supprimer cet exemplaire (corbeille Drive)", tint = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                    }
+                    details(book).takeIf { it.isNotEmpty() }?.let {
+                        Text("Celui-ci : $it", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    OutlinedButton(onClick = { onTrash(book) }) {
+                        Icon(Icons.Filled.DeleteForever, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Supprimer celui-ci")
                     }
                 }
             }

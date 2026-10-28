@@ -148,6 +148,9 @@ class LibraryScanner(
                 }
                 continue
             }
+            // Fichier de progression écrit par l'app (ce téléphone ou un autre) : relu par la
+            // synchro de progression, pas un changement de la bibliothèque.
+            if (ProgressJson.isProgressFile(file.name)) continue
             val pair = file.parents.firstNotNullOfOrNull { pairByFolder[it] }
             if (isStatusFolder(file, pair, pairs)) continue
             if (pair != null) {
@@ -548,7 +551,8 @@ class MetadataProber(
         val ext = image.name.substringAfterLast('.', "jpg").lowercase()
         val file = File(storage.coversDir(), "${book.driveId}.$ext")
         file.writeBytes(bytes)
-        books.setCoverPath(book.driveId, file.path)
+        // Le dossier Drive a déjà une image : rien à y déposer.
+        books.setCover(book.driveId, file.path, uploadPending = false)
     }
 
     /** Lit les premiers Ko de la première piste pour connaître le débit, puis estime la durée. */

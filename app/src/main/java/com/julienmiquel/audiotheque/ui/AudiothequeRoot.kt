@@ -88,6 +88,7 @@ import com.julienmiquel.audiotheque.ui.settings.SettingsScreen
 import com.julienmiquel.audiotheque.ui.sync.SyncScreen
 import com.julienmiquel.audiotheque.ui.theme.AudiothequeTheme
 import com.julienmiquel.audiotheque.ui.theme.isDarkTheme
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -169,6 +170,18 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     LaunchedEffect(Unit) {
         container.messages.collect { snackbar.showSnackbar(it, withDismissAction = true, duration = SnackbarDuration.Short) }
     }
+    // Bandeau « Annuler » : 10 s après la suppression d'un doublon (corbeille Drive).
+    LaunchedEffect(Unit) {
+        container.trashes.collectLatest { trash ->
+            val result = snackbar.showSnackbar(
+                message = "« ${trash.title} » → corbeille Drive",
+                actionLabel = "Annuler",
+                withDismissAction = true,
+                duration = SnackbarDuration.Long,
+            )
+            if (result == SnackbarResult.ActionPerformed) container.undoTrash(trash)
+        }
+    }
     LaunchedEffect(Unit) {
         PlayerRuntime.events.collect { event ->
             when (event) {
@@ -180,6 +193,11 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
                 }
                 is PlaybackEvent.WaitingForDownload ->
                     snackbar.showSnackbar("Piste suivante pas encore téléchargée : la lecture reprendra à son arrivée.", duration = SnackbarDuration.Short)
+                is PlaybackEvent.ProgressRestored ->
+                    snackbar.showSnackbar(
+                        "Position reprise depuis ${event.device ?: "un autre appareil"} (${event.percent.roundToInt()} %)",
+                        duration = SnackbarDuration.Short,
+                    )
             }
         }
     }

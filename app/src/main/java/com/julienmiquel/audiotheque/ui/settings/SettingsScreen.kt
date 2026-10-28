@@ -60,6 +60,7 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.BuildConfig
+import com.julienmiquel.audiotheque.core.model.AudioPreset
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.settings.ThemeMode
@@ -162,7 +163,7 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                     }
                 }
                 Text(
-                    "Autorisations : Drive (déplacer les dossiers de livres) et espace caché de l'app (progression, un fichier par livre, propre à votre compte).",
+                    "Autorisation : Drive (déplacer les dossiers de livres ; progression et pochette écrites dans le dossier de chaque livre, un fichier de progression par compte).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -200,6 +201,17 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                         ) { Text(Labels.skip(sec)) }
                     }
                 }
+                Text("Son", style = MaterialTheme.typography.bodyLarge)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    AudioPreset.entries.forEach { preset ->
+                        FilterChip(selected = s.audioPreset == preset, onClick = { vm.update { it.copy(audioPreset = preset) } }, label = { Text(preset.label) })
+                    }
+                }
+                Text(
+                    s.audioPreset.description + " Appliqué à tous les livres, aussi en voiture et sur la montre ; modifiable depuis le lecteur (Son).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             InfoCard(title = "Apparence") {
@@ -218,9 +230,9 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
 
             InfoCard(title = "Bibliothèque") {
                 ToggleRow("Aperçu des Nouveaux", "Télécharger la première piste des livres de _Nouveaux", s.previewNew, vm::setPreview)
-                ToggleRow("Afficher les archives", "Onglet _archives (masqué par défaut)", s.showArchives) { v -> vm.update { it.copy(showArchives = v) } }
+                ToggleRow("Afficher les archives", "Onglet Archives (dossier _archives, lu à l'ouverture)", s.showArchives) { v -> vm.update { it.copy(showArchives = v) } }
                 ToggleRow("Afficher les dossiers masqués", "Dossiers marqués « ce n'est pas un livre »", s.showHidden) { v -> vm.update { it.copy(showHidden = v) } }
-                ToggleRow("Pochettes et résumés Google Books", "Après confirmation du titre et de l'auteur ; seuls ces deux champs sont envoyés", s.googleBooksEnrichment) { v -> vm.update { it.copy(googleBooksEnrichment = v) } }
+                ToggleRow("Pochettes et résumés en ligne", "Google Books, Apple Books, Open Library (et Google Images si configuré) ; seuls le titre et l'auteur sont envoyés. Pochette au hasard exclue tant que le titre n'est pas confirmé", s.googleBooksEnrichment) { v -> vm.update { it.copy(googleBooksEnrichment = v) } }
             }
 
             InfoCard(title = "Stockage") {

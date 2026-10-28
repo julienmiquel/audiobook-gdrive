@@ -11,6 +11,7 @@ import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults as D
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
@@ -47,7 +48,7 @@ import org.robolectric.annotation.Config
  * Tests unitaires du moteur de synchro, contre un double de test de Drive (en mémoire, peuplé
  * avec l'inventaire de la spécification) et les mp3 de `testdata/audio` : inventaire,
  * téléchargements, gestes, Drive fait foi, hors ligne, refus définitif, nettoyage, espace,
- * reprise de transfert et progression appData. L'app, elle, n'utilise que l'API Google Drive.
+ * reprise de transfert et progression dans le dossier du livre. L'app, elle, n'utilise que l'API Google Drive.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -318,25 +319,138 @@ class SyncEngineTest {
     }
 
     @Test
-    fun `progression par utilisateur dans l'espace caché de l'app`() = runBlocking<Unit> {
+    fun `progression par utilisateur dans le dossier Drive du livre`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
-        // Progression déjà dans l'espace caché, importée : livre rangé à tort dans _Ecouté, pas fini.
+        // Progression déjà écrite par l'autre téléphone dans le dossier du livre, importée : livre
+        // rangé à tort dans _Ecouté, pas fini.
         val guerriers = book(LibraryFixture.UNFINISHED_BOOK)
         val imported = db.progressDao().get(guerriers.driveId, FakeDriveService.ACCOUNT)!!
         assertThat(imported.percent).isEqualTo(46f)
         assertThat(imported.finished).isFalse()
         assertThat(imported.dirty).isFalse()
+        assertThat(events().any { it.type == SyncEventType.PROGRESS && it.bookId == guerriers.driveId && it.message!!.contains(FakeDriveService.OTHER_DEVICE) }).isTrue()
 
         val civ = book(LibraryFixture.civilisations.name)
         db.progressDao().upsert(ProgressEntity(bookId = civ.driveId, account = FakeDriveService.ACCOUNT, trackIndex = 4, positionMs = 12_000, speed = 1.3f, percent = 42f, updatedAt = now))
         engine.sync(SyncTrigger.MANUAL)
 
-        val file = fake.listAppData().single { it.name == ProgressJson.fileName(civ.driveId) }
-        val json = ProgressJson.decode(fake.readAppData(file.id))
+        // Un fichier par compte, dans le dossier du livre, lisible dans Drive.
+        val file = fake.findChildren(civ.driveId, ProgressJson.fileName(FakeDriveService.ACCOUNT)).single()
+        val json = ProgressJson.decode(fake.bytesOf(file.id))
         assertThat(json.trackIndex).isEqualTo(4)
         assertThat(json.positionMs).isEqualTo(12_000)
         assertThat(json.speed).isEqualTo(1.3f)
+        assertThat(json.device).isEqualTo("test")
+        assertThat(json.title).isEqualTo("Civilisations")
         assertThat(db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!.dirty).isFalse()
+        // Jamais de pistes relistées à cause de ce fichier : il n'est pas une piste.
+        assertThat(db.trackDao().forBook(civ.driveId).map { it.name }).doesNotContain(ProgressJson.fileName(FakeDriveService.ACCOUNT))
+    }
+
+    @Test
+    fun `deux téléphones - la position la plus récente l'emporte, dans les deux sens`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+        val tracks = db.trackDao().forBook(civ.driveId)
+
+        // Ce téléphone a écouté jusqu'à la piste 2 il y a une heure, sans réseau depuis.
+        val localAt = now - 3_600_000
+        db.progressDao().upsert(ProgressEntity(bookId = civ.driveId, account = FakeDriveService.ACCOUNT, trackId = tracks[2].driveId, trackIndex = 2, positionMs = 30_000, percent = 25f, updatedAt = localAt))
+        // L'autre téléphone a continué jusqu'à la piste 5 il y a dix minutes.
+        val remoteAt = now - 600_000
+        fake.writeProgressFromOtherDevice(
+            civ.driveId,
+            ProgressJson(bookId = civ.driveId, trackId = tracks[5].driveId, trackIndex = 5, positionMs = 5_000, percent = 55f, updatedAt = remoteAt, device = FakeDriveService.OTHER_DEVICE),
+            at = remoteAt,
+        )
+
+        engine.sync(SyncTrigger.MANUAL)
+
+        // Notre position, plus ancienne, n'a pas écrasé la sienne : elle est remplacée.
+        val merged = db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!
+        assertThat(merged.trackIndex).isEqualTo(5)
+        assertThat(merged.positionMs).isEqualTo(5_000)
+        assertThat(merged.dirty).isFalse()
+        val remote = ProgressJson.decode(fake.bytesOf(fake.findChildren(civ.driveId, ProgressJson.fileName(FakeDriveService.ACCOUNT)).single().id))
+        assertThat(remote.trackIndex).isEqualTo(5)
+        assertThat(remote.device).isEqualTo(FakeDriveService.OTHER_DEVICE)
+
+        // Puis on écoute ici, plus tard : notre position devient la plus récente et part dans Drive.
+        now += 60_000
+        db.progressDao().upsert(merged.copy(trackIndex = 6, trackId = tracks[6].driveId, positionMs = 1_000, percent = 62f, updatedAt = now, dirty = true))
+        engine.sync(SyncTrigger.MANUAL)
+        val pushed = ProgressJson.decode(fake.bytesOf(fake.findChildren(civ.driveId, ProgressJson.fileName(FakeDriveService.ACCOUNT)).single().id))
+        assertThat(pushed.trackIndex).isEqualTo(6)
+        assertThat(pushed.device).isEqualTo("test")
+        // Toujours un seul fichier par compte dans le dossier.
+        assertThat(fake.findChildren(civ.driveId, ProgressJson.fileName(FakeDriveService.ACCOUNT))).hasSize(1)
+    }
+
+    @Test
+    fun `lecteur - position relue dans Drive avant la lecture, envoyée après la pause`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+        val tracks = db.trackDao().forBook(civ.driveId)
+        db.progressDao().upsert(ProgressEntity(bookId = civ.driveId, account = FakeDriveService.ACCOUNT, trackId = tracks[1].driveId, trackIndex = 1, positionMs = 0, percent = 10f, updatedAt = now - 7_200_000, dirty = false))
+
+        // Pause sur l'autre téléphone il y a cinq minutes.
+        fake.writeProgressFromOtherDevice(
+            civ.driveId,
+            ProgressJson(bookId = civ.driveId, trackId = tracks[3].driveId, trackIndex = 3, positionMs = 42_000, percent = 38f, updatedAt = now - 300_000, device = FakeDriveService.OTHER_DEVICE),
+            at = now - 300_000,
+        )
+
+        // Bouton ▶ ici : la position de l'autre téléphone est adoptée avant de démarrer.
+        val restored = engine.pullProgress(civ.driveId)
+        assertThat(restored).isNotNull()
+        assertThat(restored!!.device).isEqualTo(FakeDriveService.OTHER_DEVICE)
+        assertThat(restored.percent).isEqualTo(38f)
+        val local = db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!
+        assertThat(local.trackIndex).isEqualTo(3)
+        assertThat(local.positionMs).isEqualTo(42_000)
+        // Relecture immédiate : rien de nouveau, et pas de seconde requête dans les 30 s.
+        assertThat(engine.pullProgress(civ.driveId)).isNull()
+
+        // Pause ici, un peu plus tard : envoi léger, sans synchro complète.
+        now += 120_000
+        db.progressDao().upsert(local.copy(trackId = tracks[3].driveId, positionMs = 90_000, percent = 40f, updatedAt = now, dirty = true))
+        assertThat(engine.pushProgress(civ.driveId)).isTrue()
+        val remote = ProgressJson.decode(fake.bytesOf(fake.findChildren(civ.driveId, ProgressJson.fileName(FakeDriveService.ACCOUNT)).single().id))
+        assertThat(remote.positionMs).isEqualTo(90_000)
+        assertThat(remote.device).isEqualTo("test")
+        assertThat(db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!.dirty).isFalse()
+
+        // Hors ligne : l'envoi échoue sans bruit, la position reste à envoyer.
+        now += 60_000
+        db.progressDao().upsert(local.copy(positionMs = 100_000, updatedAt = now, dirty = true))
+        fake.offline = true
+        assertThat(engine.pushProgress(civ.driveId)).isFalse()
+        assertThat(db.progressDao().get(civ.driveId, FakeDriveService.ACCOUNT)!!.dirty).isTrue()
+    }
+
+    @Test
+    fun `pochette téléchargée - déposée une seule fois dans le dossier Drive du livre`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        // « Solo » n'a pas d'image dans son dossier Drive ; « Police » en a une.
+        val solo = book("Solo - William Boyd")
+        val police = book("Police - Hugo Boris")
+        val jpeg = File(fixtures, "cover_police.jpg").readBytes()
+        val local = tmp.newFile("solo.jpg").apply { writeBytes(jpeg) }
+        db.bookDao().setCover(solo.driveId, local.path, uploadPending = true)
+        db.bookDao().setCover(police.driveId, db.bookDao().get(police.driveId)!!.coverPath, uploadPending = true)
+
+        assertThat(engine.uploadPendingCovers()).isEqualTo(1)
+
+        val uploaded = fake.listChildren(solo.driveId).filter { it.isImage }
+        assertThat(uploaded.map { it.name }).containsExactly("cover.jpg")
+        assertThat(fake.bytesOf(uploaded.single().id)).isEqualTo(jpeg)
+        // Le dossier de « Police » avait déjà sa pochette : rien d'ajouté, drapeau levé.
+        assertThat(fake.listChildren(police.driveId).count { it.isImage }).isEqualTo(1)
+        assertThat(db.bookDao().withCoverToUpload()).isEmpty()
+        // Second passage : rien à faire, pas de doublon.
+        assertThat(engine.uploadPendingCovers()).isEqualTo(0)
+        assertThat(fake.listChildren(solo.driveId).count { it.isImage }).isEqualTo(1)
+        assertThat(events().any { it.type == SyncEventType.LIBRARY_CHANGE && it.bookId == solo.driveId && it.message!!.contains("Pochette") }).isTrue()
     }
 
     @Test
@@ -451,12 +565,13 @@ class SyncEngineTest {
         fun json(position: Long, updatedAt: Long) = ProgressJson.encode(
             ProgressJson(bookId = police.driveId, trackIndex = 1, positionMs = position, percent = 40f, updatedAt = updatedAt, device = "autre"),
         )
-        // Créés par deux téléphones : le plus récent d'abord, l'ancien ensuite.
+        // Créés au même moment par deux téléphones dans le dossier du livre : le plus récent d'abord, l'ancien ensuite.
+        val name = ProgressJson.fileName(FakeDriveService.ACCOUNT)
         val t0 = now
         now = t0 + 60_000
-        fake.createAppData(ProgressJson.fileName(police.driveId), json(77_000, now))
+        fake.createFile(name, police.driveId, json(77_000, now), ProgressJson.MIME)
         now = t0
-        fake.createAppData(ProgressJson.fileName(police.driveId), json(11_000, now))
+        fake.createFile(name, police.driveId, json(11_000, now), ProgressJson.MIME)
         now = t0 + 120_000
 
         engine.sync(SyncTrigger.MANUAL)
@@ -512,5 +627,87 @@ class SyncEngineTest {
         engine.sync(SyncTrigger.PERIODIC)
         assertThat(db.bookDao().get(civ.driveId)).isNull()
         assertThat(root.walkTopDown().none { it.isFile && it.extension == "mp3" }).isTrue()
+    }
+
+    // ------------------------------------------------------------------ doublons
+
+    /** Ce que fait « Supprimer ce doublon » (module bibliothèque) : opération corbeille en file + livre masqué. */
+    private suspend fun queueTrash(book: BookEntity) {
+        db.pendingOperationDao().insert(
+            PendingOperationEntity(
+                type = OperationType.TRASH_BOOK,
+                bookId = book.driveId,
+                fromParentId = book.parentId,
+                toParentId = book.parentId,
+                fromStatus = book.status,
+                toStatus = book.status,
+                createdAt = now,
+            ),
+        )
+        db.bookDao().setTrashPending(book.driveId, true)
+    }
+
+    @Test
+    fun `doublon supprimé - dossier à la corbeille Drive, fichiers locaux effacés, l'autre exemplaire reste`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val copies = db.bookDao().all().filter { it.name == "Abri de fortune" }
+        assertThat(copies).hasSize(2)
+        val (kept, doomed) = copies
+        // L'exemplaire à supprimer a été commencé : il a des pistes sur le téléphone.
+        queueMove(doomed, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+        val localFiles = db.trackDao().forBook(doomed.driveId).mapNotNull { it.localPath?.let(::File) }
+        assertThat(localFiles).isNotEmpty()
+        assertThat(localFiles.all { it.exists() }).isTrue()
+
+        queueTrash(db.bookDao().get(doomed.driveId)!!)
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        // Corbeille Drive (restaurable), jamais de suppression définitive.
+        assertThat(fake.getFile(doomed.driveId).trashed).isTrue()
+        assertThat(fake.getFile(kept.driveId).trashed).isFalse()
+        assertThat(db.bookDao().get(doomed.driveId)).isNull()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        assertThat(localFiles.none { it.exists() }).isTrue()
+        val row = db.bookDao().observeLibrary(FakeDriveService.ACCOUNT).first().single { it.book.driveId == kept.driveId }
+        assertThat(row.duplicateCount).isEqualTo(1)
+        assertThat(events().any { it.type == SyncEventType.LIBRARY_CHANGE && it.bookId == doomed.driveId && it.message.orEmpty().contains("corbeille") }).isTrue()
+
+        // Ni le flux de changements ni un inventaire complet ne font revenir le dossier.
+        engine.sync(SyncTrigger.PERIODIC)
+        engine.sync(SyncTrigger.MANUAL, forceFull = true)
+        assertThat(db.bookDao().get(doomed.driveId)).isNull()
+        assertThat(db.bookDao().all().count { it.name == "Abri de fortune" }).isEqualTo(1)
+    }
+
+    @Test
+    fun `doublon - refus de Drive, le livre réapparaît dans la bibliothèque`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val doomed = db.bookDao().all().first { it.name == "Abri de fortune" }
+        fake.forbiddenMoves += doomed.driveId
+        queueTrash(doomed)
+
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        val b = db.bookDao().get(doomed.driveId)!!
+        assertThat(b.trashPending).isFalse()
+        assertThat(fake.getFile(doomed.driveId).trashed).isFalse()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        assertThat(events().any { it.type == SyncEventType.ERROR && it.bookId == doomed.driveId && it.message.orEmpty().contains("refusée") }).isTrue()
+    }
+
+    @Test
+    fun `doublon - déplacé hors de la bibliothèque entre-temps, Drive fait foi et rien n'est supprimé`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val doomed = db.bookDao().all().first { it.name == "Abri de fortune" }
+        queueTrash(doomed)
+        fake.externalMove(doomed.driveId, "dossier-hors-bibliotheque")
+
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        assertThat(fake.getFile(doomed.driveId).trashed).isFalse()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+        // Hors des dossiers suivis : il quitte la bibliothèque par l'inventaire, pas par la corbeille.
+        assertThat(events().any { it.type == SyncEventType.ERROR && it.bookId == doomed.driveId && it.message.orEmpty().contains("Drive fait foi") }).isTrue()
     }
 }

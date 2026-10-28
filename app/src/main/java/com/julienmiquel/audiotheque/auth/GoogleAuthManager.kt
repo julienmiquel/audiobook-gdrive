@@ -33,8 +33,9 @@ sealed interface DriveAuthorization {
 
 /**
  * Accès Google : Credential Manager pour la connexion (si un ID client web est configuré),
- * AuthorizationClient pour le consentement Drive. Deux autorisations : « drive », nécessaire
- * pour déplacer des dossiers que l'app n'a pas créés, et « drive.appdata » pour la progression.
+ * AuthorizationClient pour le consentement Drive. Une autorisation : « drive », nécessaire pour
+ * déplacer des dossiers que l'app n'a pas créés et écrire progression et pochette dans le dossier
+ * de chaque livre.
  */
 class GoogleAuthManager(
     private val context: Context,
@@ -127,9 +128,14 @@ class GoogleAuthManager(
 
     companion object {
         const val ACCOUNT_TYPE = "com.google"
+
+        /**
+         * « drive » suffit : déplacer des dossiers que l'app n'a pas créés, et écrire la
+         * progression et la pochette dans le dossier de chaque livre. (L'espace caché
+         * « drive.appdata » n'est plus utilisé ; demander moins qu'avant ne rouvre pas le consentement.)
+         */
         val SCOPES = listOf(
             "https://www.googleapis.com/auth/drive",
-            "https://www.googleapis.com/auth/drive.appdata",
         )
 
         /** Les jetons OAuth Google durent une heure ; on les renouvelle avant. */

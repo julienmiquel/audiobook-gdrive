@@ -8,11 +8,13 @@ import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.EventResult
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
+import com.julienmiquel.audiotheque.sync.drive.DriveFile
 import com.julienmiquel.audiotheque.sync.drive.DriveHttpException
 import com.julienmiquel.audiotheque.sync.drive.DriveNotFoundException
 import com.julienmiquel.audiotheque.sync.drive.DriveService
@@ -24,8 +26,9 @@ import kotlinx.coroutines.withContext
 
 /**
  * Rejoue la file d'opérations : chaque geste de statut est un déplacement de dossier dans Drive
- * (files.update avec addParents / removeParents). Exécutée aussitôt si le réseau est là, sinon
- * au retour du réseau, avec des nouvelles tentatives espacées.
+ * (files.update avec addParents / removeParents) ; la suppression d'un doublon est une mise à la
+ * corbeille Drive. Exécutée aussitôt si le réseau est là, sinon au retour du réseau, avec des
+ * nouvelles tentatives espacées.
  *
  * Un déplacement en échec ne modifie pas l'état local confirmé : en cas de refus définitif
  * (droits, dossier supprimé), le geste est abandonné et le livre reste dans son statut Drive.
@@ -34,6 +37,7 @@ class OperationExecutor(
     private val db: AppDatabase,
     private val history: HistoryLogger,
     private val clock: Clock,
+    private val localFiles: LocalFiles,
 ) {
     private val ops = db.pendingOperationDao()
     private val books = db.bookDao()
@@ -50,6 +54,10 @@ class OperationExecutor(
             }
             try {
                 val file = drive.getFile(op.bookId)
+                if (op.type == OperationType.TRASH_BOOK) {
+                    executeTrash(drive, op, book, file, pairs, pairFolders, ctx)
+                    continue
+                }
                 if (file.trashed) throw DriveNotFoundException("Le dossier est dans la corbeille")
                 val parents = file.parents
                 val otherStatusParents = parents.filter { it != op.toParentId && (it in pairFolders || it == op.fromParentId) }
@@ -67,12 +75,19 @@ class OperationExecutor(
                 throw e
             } catch (e: DriveAuthException) {
                 throw e
+            } catch (e: DriveNotFoundException) {
+                if (op.type == OperationType.TRASH_BOOK) {
+                    // Déjà disparu de Drive : la suppression est faite, le livre quitte la bibliothèque.
+                    onTrashed(op, book, pairs, ctx, alreadyGone = true)
+                } else {
+                    onPermanentFailure(op, book, pairs, e, ctx)
+                }
             } catch (e: DriveHttpException) {
                 if (e.isTransient) {
                     reschedule(op, book, e, ctx)
                     return false
                 }
-                onPermanentFailure(op, book, pairs, e, ctx)
+                if (op.type == OperationType.TRASH_BOOK) onTrashRefused(op, book, e, ctx) else onPermanentFailure(op, book, pairs, e, ctx)
             } catch (e: IOException) {
                 // Réseau indisponible : inutile d'essayer les opérations suivantes maintenant.
                 reschedule(op, book, e, ctx)
@@ -80,6 +95,82 @@ class OperationExecutor(
             }
         }
         return ops.all().isEmpty()
+    }
+
+    // ------------------------------------------------------------------ corbeille (doublons)
+
+    private suspend fun executeTrash(
+        drive: DriveService,
+        op: PendingOperationEntity,
+        book: BookEntity,
+        file: DriveFile,
+        pairs: List<SyncPairEntity>,
+        pairFolders: Set<String>,
+        ctx: RunContext?,
+    ) {
+        when {
+            file.trashed -> onTrashed(op, book, pairs, ctx, alreadyGone = true)
+            // Drive fait foi : déplacé hors de la bibliothèque entre-temps (autre membre de la
+            // famille) : on ne supprime pas un dossier qui n'est plus le nôtre.
+            file.parents.none { it in pairFolders } -> {
+                db.withTransaction {
+                    ops.delete(op.id)
+                    books.setTrashPending(op.bookId, false)
+                }
+                history.log(
+                    type = SyncEventType.ERROR,
+                    path = book.name,
+                    book = book,
+                    result = EventResult.ERROR,
+                    message = "Déplacé hors de la bibliothèque entre-temps : suppression abandonnée, Drive fait foi.",
+                    runId = ctx?.runId,
+                )
+                ctx?.errors?.incrementAndGet()
+            }
+            else -> {
+                drive.trash(op.bookId)
+                onTrashed(op, book, pairs, ctx, alreadyGone = false)
+            }
+        }
+    }
+
+    /** Dossier à la corbeille Drive : fichiers locaux supprimés, livre retiré de la base (la progression reste). */
+    private suspend fun onTrashed(op: PendingOperationEntity, book: BookEntity, pairs: List<SyncPairEntity>, ctx: RunContext?, alreadyGone: Boolean) {
+        val freed = localFiles.deleteBookFiles(book)
+        db.withTransaction {
+            ops.deleteForBook(op.bookId)
+            books.delete(op.bookId)
+        }
+        if (freed > 0) {
+            ctx?.filesDeleted?.incrementAndGet()
+            ctx?.bytesDeleted?.addAndGet(freed)
+        }
+        history.log(
+            type = SyncEventType.LIBRARY_CHANGE,
+            path = "${pathOf(book.parentId, pairs)}/${book.name}",
+            book = book,
+            sizeBytes = freed.takeIf { it > 0 },
+            message = if (alreadyGone) "Doublon déjà retiré de Drive : retiré de la bibliothèque" else "Doublon mis à la corbeille Drive (restaurable 30 jours depuis Drive)",
+            runId = ctx?.runId,
+        )
+        ctx?.moves?.incrementAndGet()
+    }
+
+    /** Refus définitif de Drive : le livre réapparaît dans la bibliothèque. */
+    private suspend fun onTrashRefused(op: PendingOperationEntity, book: BookEntity, e: DriveHttpException, ctx: RunContext?) {
+        db.withTransaction {
+            ops.delete(op.id)
+            books.setTrashPending(op.bookId, false)
+        }
+        history.log(
+            type = SyncEventType.ERROR,
+            path = book.name,
+            book = book,
+            result = EventResult.ERROR,
+            message = "Suppression refusée par Drive (${e.code}) : le livre reste dans la bibliothèque.",
+            runId = ctx?.runId,
+        )
+        ctx?.errors?.incrementAndGet()
     }
 
     /** [movedFrom] : dossier quitté dans Drive, ou null si Drive avait déjà la valeur attendue. */
@@ -219,6 +310,16 @@ class LocalFiles(private val db: AppDatabase, private val storage: LocalStorage)
         }
         if (updateDb) db.trackDao().setLocalState(track.driveId, TrackState.ABSENT, null, 0)
         freed
+    }
+
+    /** Toutes les pistes d'un livre et sa pochette locale ; retourne les octets libérés (pistes). */
+    suspend fun deleteBookFiles(book: BookEntity): Long {
+        var freed = 0L
+        db.trackDao().forBook(book.driveId).forEach { freed += deleteTrackFiles(it, updateDb = false) }
+        book.coverPath?.let { path ->
+            if (path.startsWith(storage.coversDir().path)) withContext(Dispatchers.IO) { File(path).delete() }
+        }
+        return freed
     }
 
     /** Remonte en supprimant les dossiers vides, sans jamais toucher à la racine Audiobooks. */

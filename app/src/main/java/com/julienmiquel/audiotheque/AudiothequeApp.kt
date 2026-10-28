@@ -13,17 +13,27 @@ import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
+import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.settings.SyncState
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
+import com.julienmiquel.audiotheque.core.sync.ProgressSyncRequester
+import com.julienmiquel.audiotheque.core.sync.RemoteProgress
+import com.julienmiquel.audiotheque.covers.CoverImporter
+import com.julienmiquel.audiotheque.library.AppleBooksClient
 import com.julienmiquel.audiotheque.library.BookEditor
+import com.julienmiquel.audiotheque.library.CoverSource
+import com.julienmiquel.audiotheque.library.EnrichOutcome
 import com.julienmiquel.audiotheque.library.Enricher
 import com.julienmiquel.audiotheque.library.Gesture
 import com.julienmiquel.audiotheque.library.GoogleBooksClient
+import com.julienmiquel.audiotheque.library.GoogleImageSearchClient
 import com.julienmiquel.audiotheque.library.LibraryRepository
 import com.julienmiquel.audiotheque.library.MoveResult
+import com.julienmiquel.audiotheque.library.OpenLibraryClient
 import com.julienmiquel.audiotheque.library.StatusGestures
+import com.julienmiquel.audiotheque.library.TrashResult
 import com.julienmiquel.audiotheque.player.PlayerConnection
 import com.julienmiquel.audiotheque.player.PlayerDependencies
 import com.julienmiquel.audiotheque.player.PlayerDependenciesProvider
@@ -40,6 +50,7 @@ import com.julienmiquel.audiotheque.sync.work.SyncNotifications
 import com.julienmiquel.audiotheque.sync.work.SyncScheduler
 import java.io.File
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -52,6 +63,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -98,18 +111,55 @@ class AppContainer(private val app: Application) {
     val library = LibraryRepository(database, settings)
     val gestures = StatusGestures(database, settings, scheduler, clock)
     val editor = BookEditor(database)
-    val enricher = Enricher(database, GoogleBooksClient(http), clock)
+
+    /**
+     * Sources de pochettes, dans l'ordre : Google Books (résumé compris), Apple Books (vraies
+     * pochettes de livres audio), Open Library, puis Google Images si une clé est configurée.
+     */
+    private val coverSources: List<CoverSource> = listOfNotNull(
+        GoogleBooksClient(http),
+        AppleBooksClient(http),
+        OpenLibraryClient(http),
+        BuildConfig.CUSTOM_SEARCH_KEY.takeIf { it.isNotBlank() && BuildConfig.CUSTOM_SEARCH_CX.isNotBlank() }
+            ?.let { GoogleImageSearchClient(http, it, BuildConfig.CUSTOM_SEARCH_CX) },
+    )
+
+    /** Recherche d'images Google disponible (clé configurée dans local.properties). */
+    val imageSearchConfigured: Boolean = coverSources.any { it is GoogleImageSearchClient }
+
+    val enricher = Enricher(database, coverSources, http, storage.coversDir(), clock)
+    private val coverImporter = CoverImporter(app)
     val player = PlayerConnection(app)
+
+    /**
+     * Progression échangée avec Drive hors synchro complète : envoi après une pause (sans
+     * attendre), relecture avant une lecture (délai borné par le lecteur). Seul le moteur parle à
+     * Drive ; ce pont ne fait que lui transmettre les demandes du lecteur.
+     */
+    val progressBridge: ProgressSyncRequester = object : ProgressSyncRequester {
+        override suspend fun pullProgress(bookId: String, timeoutMs: Long): RemoteProgress? =
+            withTimeoutOrNull(timeoutMs) { engine.pullProgress(bookId) }
+
+        override fun pushProgress(bookId: String?) {
+            appScope.launch { withTimeoutOrNull(PUSH_TIMEOUT_MS) { engine.pushProgress(bookId) } }
+        }
+    }
 
     val playerDependencies = object : PlayerDependencies {
         override val database: AppDatabase get() = this@AppContainer.database
         override val settings: SettingsRepository get() = this@AppContainer.settings
+        override val progressSync: ProgressSyncRequester get() = progressBridge
     }
 
     private val _moves = MutableSharedFlow<MoveResult>(extraBufferCapacity = 4)
 
     /** Gestes de statut récents, pour le bandeau « Annuler » (10 s). */
     val moves: SharedFlow<MoveResult> = _moves.asSharedFlow()
+
+    private val _trashes = MutableSharedFlow<TrashResult>(extraBufferCapacity = 4)
+
+    /** Doublons envoyés à la corbeille Drive, pour le bandeau « Annuler » (10 s). */
+    val trashes: SharedFlow<TrashResult> = _trashes.asSharedFlow()
 
     private val _messages = MutableSharedFlow<String>(extraBufferCapacity = 8)
 
@@ -121,10 +171,19 @@ class AppContainer(private val app: Application) {
     /** Livre de l'onglet Lecteur : le dernier demandé, ou celui que lit le service. */
     val selectedBookId: StateFlow<String?> = _selectedBookId.asStateFlow()
 
+    /** Dernier passage au premier plan traité (progression relue au plus une fois par minute). */
+    @Volatile
+    private var lastForegroundSyncAt = 0L
+
     init {
         // Lecture lancée ailleurs (notification, casque, Android Auto) : l'onglet Lecteur suit.
         appScope.launch {
             player.state.map { it.bookId }.distinctUntilChanged().collect { id -> if (id != null) _selectedBookId.value = id }
+        }
+        // Fin de chaque synchro : pochettes manquantes reprises (Google Books joignable à nouveau ?)
+        // et pochettes téléchargées déposées dans Drive.
+        appScope.launch {
+            engine.status.map { it.running }.distinctUntilChanged().drop(1).filter { !it }.collect { enrichMissingCovers() }
         }
     }
 
@@ -141,6 +200,43 @@ class AppContainer(private val app: Application) {
         appScope.launch {
             val result = gestures.apply(bookId, gesture)
             if (result == null) message("Dossier de statut introuvable : vérifiez les dossiers synchronisés") else announceMove(result)
+        }
+    }
+
+    /**
+     * Supprime un doublon : son dossier part à la corbeille Drive (restaurable 30 jours) via la
+     * file d'opérations ; il disparaît aussitôt de la bibliothèque, bandeau « Annuler » 10 s.
+     */
+    fun trashBook(bookId: String) {
+        appScope.launch {
+            val result = gestures.trash(bookId, isInUse = BookInUse.isInUse(bookId))
+            if (result == null) message("Impossible : ce livre est chargé dans le lecteur. Chargez-en un autre d'abord.") else _trashes.tryEmit(result)
+        }
+    }
+
+    fun undoTrash(result: TrashResult) {
+        appScope.launch {
+            if (!gestures.undoTrash(result.bookId)) {
+                message("« ${result.title} » est déjà dans la corbeille Drive : restaurable depuis Drive pendant 30 jours.")
+            }
+        }
+    }
+
+    /**
+     * Pochette choisie dans les photos du téléphone (sélecteur système, Google Photos) :
+     * enregistrée sur le téléphone puis déposée dans le dossier Drive du livre.
+     */
+    fun setCoverFromPhotos(bookId: String, uri: android.net.Uri) {
+        appScope.launch {
+            val target = File(storage.coversDir(), "$bookId.jpg")
+            val written = coverImporter.import(uri, target)
+            if (written == null) {
+                message("Image illisible")
+                return@launch
+            }
+            database.bookDao().setCover(bookId, written.path, uploadPending = true)
+            message("Pochette mise à jour : elle sera déposée dans le dossier Drive du livre")
+            engine.uploadPendingCovers()
         }
     }
 
@@ -174,19 +270,74 @@ class AppContainer(private val app: Application) {
         }
     }
 
-    /** Pochette et résumé Google Books, à partir du titre et de l'auteur confirmés. */
+    /**
+     * Pochette et résumé en ligne (Google Books, Apple Books, Open Library, Google Images si
+     * configuré), à partir du titre et de l'auteur affichés — correspondance stricte tant que le
+     * titre n'est pas confirmé. La pochette est téléchargée sur le téléphone puis déposée dans le
+     * dossier Drive du livre, pour les autres téléphones.
+     */
     fun enrich(bookId: String, manual: Boolean) {
         appScope.launch {
-            val found = runCatching { enricher.enrich(bookId) }
+            val outcome = try {
+                enricher.enrich(bookId)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                EnrichOutcome.UNREACHABLE
+            }
+            if (outcome == EnrichOutcome.FOUND) engine.uploadPendingCovers()
             if (manual) {
                 message(
-                    when {
-                        found.isFailure -> "Google Books est injoignable"
-                        found.getOrDefault(false) -> "Pochette et résumé mis à jour"
-                        else -> "Aucun résultat dans Google Books"
+                    when (outcome) {
+                        EnrichOutcome.UNREACHABLE -> "Services de pochettes injoignables pour le moment : nouvel essai automatique plus tard"
+                        EnrichOutcome.FOUND -> "Pochette et résumé mis à jour"
+                        EnrichOutcome.NOT_FOUND -> "Aucune pochette dans Google Books, Apple Books ni Open Library : essayez « Chercher sur Google Images » ou « Choisir une image »"
                     },
                 )
             }
+        }
+    }
+
+    /** Fiche ouverte : pochette cherchée si elle manque encore (au plus une fois par demi-heure). */
+    fun enrichIfNeeded(bookId: String) {
+        appScope.launch {
+            if (!settings.current().googleBooksEnrichment) return@launch
+            val book = library.book(bookId) ?: return@launch
+            if (enricher.wants(book)) enrich(bookId, manual = false)
+        }
+    }
+
+    /** Livres confirmés sans pochette : repris par petits lots, puis pochettes déposées dans Drive. */
+    private suspend fun enrichMissingCovers() {
+        val s = settings.current()
+        if (!s.isConnected || !s.googleBooksEnrichment) return
+        val found = try {
+            enricher.enrichPending()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            0
+        }
+        if (found > 0) engine.uploadPendingCovers()
+    }
+
+    /**
+     * App au premier plan : les positions à envoyer partent, celles changées dans Drive sont
+     * relues (une requête), au plus une fois par minute ; une position reprise d'un autre
+     * téléphone est annoncée. Puis reprise des pochettes manquantes.
+     */
+    fun onForeground() {
+        val now = System.currentTimeMillis()
+        if (now - lastForegroundSyncAt < FOREGROUND_SYNC_MIN_INTERVAL_MS) return
+        lastForegroundSyncAt = now
+        appScope.launch {
+            if (!settings.current().isConnected) return@launch
+            val adopted = engine.syncProgress()
+            adopted.firstOrNull()?.let { r ->
+                val title = library.book(r.bookId)?.displayTitle ?: return@let
+                message("« $title » : position reprise depuis ${r.device ?: "un autre appareil"} (${r.percent.roundToInt()} %)")
+            }
+            enrichMissingCovers()
         }
     }
 
@@ -261,7 +412,7 @@ class AppContainer(private val app: Application) {
 
     /**
      * Déconnexion : plus aucune tâche de fond, fin de la synchro en cours, progression écrite une
-     * dernière fois dans l'espace caché du compte, puis bibliothèque locale et pistes effacées du
+     * dernière fois dans les dossiers Drive des livres, puis bibliothèque locale et pistes effacées du
      * téléphone. La progression (propre à chaque compte) et les signets restent.
      */
     suspend fun signOut() = accountLock.withLock {
@@ -303,6 +454,12 @@ class AppContainer(private val app: Application) {
     companion object {
         /** Attente maximale de la fin de la synchro et de l'écriture de la progression. */
         private const val SIGN_OUT_WAIT_MS = 20_000L
+
+        /** Envoi de la position après une pause : abandonné au-delà (il sera refait à la prochaine occasion). */
+        private const val PUSH_TIMEOUT_MS = 30_000L
+
+        /** Progression relue au retour au premier plan, au plus une fois par minute. */
+        private const val FOREGROUND_SYNC_MIN_INTERVAL_MS = 60_000L
     }
 }
 
@@ -310,7 +467,7 @@ class AppContainer(private val app: Application) {
 sealed interface AuthRenewal {
     data object Done : AuthRenewal
 
-    /** Écran de consentement Google à ouvrir (choix du compte, autorisations drive et drive.appdata). */
+    /** Écran de consentement Google à ouvrir (choix du compte, autorisation drive). */
     data class NeedsConsent(val pendingIntent: PendingIntent) : AuthRenewal
 
     data class Failed(val message: String) : AuthRenewal

@@ -15,13 +15,18 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSourceBitmapLoader
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.session.CacheBitmapLoader
 import androidx.media3.session.CommandButton
 import androidx.media3.session.DefaultMediaNotificationProvider
 import androidx.media3.session.LibraryResult
+import androidx.media3.session.MediaConstants
 import androidx.media3.session.MediaLibraryService
 import androidx.media3.session.MediaSession
+import androidx.media3.session.SessionCommand
 import androidx.media3.session.SessionError
+import androidx.media3.session.SessionResult
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
@@ -33,25 +38,39 @@ import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.model.displayAuthor
+import com.julienmiquel.audiotheque.core.model.displayNarrator
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.model.effectiveStatus
+import com.julienmiquel.audiotheque.core.model.isPlayableKind
+import com.julienmiquel.audiotheque.core.model.partLabel
 import com.julienmiquel.audiotheque.core.sync.BookInUse
+import com.julienmiquel.audiotheque.core.sync.RemoteProgress
+import com.julienmiquel.audiotheque.core.util.Formats
+import com.julienmiquel.audiotheque.player.audio.PresetAudioProcessor
+import com.julienmiquel.audiotheque.player.audio.PresetRenderersFactory
 import java.io.File
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.guava.future
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * Lecture hors ligne uniquement (fichiers locaux, jamais de streaming depuis Drive), avec
@@ -60,8 +79,19 @@ import kotlinx.coroutines.sync.withLock
  * Reprise à la seconde près : position enregistrée toutes les 10 s et à chaque pause ; à la
  * reprise, recul automatique de 5 s. Charger un livre (écran Lecteur, Android Auto) n'enregistre
  * rien : seules l'écoute et les actions de l'utilisateur (déplacement, vitesse) le font.
+ *
+ * D'un téléphone à l'autre : à chaque pause, déplacement ou fin de livre (et toutes les 5 min
+ * pendant l'écoute), la position part dans le dossier Drive du livre ; juste avant de reprendre
+ * un livre, elle y est relue, et la lecture repart de la position la plus récente.
+ *
+ * Catalogue proposé aux navigateurs média (Android Auto, Assistant) : onglets « En écoute » et
+ * « Plus tard » (livres ayant des pistes sur le téléphone, grille de pochettes avec avancement),
+ * puis les chapitres groupés par partie ; recherche par titre, auteur ou voix ; bouton
+ * « Vitesse ». Vignette de reprise du système (Réglages rapides, après redémarrage) : le dernier
+ * livre écouté, avec sa pochette, lancé sans attendre Drive.
  */
 @OptIn(UnstableApi::class)
+@kotlin.OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 class PlaybackService : MediaLibraryService() {
 
     private val errors = CoroutineExceptionHandler { _, e -> Log.w(TAG, "Erreur du lecteur", e) }
@@ -89,13 +119,23 @@ class PlaybackService : MediaLibraryService() {
     /** Écoute effective depuis le dernier enregistrement (date de « dernière écoute »). */
     private var listenedSinceSave = false
 
+    /** Dernier envoi de la position dans Drive (pendant l'écoute : au plus toutes les 5 min). */
+    @Volatile
+    private var lastPushAt = 0L
+
     @Volatile
     private var skipMs = 30_000L
+
+    /** Bouton « Vitesse » (Android Auto, notification) : un appui passe à la vitesse suivante du cycle. */
+    private val speedCommand = SessionCommand(COMMAND_CYCLE_SPEED, Bundle.EMPTY)
+
+    /** Préréglage audio (normalisation, voix, niveau très bas, binaural), appliqué avant la vitesse. */
+    private val dsp = PresetAudioProcessor()
 
     override fun onCreate() {
         super.onCreate()
         deps = (application as PlayerDependenciesProvider).playerDependencies
-        exo = ExoPlayer.Builder(this)
+        exo = ExoPlayer.Builder(this, PresetRenderersFactory(this, dsp))
             .setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(C.USAGE_MEDIA)
@@ -117,29 +157,37 @@ class PlaybackService : MediaLibraryService() {
 
         session = MediaLibrarySession.Builder(this, player, LibraryCallback())
             .setSessionActivity(sessionActivity())
-            .setMediaButtonPreferences(skipButtons())
+            .setMediaButtonPreferences(mediaButtons())
+            // Pochettes lues depuis le fichier local (ou l'adresse content://), réduites : écran
+            // verrouillé, notification, Bluetooth, Android Auto sans images de 1 200 px en mémoire.
+            .setBitmapLoader(CacheBitmapLoader(DataSourceBitmapLoader.Builder(this).setMaximumOutputDimension(ARTWORK_MAX_PX).build()))
             .build()
 
         scope.launch {
             deps.settings.settings.map { it.skipSeconds }.distinctUntilChanged().collect { seconds ->
                 skipMs = seconds * 1000L
-                session?.setMediaButtonPreferences(skipButtons())
+                session?.setMediaButtonPreferences(mediaButtons())
             }
         }
+        scope.launch {
+            // Changement pris en compte au tampon suivant, même pendant l'écoute.
+            deps.settings.settings.map { it.audioPreset }.distinctUntilChanged().collect { dsp.preset = it }
+        }
         scope.launch { observeSleepTimer() }
+        scope.launch { observeCatalogChanges() }
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaLibrarySession? = session
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         if (!exo.playWhenReady || exo.mediaItemCount == 0) {
-            persistNow()
+            persistNow(push = true)
             stopSelf()
         }
     }
 
     override fun onDestroy() {
-        persistNow()
+        persistNow(push = true)
         tickerJob?.cancel()
         tracksJob?.cancel()
         session?.release()
@@ -225,7 +273,8 @@ class PlaybackService : MediaLibraryService() {
                     pausedAt = System.currentTimeMillis()
                 }
                 tickerJob?.cancel()
-                persistNow()
+                // Pause : la position part dans Drive, pour reprendre sur l'autre téléphone.
+                persistNow(push = true)
             }
         }
 
@@ -237,14 +286,16 @@ class PlaybackService : MediaLibraryService() {
 
         override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
             if (reason == Player.DISCONTINUITY_REASON_SEEK) {
-                // Position choisie par l'utilisateur (barre, chapitres, saut) : enregistrée.
+                // Position choisie par l'utilisateur (barre, chapitres, saut) : enregistrée et envoyée.
                 finishedEmitted = false
                 persistEnabled = true
-                persistNow()
+                persistNow(push = true)
             }
         }
 
         override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) {
+            // Le bouton « Vitesse » affiche la vitesse en cours.
+            session?.setMediaButtonPreferences(mediaButtons())
             val bookId = currentBook?.driveId ?: return
             val speed = playbackParameters.speed
             persistScope.launch(start = CoroutineStart.UNDISPATCHED) { persistMutex.withLock { persistSpeed(bookId, speed) } }
@@ -290,7 +341,7 @@ class PlaybackService : MediaLibraryService() {
         if (isOnLastTrack()) {
             if (finishedEmitted) return
             finishedEmitted = true
-            persistNow(markFinished = true)
+            persistNow(markFinished = true, push = true)
             PlayerRuntime.emit(PlaybackEvent.BookFinished(book.driveId))
         } else {
             waitingForNext = true
@@ -339,24 +390,30 @@ class PlaybackService : MediaLibraryService() {
         val markFinished: Boolean,
         /** Écoute effective depuis le dernier enregistrement : met à jour « dernière écoute ». */
         val listened: Boolean,
+        /** Envoyer la position dans Drive une fois enregistrée. */
+        val push: Boolean,
     )
 
-    private fun snapshot(markFinished: Boolean, listened: Boolean): Snapshot? {
+    private fun snapshot(markFinished: Boolean, listened: Boolean, push: Boolean): Snapshot? {
         val book = currentBook ?: return null
         val ref = exo.currentMediaItem?.let { MediaIds.parseTrack(it.mediaId) } ?: return null
         if (ref.bookId != book.driveId) return null
-        return Snapshot(book, currentTracks, ref.trackId, exo.currentPosition.coerceAtLeast(0), exo.playbackParameters.speed, markFinished, listened)
+        return Snapshot(book, currentTracks, ref.trackId, exo.currentPosition.coerceAtLeast(0), exo.playbackParameters.speed, markFinished, listened, push)
     }
 
     /**
      * Enregistre la position (instantané pris tout de suite, écrit ensuite). Sans effet tant que
      * le livre chargé n'a été ni écouté ni déplacé. Les écritures se font une par une, dans
      * l'ordre : la fin du livre ne peut pas être effacée par une pause enregistrée en même temps.
+     * Avec [push], ou si le dernier envoi date de plus de 5 min, la position part aussi dans Drive.
      */
-    private fun persistNow(markFinished: Boolean = false) {
+    private fun persistNow(markFinished: Boolean = false, push: Boolean = false) {
         if (!persistEnabled && !markFinished) return
-        val snapshot = snapshot(markFinished, listened = listenedSinceSave || exo.isPlaying) ?: return
+        val now = System.currentTimeMillis()
+        val send = push || now - lastPushAt >= PUSH_INTERVAL_MS
+        val snapshot = snapshot(markFinished, listened = listenedSinceSave || exo.isPlaying, push = send) ?: return
         listenedSinceSave = exo.isPlaying
+        if (send) lastPushAt = now
         persistScope.launch(start = CoroutineStart.UNDISPATCHED) { persistMutex.withLock { persist(snapshot) } }
     }
 
@@ -385,6 +442,8 @@ class PlaybackService : MediaLibraryService() {
         if (s.listened && settings.lastPlayedBookId != s.book.driveId) {
             deps.settings.update { it.copy(lastPlayedBookId = s.book.driveId) }
         }
+        // Après l'écriture locale : l'envoi relit la base, la position est à jour.
+        if (s.push) deps.progressSync?.pushProgress(s.book.driveId)
     }
 
     /** Vitesse mémorisée par livre : écrite seule, et seulement si elle change. */
@@ -395,11 +454,24 @@ class PlaybackService : MediaLibraryService() {
         if (existing?.speed == speed || (existing == null && speed == 1f)) return
         val now = System.currentTimeMillis()
         dao.upsert((existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now)).copy(speed = speed, updatedAt = now, dirty = true))
+        deps.progressSync?.pushProgress(bookId)
     }
 
-    // ------------------------------------------------------------------ livres → éléments média
+    // ------------------------------------------------------------------ livres → liste de lecture
 
-    private suspend fun resolveBook(bookId: String, trackId: String?, positionMs: Long?): MediaSession.MediaItemsWithStartPosition? {
+    /**
+     * Prépare la liste de lecture d'un livre. Sans piste ni position imposées, c'est une reprise :
+     * la position de l'autre téléphone est relue dans Drive avant de choisir où repartir — ou,
+     * avec [deferRemote] (vignette de reprise, bouton du casque, « Reprends mon livre »), la lecture
+     * part tout de suite de la position locale et saute à celle de Drive si elle arrive plus
+     * récente.
+     */
+    private suspend fun resolveBook(
+        bookId: String,
+        trackId: String?,
+        positionMs: Long?,
+        deferRemote: Boolean = false,
+    ): MediaSession.MediaItemsWithStartPosition? {
         // Livre précédent : sa position est enregistrée avant d'en charger un autre, et les
         // enregistrements en cours sont terminés pour lire une position à jour.
         persistNow()
@@ -409,8 +481,10 @@ class PlaybackService : MediaLibraryService() {
         val tracks = db.trackDao().forBook(bookId)
         val present = tracks.filter { it.isPlayableLocally() }
         if (present.isEmpty()) return null
+        val resuming = trackId == null && positionMs == null
+        val restored = if (resuming && !deferRemote) pullRemoteProgress(bookId, PULL_TIMEOUT_MS) else null
         val progress = db.progressDao().get(bookId, deps.settings.current().accountKey)
-        val restart = trackId == null && positionMs == null && progress?.finished == true
+        val restart = resuming && progress?.finished == true
         val wantedId = when {
             trackId != null -> trackId
             restart -> tracks.first().driveId
@@ -433,7 +507,35 @@ class PlaybackService : MediaLibraryService() {
         bind(book, tracks)
         exo.setPlaybackSpeed(progress?.speed?.coerceIn(MIN_SPEED, MAX_SPEED) ?: 1f)
         pausedAt = null
-        return MediaSession.MediaItemsWithStartPosition(present.map { mediaItem(book, it, tracks.size) }, startIndex, startPosition)
+        if (restored != null) PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
+        if (resuming && deferRemote) scope.launch { adoptRemoteProgressLater(bookId) }
+        return MediaSession.MediaItemsWithStartPosition(present.map { playlistItem(book, it, tracks.size) }, startIndex, startPosition)
+    }
+
+    /** Position du livre dans Drive, au plus [timeoutMs] : null si rien de plus récent (ou hors ligne). */
+    private suspend fun pullRemoteProgress(bookId: String, timeoutMs: Long): RemoteProgress? {
+        val sync = deps.progressSync ?: return null
+        return try {
+            sync.pullProgress(bookId, timeoutMs)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Position Drive non relue", e)
+            null
+        }
+    }
+
+    /**
+     * Reprise lancée sans attendre Drive : si l'autre téléphone y a enregistré une position plus
+     * récente, la lecture y saute dès qu'elle est relue (le livre doit être toujours chargé).
+     */
+    private suspend fun adoptRemoteProgressLater(bookId: String) {
+        val restored = pullRemoteProgress(bookId, DEFERRED_PULL_TIMEOUT_MS) ?: return
+        if (currentBook?.driveId != bookId) return
+        val progress = deps.database.progressDao().get(bookId, deps.settings.current().accountKey) ?: return
+        val index = (0 until exo.mediaItemCount).firstOrNull { MediaIds.parseTrack(exo.getMediaItemAt(it).mediaId)?.trackId == progress.trackId } ?: return
+        exo.seekTo(index, (progress.positionMs - RESUME_REWIND_MS).coerceAtLeast(0))
+        PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
     }
 
     /** Livre chargé : protégé du nettoyage, et complété au fil des téléchargements. */
@@ -466,7 +568,7 @@ class PlaybackService : MediaLibraryService() {
                 val id = MediaIds.parseTrack(exo.getMediaItemAt(i).mediaId)?.trackId
                 (sortById[id] ?: Int.MAX_VALUE) < track.sortIndex
             }
-            exo.addMediaItem(index, mediaItem(book, track, tracks.size))
+            exo.addMediaItem(index, playlistItem(book, track, tracks.size))
             inserted = true
         }
         if (inserted && waitingForNext && exo.currentMediaItemIndex < exo.mediaItemCount - 1) {
@@ -479,19 +581,31 @@ class PlaybackService : MediaLibraryService() {
     private fun TrackEntity.isPlayableLocally(): Boolean =
         state == TrackState.PRESENT && localPath?.let { File(it).exists() } == true
 
+    /**
+     * Pochette : adresse `content://` servie par [CoverArtProvider] (lisible par Android Auto et le
+     * système, qui tournent dans d'autres processus), sinon l'URL en ligne.
+     */
     private fun coverUri(book: BookEntity): Uri? =
-        book.coverPath?.let { Uri.fromFile(File(it)) } ?: book.coverUrl?.let(Uri::parse)
+        book.coverPath?.let(::File)?.takeIf { it.isFile }?.let { CoverArtProvider.uriFor(this, book.driveId, it) }
+            ?: book.coverUrl?.let(Uri::parse)
 
-    private fun mediaItem(book: BookEntity, track: TrackEntity, total: Int): MediaItem =
+    /**
+     * Élément de la liste de lecture : ce qu'affichent la vignette système (écran verrouillé,
+     * Réglages rapides), la montre, Android Auto (lecture en cours, file d'attente) et les
+     * autoradios Bluetooth. Android prend la 1ʳᵉ ligne dans `title` et la 2ᵉ dans `artist` :
+     * **numéro de piste ou chapitre** (« Piste 4 / 51 », « Chapitre 4 »), puis **titre du livre** ;
+     * l'auteur passe en album (3ᵉ ligne d'Android Auto), le nom de piste d'origine en sous-titre.
+     */
+    private fun playlistItem(book: BookEntity, track: TrackEntity, total: Int): MediaItem =
         MediaItem.Builder()
             .setMediaId(MediaIds.track(book.driveId, track.driveId))
             .setUri(Uri.fromFile(File(track.localPath!!)))
             .setMediaMetadata(
                 MediaMetadata.Builder()
-                    .setTitle(track.title)
-                    .setSubtitle(track.chapterLabel)
-                    .setArtist(book.displayAuthor)
-                    .setAlbumTitle(book.displayTitle)
+                    .setTitle(Chapters.label(track, total))
+                    .setSubtitle(track.title)
+                    .setArtist(book.displayTitle)
+                    .setAlbumTitle(book.displayAuthor)
                     .setAlbumArtist(book.displayAuthor)
                     .setArtworkUri(coverUri(book))
                     .setTrackNumber(track.sortIndex + 1)
@@ -504,20 +618,12 @@ class PlaybackService : MediaLibraryService() {
             )
             .build()
 
-    private fun bookItem(book: BookEntity): MediaItem =
-        MediaItem.Builder()
-            .setMediaId(MediaIds.bookRequest(book.driveId))
-            .setMediaMetadata(
-                MediaMetadata.Builder()
-                    .setTitle(book.displayTitle)
-                    .setArtist(book.displayAuthor)
-                    .setArtworkUri(coverUri(book))
-                    .setIsBrowsable(true)
-                    .setIsPlayable(true)
-                    .setMediaType(MediaMetadata.MEDIA_TYPE_AUDIO_BOOK)
-                    .build(),
-            )
-            .build()
+    // ------------------------------------------------------------------ catalogue (Android Auto, Assistant, vignette)
+
+    /** Un livre écoutable hors ligne, avec ce qu'il faut pour l'afficher dans un navigateur média. */
+    private data class BookCard(val book: BookEntity, val progress: ProgressEntity?, val presentTracks: Int) {
+        val lastListenedAt: Long get() = progress?.lastListenedAt ?: 0L
+    }
 
     private fun rootItem(): MediaItem =
         MediaItem.Builder()
@@ -532,38 +638,283 @@ class PlaybackService : MediaLibraryService() {
             )
             .build()
 
-    /** Livres « En écoute » ayant des pistes téléchargées (Android Auto). */
-    private suspend fun browsableBooks(): List<MediaItem> {
-        val db = deps.database
-        return db.bookDao().byEffectiveStatus(BookStatus.IN_PROGRESS)
-            .filter { db.trackDao().presentCount(it.driveId) > 0 }
-            .map { bookItem(it) }
+    /** Onglet de la racine : ses enfants (les livres) s'affichent en grille de pochettes. */
+    private fun tabItem(status: BookStatus): MediaItem =
+        MediaItem.Builder()
+            .setMediaId(MediaIds.tab(status))
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(getString(if (status == BookStatus.LATER) R.string.player_tab_later else R.string.player_tab_in_progress))
+                    .setIsBrowsable(true)
+                    .setIsPlayable(false)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_FOLDER_AUDIO_BOOKS)
+                    .setExtras(
+                        Bundle().apply {
+                            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+                            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_GRID_ITEM)
+                        },
+                    )
+                    .build(),
+            )
+            .build()
+
+    /**
+     * Un livre dans une liste ou une grille : toucher lance la reprise, le chevron ouvre ses
+     * chapitres (en liste). Avancement, « hors ligne » et pochette lisibles par Android Auto.
+     */
+    private fun bookBrowseItem(card: BookCard): MediaItem {
+        val book = card.book
+        val completion = AutoCatalog.bookCompletion(card.progress?.percent, card.progress?.finished == true)
+        val extras = Bundle().apply {
+            putString(EXTRA_BOOK_ID, book.driveId)
+            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+            putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+            putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, completion.status)
+            putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, completion.fraction)
+            if (book.trackCount > 0 && card.presentTracks >= book.trackCount) {
+                putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED)
+            }
+        }
+        val subtitle = when {
+            book.trackCount > 0 && card.presentTracks < book.trackCount ->
+                listOfNotNull(book.displayAuthor, getString(R.string.player_downloaded_tracks, card.presentTracks, book.trackCount)).joinToString(" · ")
+            else -> book.displayAuthor
+        }
+        return MediaItem.Builder()
+            .setMediaId(MediaIds.bookRequest(book.driveId))
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(book.displayTitle)
+                    .setDisplayTitle(book.displayTitle)
+                    .setSubtitle(subtitle)
+                    .setDescription(book.displayNarrator?.let { "Lu par $it" })
+                    .setArtist(book.displayAuthor)
+                    .setAlbumTitle(book.displayTitle)
+                    .setArtworkUri(coverUri(book))
+                    .setIsBrowsable(true)
+                    .setIsPlayable(true)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_AUDIO_BOOK)
+                    .setExtras(extras)
+                    .build(),
+            )
+            .build()
     }
 
-    private suspend fun chapterItems(bookId: String): List<MediaItem> {
+    /** Un chapitre dans la liste d'un livre : groupé par partie, avec son avancement et sa durée. */
+    private fun chapterBrowseItem(book: BookEntity, track: TrackEntity, duration: Long, completion: AutoCatalog.Completion): MediaItem {
+        val extras = Bundle().apply {
+            putString(EXTRA_BOOK_ID, book.driveId)
+            track.partLabel?.let { putString(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_GROUP_TITLE, it) }
+            putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, completion.status)
+            putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, completion.fraction)
+            putLong(MediaConstants.EXTRAS_KEY_DOWNLOAD_STATUS, MediaConstants.EXTRAS_VALUE_STATUS_DOWNLOADED)
+        }
+        val subtitle = if (duration > 0) {
+            getString(R.string.player_chapter_duration, track.chapterLabel, Formats.duration(duration, approximate = !track.durationExact))
+        } else {
+            track.chapterLabel
+        }
+        return MediaItem.Builder()
+            .setMediaId(MediaIds.track(book.driveId, track.driveId))
+            .setMediaMetadata(
+                MediaMetadata.Builder()
+                    .setTitle(track.title)
+                    .setDisplayTitle(track.title)
+                    .setSubtitle(subtitle)
+                    .setArtist(book.displayAuthor)
+                    .setAlbumTitle(book.displayTitle)
+                    .setArtworkUri(coverUri(book))
+                    .setTrackNumber(track.sortIndex + 1)
+                    .setIsBrowsable(false)
+                    .setIsPlayable(true)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_AUDIO_BOOK_CHAPTER)
+                    .setExtras(extras)
+                    .build(),
+            )
+            .build()
+    }
+
+    /**
+     * Vignette de reprise du système (Réglages rapides, écran verrouillé, après un redémarrage ou
+     * l'arrêt de l'app) : le livre, puis « Piste 4 / 51 · 42 % » (où l'on reprend), avec sa
+     * pochette embarquée — le système ne charge pas d'image à ce moment-là.
+     */
+    private fun resumeItem(card: BookCard, resumeAt: String?, artwork: ByteArray?): MediaItem {
+        val book = card.book
+        val finished = card.progress?.finished == true
+        val completion = AutoCatalog.bookCompletion(card.progress?.percent, finished)
+        val metadata = MediaMetadata.Builder()
+            .setTitle(book.displayTitle)
+            .setDisplayTitle(book.displayTitle)
+            .setSubtitle(AutoCatalog.resumeSubtitle(resumeAt, card.progress?.percent, finished))
+            .setArtist(book.displayTitle)
+            .setAlbumTitle(book.displayAuthor)
+            .setAlbumArtist(book.displayAuthor)
+            .setArtworkUri(coverUri(book))
+            .setIsBrowsable(false)
+            .setIsPlayable(true)
+            .setMediaType(MediaMetadata.MEDIA_TYPE_AUDIO_BOOK)
+            .setExtras(
+                Bundle().apply {
+                    putString(EXTRA_BOOK_ID, book.driveId)
+                    putInt(MediaConstants.EXTRAS_KEY_COMPLETION_STATUS, completion.status)
+                    putDouble(MediaConstants.EXTRAS_KEY_COMPLETION_PERCENTAGE, completion.fraction)
+                },
+            )
+        if (artwork != null) metadata.setArtworkData(artwork, MediaMetadata.PICTURE_TYPE_FRONT_COVER)
+        return MediaItem.Builder().setMediaId(MediaIds.bookRequest(book.driveId)).setMediaMetadata(metadata.build()).build()
+    }
+
+    /** Piste où la lecture reprendra (« Piste 4 / 51 », « Chapitre 4 »), d'après la progression enregistrée. */
+    private suspend fun resumeLabel(card: BookCard): String? {
+        val tracks = deps.database.trackDao().forBook(card.book.driveId)
+        if (tracks.isEmpty()) return null
+        val progress = card.progress
+        val track = if (progress?.finished == true) {
+            tracks.first()
+        } else {
+            tracks.firstOrNull { it.driveId == progress?.trackId } ?: tracks.getOrNull(progress?.trackIndex ?: 0) ?: tracks.first()
+        }
+        return Chapters.label(track, tracks.size)
+    }
+
+    /** Livres d'un statut ayant des pistes téléchargées, le dernier écouté en premier. */
+    private suspend fun playableBooks(status: BookStatus): List<BookCard> =
+        cards(deps.database.bookDao().byEffectiveStatus(status))
+
+    /** Tous les livres écoutables hors ligne, quel que soit leur statut (recherche, reprise). */
+    private suspend fun allPlayableBooks(): List<BookCard> = cards(deps.database.bookDao().all())
+
+    private suspend fun cards(books: List<BookEntity>): List<BookCard> {
+        val db = deps.database
+        val account = deps.settings.current().accountKey
+        return books
+            .filter { it.isPlayableKind && !it.hidden && !it.trashPending }
+            .mapNotNull { book ->
+                val present = db.trackDao().presentCount(book.driveId)
+                if (present == 0) null else BookCard(book, db.progressDao().get(book.driveId, account), present)
+            }
+            .sortedWith(compareByDescending<BookCard> { it.lastListenedAt }.thenByDescending { it.book.statusChangedAt })
+    }
+
+    /** Onglets proposés : « En écoute » toujours, « Plus tard » seulement s'il a de quoi écouter. */
+    private suspend fun tabs(): List<MediaItem> =
+        AutoCatalog.TAB_STATUSES
+            .filter { it == BookStatus.IN_PROGRESS || playableBooks(it).isNotEmpty() }
+            .map { tabItem(it) }
+
+    private suspend fun chapterBrowseItems(bookId: String): List<MediaItem> {
         val db = deps.database
         val book = db.bookDao().get(bookId) ?: return emptyList()
         val tracks = db.trackDao().forBook(bookId)
-        return tracks.filter { it.isPlayableLocally() }.map { mediaItem(book, it, tracks.size) }
+        val progress = db.progressDao().get(bookId, deps.settings.current().accountKey)
+        val durations = ProgressMath.durations(tracks, book.durationMs)
+        val isCurrent = currentBook?.driveId == bookId && exo.mediaItemCount > 0
+        val currentTrackId = if (isCurrent) currentTrack()?.driveId else progress?.trackId
+        val currentIndex = tracks.indexOfFirst { it.driveId == currentTrackId }.takeIf { it >= 0 }
+        val positionMs = if (isCurrent) exo.currentPosition.coerceAtLeast(0) else progress?.positionMs ?: 0L
+        val finished = progress?.finished == true && !isCurrent
+        return tracks.withIndex()
+            .filter { (_, track) -> track.isPlayableLocally() }
+            .map { (index, track) ->
+                val duration = durations.getOrElse(index) { 0L }
+                chapterBrowseItem(book, track, duration, AutoCatalog.chapterCompletion(index, currentIndex, positionMs, duration, finished))
+            }
     }
 
-    private fun skipButtons(): List<CommandButton> {
+    /** Pistes téléchargées d'un livre, prêtes pour la liste de lecture. */
+    private suspend fun playlistItems(bookId: String): List<MediaItem> {
+        val db = deps.database
+        val book = db.bookDao().get(bookId) ?: return emptyList()
+        val tracks = db.trackDao().forBook(bookId)
+        return tracks.filter { it.isPlayableLocally() }.map { playlistItem(book, it, tracks.size) }
+    }
+
+    /**
+     * Dernier livre écouté encore écoutable hors ligne (vignette de reprise, bouton du casque,
+     * « Reprends mon livre ») ; à défaut, le dernier livre « En écoute » ayant des pistes.
+     */
+    private suspend fun lastPlayableBook(): BookCard? {
+        val db = deps.database
+        val settings = deps.settings.current()
+        val candidates = listOfNotNull(settings.lastPlayedBookId, db.progressDao().lastListened(settings.accountKey)?.bookId).distinct()
+        for (id in candidates) {
+            val book = db.bookDao().get(id) ?: continue
+            cards(listOf(book)).firstOrNull()?.let { return it }
+        }
+        return playableBooks(BookStatus.IN_PROGRESS).firstOrNull()
+    }
+
+    /** Livres écoutables correspondant à une recherche (barre de recherche Android Auto, Assistant). */
+    private suspend fun searchBooks(query: String): List<BookCard> =
+        allPlayableBooks()
+            .map { it to AutoCatalog.searchScore(query, it.book.displayTitle, it.book.displayAuthor, it.book.displayNarrator) }
+            .filter { (_, score) -> score > 0 }
+            .sortedWith(compareByDescending<Pair<BookCard, Int>> { it.second }.thenByDescending { it.first.lastListenedAt })
+            .map { it.first }
+
+    /** Signature du catalogue : ce qui, en changeant, modifie les listes proposées aux navigateurs. */
+    private data class CatalogEntry(val bookId: String, val status: BookStatus, val presentTracks: Int, val percent: Int?, val finished: Boolean)
+
+    /**
+     * Téléchargement terminé, geste de statut, écoute : les navigateurs abonnés (Android Auto)
+     * sont prévenus que la racine, les onglets et les chapitres du livre concerné ont changé.
+     */
+    private suspend fun observeCatalogChanges() {
+        var previous: Map<String, CatalogEntry>? = null
+        deps.settings.settings.map { it.accountKey }.distinctUntilChanged()
+            .flatMapLatest { deps.database.bookDao().observeLibrary(it) }
+            .map { rows ->
+                rows.filter { it.presentTracks > 0 && !it.book.hidden && !it.book.trashPending }
+                    .associate { it.book.driveId to CatalogEntry(it.book.driveId, it.book.effectiveStatus, it.presentTracks, it.percent?.toInt(), it.finished == true) }
+            }
+            .distinctUntilChanged()
+            .debounce(CATALOG_NOTIFY_DEBOUNCE_MS)
+            .collect { entries ->
+                val before = previous
+                previous = entries
+                val s = session ?: return@collect
+                if (before == null) return@collect
+                s.notifyChildrenChanged(MediaIds.ROOT, Int.MAX_VALUE, null)
+                AutoCatalog.TAB_STATUSES.forEach { s.notifyChildrenChanged(MediaIds.tab(it), Int.MAX_VALUE, null) }
+                (before.keys + entries.keys)
+                    .filter { before[it]?.presentTracks != entries[it]?.presentTracks }
+                    .forEach { s.notifyChildrenChanged(MediaIds.bookRequest(it), Int.MAX_VALUE, null) }
+            }
+    }
+
+    // ------------------------------------------------------------------ boutons et session
+
+    /**
+     * Boutons média : saut arrière/avant réglable et « Vitesse » (cycle), tous en boutons
+     * supplémentaires. Les emplacements précédent/suivant restent aux chapitres (⏮/⏭ standard) :
+     * occupés par les sauts, Media3 retire `ACTION_SKIP_TO_PREVIOUS/NEXT` de la session système,
+     * et les contrôleurs qui n'affichent pas les boutons personnalisés — montre Wear OS,
+     * autoradios Bluetooth — n'ont alors plus que ▶/⏸, parfois figé. Téléphone : ⏮ ▶ ⏭ −30 +30.
+     */
+    private fun mediaButtons(): List<CommandButton> {
         val seconds = (skipMs / 1000).toInt()
         val (back, forward) = when (seconds) {
             10 -> CommandButton.ICON_SKIP_BACK_10 to CommandButton.ICON_SKIP_FORWARD_10
             15 -> CommandButton.ICON_SKIP_BACK_15 to CommandButton.ICON_SKIP_FORWARD_15
             else -> CommandButton.ICON_SKIP_BACK_30 to CommandButton.ICON_SKIP_FORWARD_30
         }
+        val speed = if (::exo.isInitialized) exo.playbackParameters.speed else 1f
         return listOf(
             CommandButton.Builder(back)
                 .setPlayerCommand(Player.COMMAND_SEEK_BACK)
                 .setDisplayName(getString(R.string.player_seek_back, seconds))
-                .setSlots(CommandButton.SLOT_BACK)
+                .setSlots(CommandButton.SLOT_OVERFLOW)
                 .build(),
             CommandButton.Builder(forward)
                 .setPlayerCommand(Player.COMMAND_SEEK_FORWARD)
                 .setDisplayName(getString(R.string.player_seek_forward, seconds))
-                .setSlots(CommandButton.SLOT_FORWARD)
+                .setSlots(CommandButton.SLOT_OVERFLOW)
+                .build(),
+            CommandButton.Builder(CommandButton.ICON_PLAYBACK_SPEED)
+                .setSessionCommand(speedCommand)
+                .setDisplayName(getString(R.string.player_speed, Formats.speed(speed)))
+                .setSlots(CommandButton.SLOT_OVERFLOW)
                 .build(),
         )
     }
@@ -576,13 +927,56 @@ class PlaybackService : MediaLibraryService() {
         return PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
+    private fun emptyPlaylist() = MediaSession.MediaItemsWithStartPosition(ImmutableList.of(), C.INDEX_UNSET, C.TIME_UNSET)
+
     private inner class LibraryCallback : MediaLibrarySession.Callback {
+
+        /**
+         * Toute application connectée peut commander la lecture, comme avant Media3 1.11 (qui
+         * limite par défaut à la lecture seule les contrôleurs sans accès aux notifications) : le
+         * relais de la montre, un autoradio ou l'Assistant doivent pouvoir lancer, mettre en pause
+         * et sauter. Les commandes de lecture sont celles du lecteur, plus le bouton « Vitesse ».
+         */
+        override fun onConnect(session: MediaSession, controller: MediaSession.ControllerInfo): MediaSession.ConnectionResult {
+            // Android Auto, System UI, Bluetooth… liront les pochettes par le fournisseur de contenu.
+            CoverArtProvider.grantTo(this@PlaybackService, controller.packageName)
+            return MediaSession.ConnectionResult.AcceptedResultBuilder()
+                .setAvailableSessionCommands(
+                    MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon().add(speedCommand).build(),
+                )
+                .setAvailablePlayerCommands(MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS)
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle,
+        ): ListenableFuture<SessionResult> {
+            if (customCommand.customAction == COMMAND_CYCLE_SPEED) {
+                exo.setPlaybackSpeed(AutoCatalog.nextSpeed(exo.playbackParameters.speed))
+                return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+            }
+            return Futures.immediateFuture(SessionResult(SessionError.ERROR_NOT_SUPPORTED))
+        }
 
         override fun onGetLibraryRoot(
             session: MediaLibrarySession,
             browser: MediaSession.ControllerInfo,
             params: LibraryParams?,
-        ): ListenableFuture<LibraryResult<MediaItem>> = Futures.immediateFuture(LibraryResult.ofItem(rootItem(), params))
+        ): ListenableFuture<LibraryResult<MediaItem>> {
+            // Styles par défaut du catalogue : listes ; les onglets passent leurs livres en grille.
+            val hints = LibraryParams.Builder()
+                .setExtras(
+                    Bundle().apply {
+                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_BROWSABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+                        putInt(MediaConstants.EXTRAS_KEY_CONTENT_STYLE_PLAYABLE, MediaConstants.EXTRAS_VALUE_CONTENT_STYLE_LIST_ITEM)
+                    },
+                )
+                .build()
+            return Futures.immediateFuture(LibraryResult.ofItem(rootItem(), hints))
+        }
 
         override fun onGetChildren(
             session: MediaLibrarySession,
@@ -592,10 +986,11 @@ class PlaybackService : MediaLibraryService() {
             pageSize: Int,
             params: LibraryParams?,
         ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future {
-            val items = if (parentId == MediaIds.ROOT) {
-                browsableBooks()
-            } else {
-                MediaIds.parseBookRequest(parentId)?.let { chapterItems(it.bookId) } ?: emptyList()
+            val tab = MediaIds.parseTab(parentId)
+            val items = when {
+                parentId == MediaIds.ROOT -> tabs()
+                tab != null -> playableBooks(tab).map { bookBrowseItem(it) }
+                else -> MediaIds.parseBookRequest(parentId)?.let { chapterBrowseItems(it.bookId) } ?: emptyList()
             }
             LibraryResult.ofItemList(ImmutableList.copyOf(items), params)
         }
@@ -605,15 +1000,38 @@ class PlaybackService : MediaLibraryService() {
             browser: MediaSession.ControllerInfo,
             mediaId: String,
         ): ListenableFuture<LibraryResult<MediaItem>> = scope.future {
+            val tab = MediaIds.parseTab(mediaId)
             val book = MediaIds.parseBookRequest(mediaId)?.let { deps.database.bookDao().get(it.bookId) }
             val track = MediaIds.parseTrack(mediaId)
             val item = when {
                 mediaId == MediaIds.ROOT -> rootItem()
-                book != null -> bookItem(book)
-                track != null -> chapterItems(track.bookId).firstOrNull { it.mediaId == mediaId }
+                tab != null -> tabItem(tab)
+                book != null -> cards(listOf(book)).firstOrNull()?.let { bookBrowseItem(it) }
+                track != null -> chapterBrowseItems(track.bookId).firstOrNull { it.mediaId == mediaId }
                 else -> null
             }
             if (item != null) LibraryResult.ofItem(item, null) else LibraryResult.ofError(SessionError.ERROR_BAD_VALUE)
+        }
+
+        override fun onSearch(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<Void>> = scope.future {
+            session.notifySearchResultChanged(browser, query, searchBooks(query).size, params)
+            LibraryResult.ofVoid(params)
+        }
+
+        override fun onGetSearchResult(
+            session: MediaLibrarySession,
+            browser: MediaSession.ControllerInfo,
+            query: String,
+            page: Int,
+            pageSize: Int,
+            params: LibraryParams?,
+        ): ListenableFuture<LibraryResult<ImmutableList<MediaItem>>> = scope.future {
+            LibraryResult.ofItemList(ImmutableList.copyOf(searchBooks(query).map { bookBrowseItem(it) }), params)
         }
 
         override fun onSetMediaItems(
@@ -625,13 +1043,21 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future {
             val first = mediaItems.getOrNull(startIndex.coerceAtLeast(0)) ?: mediaItems.firstOrNull()
             val explicitPosition = startPositionMs.takeIf { it != C.TIME_UNSET && it > 0 }
+            val query = first?.requestMetadata?.searchQuery
             val book = first?.let { MediaIds.parseBookRequest(it.mediaId) }
             val track = first?.let { MediaIds.parseTrack(it.mediaId) }
             when {
+                // Assistant, Android Auto : « Écoute Civilisations » cherche un livre écoutable ;
+                // « Reprends mon livre » (ou rien) relance le dernier, sans attendre Drive.
+                query != null -> {
+                    val resume = AutoCatalog.isGenericRequest(query)
+                    val card = if (resume) lastPlayableBook() else searchBooks(query).firstOrNull()
+                    card?.let { resolveBook(it.book.driveId, null, null, deferRemote = resume) }
+                }
                 book != null -> resolveBook(book.bookId, book.trackId, book.positionMs ?: explicitPosition)
                 track != null -> resolveBook(track.bookId, track.trackId, explicitPosition ?: 0)
                 else -> null
-            } ?: MediaSession.MediaItemsWithStartPosition(ImmutableList.of(), C.INDEX_UNSET, C.TIME_UNSET)
+            } ?: emptyPlaylist()
         }
 
         override fun onAddMediaItems(
@@ -645,35 +1071,62 @@ class PlaybackService : MediaLibraryService() {
                 // Lecture hors ligne uniquement : seules les pistes téléchargées de la bibliothèque
                 // sont acceptées, jamais une adresse fournie par une autre app.
                 when {
-                    track != null -> chapterItems(track.bookId).filter { it.mediaId == item.mediaId }
-                    book != null -> chapterItems(book.bookId)
+                    track != null -> playlistItems(track.bookId).filter { it.mediaId == item.mediaId }
+                    book != null -> playlistItems(book.bookId)
                     else -> emptyList()
                 }
             }.toMutableList()
         }
 
-        @Deprecated("Remplacée par la variante avec isForPlayback dans les versions récentes de Media3")
+        /**
+         * Reprise demandée sans livre chargé : vignette du système, bouton du casque après l'arrêt
+         * du service, Assistant. Sans intention de lecture ([isForPlayback] faux : le système
+         * garnit sa vignette), un seul élément décrit le livre avec sa pochette ; sinon la liste
+         * de lecture part aussitôt de la position locale, Drive est relu en parallèle.
+         */
         override fun onPlaybackResumption(
             mediaSession: MediaSession,
             controller: MediaSession.ControllerInfo,
+            isForPlayback: Boolean,
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future {
-            val db = deps.database
-            val settings = deps.settings.current()
-            val bookId = settings.lastPlayedBookId ?: db.progressDao().lastListened(settings.accountKey)?.bookId
-            bookId?.let { resolveBook(it, null, null) }
-                ?: MediaSession.MediaItemsWithStartPosition(ImmutableList.of(), C.INDEX_UNSET, C.TIME_UNSET)
+            val card = lastPlayableBook() ?: return@future emptyPlaylist()
+            if (isForPlayback) {
+                resolveBook(card.book.driveId, null, null, deferRemote = true) ?: emptyPlaylist()
+            } else {
+                val artwork = withContext(Dispatchers.IO) { CoverThumbnails.jpegBytes(card.book.coverPath, RESUME_ART_PX) }
+                MediaSession.MediaItemsWithStartPosition(ImmutableList.of(resumeItem(card, resumeLabel(card), artwork)), 0, C.TIME_UNSET)
+            }
         }
     }
 
     companion object {
         const val EXTRA_OPEN_PLAYER = "com.julienmiquel.audiotheque.OPEN_PLAYER"
         const val EXTRA_BOOK_ID = "bookId"
+        const val COMMAND_CYCLE_SPEED = "com.julienmiquel.audiotheque.CYCLE_SPEED"
         const val SAVE_INTERVAL_MS = 10_000L
         const val RESUME_REWIND_MS = 5_000L
         const val MIN_PAUSE_FOR_REWIND_MS = 2_000L
         const val FADE_MS = 10_000L
         const val MIN_SPEED = 0.8f
         const val MAX_SPEED = 2.0f
+
+        /** Pendant l'écoute, la position part dans Drive au plus toutes les 5 min (et à chaque pause). */
+        const val PUSH_INTERVAL_MS = 5 * 60_000L
+
+        /** Relecture de la position Drive avant une lecture : au-delà, on repart de la position locale. */
+        const val PULL_TIMEOUT_MS = 4_000L
+
+        /** Reprise lancée sans attendre (vignette, casque) : la position Drive est relue en parallèle, au plus 15 s. */
+        const val DEFERRED_PULL_TIMEOUT_MS = 15_000L
+
+        /** Pochette embarquée dans la vignette de reprise. */
+        const val RESUME_ART_PX = 320
+
+        /** Côté maximal des pochettes chargées pour la session (notification, écran verrouillé, Android Auto). */
+        const val ARTWORK_MAX_PX = 1024
+
+        /** Les navigateurs sont prévenus d'un changement du catalogue au plus toutes les 1,5 s. */
+        private const val CATALOG_NOTIFY_DEBOUNCE_MS = 1_500L
 
         /** Au-delà, le livre reste « terminé » malgré une petite marge de position. */
         private const val FINISHED_PERCENT = 99f

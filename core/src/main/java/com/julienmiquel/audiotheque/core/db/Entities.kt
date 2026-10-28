@@ -1,5 +1,6 @@
 package com.julienmiquel.audiotheque.core.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
@@ -63,10 +64,13 @@ data class BookEntity(
     val durationExact: Boolean = false,
     val sizeBytes: Long = 0,
     val trackCount: Int = 0,
-    /** Pochette locale (image du dossier Drive ou image intégrée aux tags). */
+    /** Pochette locale (image du dossier Drive, image intégrée aux tags, ou pochette téléchargée). */
     val coverPath: String? = null,
-    /** Pochette Google Books. */
+    /** Pochette Google Books (ou Open Library). */
     val coverUrl: String? = null,
+    /** Pochette téléchargée en ligne : à déposer dans le dossier Drive du livre (« cover.jpg »). */
+    @ColumnInfo(defaultValue = "0")
+    val coverUploadPending: Boolean = false,
     val summary: String? = null,
     /** Date d'ajout (createdTime Drive). */
     val addedAt: Long,
@@ -80,6 +84,9 @@ data class BookEntity(
     val hidden: Boolean = false,
     /** Nom du dossier local attribué (unique, même en cas de doublon de nom). */
     val localDirName: String? = null,
+    /** Suppression demandée (doublon) : masqué aussitôt, dossier mis à la corbeille Drive par la file d'opérations. */
+    @ColumnInfo(defaultValue = "0")
+    val trashPending: Boolean = false,
 )
 
 /** Piste = un fichier audio du dossier du livre. */
@@ -136,9 +143,11 @@ data class ProgressEntity(
     val finished: Boolean = false,
     val setAsideAtPercent: Float? = null,
     val updatedAt: Long,
-    /** À écrire dans l'espace caché Drive (appDataFolder). */
+    /** À écrire dans le fichier de progression du dossier Drive du livre. */
     val dirty: Boolean = true,
+    /** Fichier de progression dans Drive (dossier du livre), une fois connu. */
     val remoteFileId: String? = null,
+    /** modifiedTime Drive du fichier tel que lu ou écrit la dernière fois. */
     val remoteSyncedAt: Long? = null,
 )
 

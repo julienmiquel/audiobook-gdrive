@@ -71,6 +71,9 @@ enum class SyncEventType {
     /** Livre apparu ou disparu de la bibliothèque Drive. */
     LIBRARY_CHANGE,
 
+    /** Position d'écoute reprise depuis Drive (enregistrée par un autre téléphone). */
+    PROGRESS,
+
     /** Erreur. */
     ERROR,
 }
@@ -92,5 +95,11 @@ enum class SyncTrigger {
     WIFI,
 }
 
-/** Opérations de la file (seules écritures Drive : déplacer un dossier de livre). */
-enum class OperationType { MOVE_BOOK }
+/** Opérations de la file (écritures Drive sur les dossiers de livres). */
+enum class OperationType {
+    /** Déplacer le dossier d'un livre (geste de statut). */
+    MOVE_BOOK,
+
+    /** Mettre le dossier d'un livre à la corbeille Drive (doublon supprimé par l'utilisateur ; restaurable 30 jours). */
+    TRASH_BOOK,
+}

@@ -1,6 +1,5 @@
 package com.julienmiquel.audiotheque.sync.engine
 
-import androidx.room.withTransaction
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
@@ -96,7 +95,7 @@ class Downloader(
         val withProgress = candidates.filter { it.kind != BookKind.ZIP }.distinctBy { it.driveId }
             .map { it to progressDao.get(it.driveId, s.accountKey) }
             .sortedWith(
-                compareByDescending<Pair<BookEntity, com.julienmiquel.audiotheque.core.db.ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
+                compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
                     .thenByDescending { it.first.effectiveStatusChangedAt },
             )
         val result = mutableListOf<Task>()
@@ -440,98 +439,5 @@ class Cleaner(
             val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
             CleanupPolicy.deadline(book, track.sortIndex, pairMode, s)?.takeIf { it > now }
         }.minOrNull()
-    }
-}
-
-/**
- * Progression par utilisateur dans l'espace caché de l'app sur le Drive de chaque compte
- * (appDataFolder) : elle suit l'utilisateur d'un téléphone à l'autre sans mélanger les positions
- * des membres de la famille. Le plus récent l'emporte.
- *
- * Les dates de synchro sont celles de Drive (modifiedTime), jamais l'horloge du téléphone : un
- * téléphone en avance ou en retard ne fait pas manquer une mise à jour venue d'ailleurs.
- */
-class ProgressSync(
-    private val db: AppDatabase,
-    private val clock: Clock,
-    private val deviceName: String,
-) {
-    suspend fun run(drive: DriveService, account: String) {
-        val dao = db.progressDao()
-        // Un fichier par livre. Si deux téléphones en ont créé un au même moment, le plus récent.
-        val remoteByBook = drive.listAppData()
-            .mapNotNull { file -> ProgressJson.bookIdFromFileName(file.name)?.let { it to file } }
-            .groupBy({ it.first }, { it.second })
-            .mapValues { (_, files) -> files.maxBy { it.modifiedTime ?: 0L } }
-
-        for (local in dao.dirty(account)) {
-            val payload = ProgressJson(
-                bookId = local.bookId,
-                trackId = local.trackId,
-                trackIndex = local.trackIndex,
-                positionMs = local.positionMs,
-                speed = local.speed,
-                percent = local.percent,
-                lastListenedAt = local.lastListenedAt,
-                finished = local.finished,
-                setAsideAtPercent = local.setAsideAtPercent,
-                updatedAt = local.updatedAt,
-                device = deviceName,
-            )
-            val id = local.remoteFileId ?: remoteByBook[local.bookId]?.id
-            val file = if (id != null) {
-                runCatching { drive.updateAppData(id, ProgressJson.encode(payload)) }.getOrElse { e ->
-                    if (e is DriveNotFoundException) {
-                        drive.createAppData(ProgressJson.fileName(local.bookId), ProgressJson.encode(payload))
-                    } else {
-                        throw e
-                    }
-                }
-            } else {
-                drive.createAppData(ProgressJson.fileName(local.bookId), ProgressJson.encode(payload))
-            }
-            // Sans effet si le lecteur a enregistré une position plus récente entre-temps.
-            dao.markSynced(local.bookId, account, local.updatedAt, file.id, file.modifiedTime ?: 0L)
-        }
-
-        for ((bookId, file) in remoteByBook) {
-            val known = dao.get(bookId, account)
-            if (known?.dirty == true) continue
-            val remoteModified = file.modifiedTime
-            val alreadySeen = known != null && known.remoteFileId == file.id && remoteModified != null &&
-                known.remoteSyncedAt?.let { remoteModified <= it } == true
-            if (alreadySeen) continue
-            val json = runCatching { ProgressJson.decode(drive.readAppData(file.id)) }.getOrNull() ?: continue
-            db.withTransaction {
-                // Relu dans la transaction : une position enregistrée pendant la lecture du JSON gagne.
-                val local = dao.get(bookId, account)
-                when {
-                    local?.dirty == true -> Unit
-                    local != null && local.updatedAt > json.updatedAt && local.remoteFileId != null && local.remoteFileId != file.id ->
-                        // Deux fichiers pour ce livre : notre position, plus récente, ira dans le plus récent.
-                        dao.upsert(local.copy(dirty = true, remoteFileId = file.id))
-                    local != null && local.updatedAt >= json.updatedAt ->
-                        dao.markSynced(bookId, account, local.updatedAt, file.id, remoteModified ?: 0L)
-                    else -> dao.upsert(
-                        ProgressEntity(
-                            bookId = bookId,
-                            account = account,
-                            trackId = json.trackId,
-                            trackIndex = json.trackIndex,
-                            positionMs = json.positionMs,
-                            speed = json.speed,
-                            percent = json.percent,
-                            lastListenedAt = json.lastListenedAt,
-                            finished = json.finished,
-                            setAsideAtPercent = json.setAsideAtPercent,
-                            updatedAt = json.updatedAt,
-                            dirty = false,
-                            remoteFileId = file.id,
-                            remoteSyncedAt = remoteModified ?: 0L,
-                        ),
-                    )
-                }
-            }
-        }
     }
 }

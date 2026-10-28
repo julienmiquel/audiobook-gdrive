@@ -11,6 +11,7 @@ import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
+import com.julienmiquel.audiotheque.core.sync.RemoteProgress
 import com.julienmiquel.audiotheque.sync.drive.DriveAbout
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
 import com.julienmiquel.audiotheque.sync.drive.DriveFile
@@ -72,8 +73,10 @@ fun interface DriveProvider {
 /**
  * Moteur de synchro : seul composant qui parle à Drive. Une exécution enchaîne la file de
  * déplacements, la détection des changements, les pistes de _En écoute (listées puis
- * téléchargées en priorité), les métadonnées du reste de la bibliothèque, le nettoyage selon le
- * statut et la progression dans l'espace caché.
+ * téléchargées en priorité), les métadonnées du reste de la bibliothèque, le dépôt des pochettes
+ * téléchargées, le nettoyage selon le statut et la progression dans le dossier Drive de chaque
+ * livre. Le lecteur dispose en plus d'échanges légers de progression ([pushProgress],
+ * [pullProgress]) pour continuer un livre d'un téléphone à l'autre sans attendre une synchro.
  */
 class SyncEngine(
     private val db: AppDatabase,
@@ -97,12 +100,13 @@ class SyncEngine(
 
     private val history = HistoryLogger(db, clock)
     private val localFiles = LocalFiles(db, storage)
-    private val executor = OperationExecutor(db, history, clock)
+    private val executor = OperationExecutor(db, history, clock, localFiles)
     private val scanner = LibraryScanner(db, settings, history, localFiles, storage, clock, isBookInUse)
     private val prober = MetadataProber(db, history, localFiles, storage, clock)
     private val downloader = Downloader(db, settings, storage, history, transfers, inspector, clock)
     private val cleaner = Cleaner(db, settings, localFiles, storage, history, clock, isBookInUse)
-    private val progressSync = ProgressSync(db, clock, deviceName)
+    private val progressSync = ProgressSync(db, history, clock, deviceName)
+    private val covers = CoverUploader(db, history)
 
     private val mutex = Mutex()
     private val rerunRequested = AtomicBoolean(false)
@@ -216,20 +220,71 @@ class SyncEngine(
     }
 
     /**
-     * Déconnexion : dernière écriture de la progression dans l'espace caché du compte, une fois
-     * la synchro en cours terminée. Retourne faux si elle n'a pas pu être faite.
+     * Déconnexion : dernière écriture de la progression dans les dossiers Drive des livres, une
+     * fois la synchro en cours terminée. Retourne faux si elle n'a pas pu être faite.
      */
     suspend fun pushProgressBeforeSignOut(): Boolean = mutex.withLock {
         val s = settings.current()
         if (s.accountKey == Accounts.LOCAL) return@withLock true
         val drive = driveProvider.get() ?: return@withLock false
         try {
-            progressSync.run(drive, s.accountKey)
+            progressSync.push(drive, s.accountKey, bookId = null)
             true
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             false
+        }
+    }
+
+    // ------------------------------------------------------------------ progression (lecteur, premier plan)
+
+    /**
+     * Lecteur, après une pause ou un déplacement : la position du livre ([bookId], ou tout ce qui
+     * est à envoyer) part dans son dossier Drive, sans attendre une synchro complète ni la fin
+     * d'une synchro en cours. Retourne faux si Drive n'a pas pu être joint.
+     */
+    suspend fun pushProgress(bookId: String?): Boolean = lightweight { drive, account ->
+        progressSync.push(drive, account, bookId)
+        true
+    } ?: false
+
+    /**
+     * Lecteur, juste avant une lecture : relit la position du livre dans Drive. Retourne la
+     * position adoptée si un autre téléphone en a enregistré une plus récente.
+     */
+    suspend fun pullProgress(bookId: String): RemoteProgress? = lightweight { drive, account ->
+        progressSync.pull(drive, account, bookId)
+    }
+
+    /**
+     * Retour de l'app au premier plan : positions à envoyer envoyées, positions changées dans
+     * Drive relues (une requête). Retourne les positions reprises d'un autre appareil.
+     */
+    suspend fun syncProgress(): List<RemoteProgress> = lightweight { drive, account ->
+        progressSync.run(drive, account)
+    }.orEmpty()
+
+    /** Pochettes téléchargées en ligne, déposées dans le dossier Drive de leur livre (pas sur réseau mesuré en « Wi-Fi uniquement »). */
+    suspend fun uploadPendingCovers(): Int = lightweight { drive, _ ->
+        if (contentAllowed()) covers.run(drive, null) else 0
+    } ?: 0
+
+    /** Appel Drive léger : compte connecté et réseau présents, erreurs avalées (la synchro complète les signalera). */
+    private suspend fun <T> lightweight(block: suspend (DriveService, String) -> T): T? {
+        val s = settings.current()
+        if (!s.isConnected || s.accountKey == Accounts.LOCAL || !network.isConnected()) return null
+        val drive = driveProvider.get() ?: return null
+        return try {
+            block(drive, s.accountKey)
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: DriveAuthException) {
+            null
+        } catch (e: IOException) {
+            null
+        } catch (e: Exception) {
+            null
         }
     }
 
@@ -412,6 +467,8 @@ class SyncEngine(
             if (prober.run(drive, ctx, scope = ProbeScope.LIBRARY, allowContent = wifiRuleOk()) { detail(it) }) {
                 ctx.waitingForWifi = true
             }
+            // Pochettes téléchargées en ligne : déposées dans le dossier Drive du livre.
+            if (wifiRuleOk()) covers.run(drive, ctx)
             executor.flush(drive, ctx)
         }
 
@@ -421,7 +478,7 @@ class SyncEngine(
 
         if (s.accountKey != Accounts.LOCAL) {
             phase(SyncPhase.PROGRESS)
-            progressSync.run(drive, s.accountKey)
+            progressSync.run(drive, s.accountKey, ctx.runId)
         }
 
         phase(SyncPhase.FINISHING)

@@ -71,6 +71,7 @@ object Labels {
         SyncEventType.DRIVE_MOVE -> "Déplacement Drive"
         SyncEventType.STATUS_FROM_DRIVE -> "Statut mis à jour depuis Drive"
         SyncEventType.LIBRARY_CHANGE -> "Bibliothèque"
+        SyncEventType.PROGRESS -> "Position reprise"
         SyncEventType.ERROR -> "Erreur"
     }
 
