@@ -35,7 +35,7 @@ enum class BookKind {
     /** Une piste isolée hors dossier, traitée comme un livre d'une seule piste. */
     SINGLE_FILE,
 
-    /** Livre livré en zip : affiché avec un badge, non lisible en v1. */
+    /** Livre livré en archive .zip : décompressé localement à la demande et lu hors ligne. */
     ZIP,
 }
 
@@ -99,6 +99,9 @@ enum class SyncTrigger {
 enum class OperationType {
     /** Déplacer le dossier d'un livre (geste de statut). */
     MOVE_BOOK,
+
+    /** Renommer le dossier (ou le fichier) d'un livre dans Drive selon la convention « Titre - AUTEUR ». */
+    RENAME_BOOK,
 
     /** Mettre le dossier d'un livre à la corbeille Drive (doublon supprimé par l'utilisateur ; restaurable 30 jours). */
     TRASH_BOOK,

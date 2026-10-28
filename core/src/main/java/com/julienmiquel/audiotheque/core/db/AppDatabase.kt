@@ -22,7 +22,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PendingOperationEntity::class,
         SyncPairEntity::class,
     ],
-    version = 5,
+    version = 6,
     exportSchema = true,
     autoMigrations = [
         // v2 : clé d'auteur pour les doublons (colonne facultative, remplie au fil des synchros).
@@ -33,6 +33,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AutoMigration(from = 3, to = 4),
         // v5 : préréglage audio par livre et chapitres embarqués (.m4b / ID3 CHAP).
         AutoMigration(from = 4, to = 5),
+        // v6 : renommage normalisé dans Drive (« Titre - AUTEUR ») via la file d'opérations.
+        AutoMigration(from = 5, to = 6),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {

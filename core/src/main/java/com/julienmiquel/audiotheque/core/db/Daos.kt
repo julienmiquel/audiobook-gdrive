@@ -8,6 +8,7 @@ import androidx.room.Transaction
 import androidx.room.Update
 import androidx.room.Upsert
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.TrackState
 import kotlinx.coroutines.flow.Flow
 
@@ -76,6 +77,9 @@ interface BookDao {
 
     @Query("UPDATE books SET pendingStatus = :status, pendingParentId = :parentId, pendingSince = :since WHERE driveId = :id")
     suspend fun setPending(id: String, status: BookStatus?, parentId: String?, since: Long?)
+
+    @Query("UPDATE books SET pendingName = :pendingName WHERE driveId = :id")
+    suspend fun setPendingName(id: String, pendingName: String?)
 
     @Query(
         """
@@ -403,12 +407,22 @@ interface PendingOperationDao {
     @Query("SELECT * FROM pending_ops WHERE bookId = :bookId ORDER BY createdAt DESC, id DESC LIMIT 1")
     suspend fun latestForBook(bookId: String): PendingOperationEntity?
 
+    @Query("SELECT * FROM pending_ops WHERE bookId = :bookId AND type = :type ORDER BY createdAt DESC, id DESC LIMIT 1")
+    suspend fun latestOfType(bookId: String, type: OperationType): PendingOperationEntity?
+
     @Query("DELETE FROM pending_ops WHERE bookId = :bookId")
     suspend fun deleteForBook(bookId: String)
+
+    @Query("DELETE FROM pending_ops WHERE bookId = :bookId AND type = :type")
+    suspend fun deleteByBookAndType(bookId: String, type: OperationType)
 
     /** Supprime l'opération seulement si sa cible n'a pas changé entre-temps. */
     @Query("DELETE FROM pending_ops WHERE id = :id AND toParentId = :toParentId")
     suspend fun deleteIfTarget(id: Long, toParentId: String): Int
+
+    /** Supprime le renommage seulement si le nom visé n'a pas changé entre-temps. */
+    @Query("DELETE FROM pending_ops WHERE id = :id AND targetName = :targetName")
+    suspend fun deleteIfRenameTarget(id: Long, targetName: String): Int
 
     @Query("SELECT COUNT(*) FROM pending_ops")
     fun observeCount(): Flow<Int>

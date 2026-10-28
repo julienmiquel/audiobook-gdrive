@@ -128,6 +128,9 @@ interface DriveService {
     /** files.update avec addParents = nouveau statut, removeParents = ancien. */
     suspend fun move(fileId: String, addParent: String, removeParents: List<String>): DriveFile
 
+    /** files.update avec name = nouveau nom (normalisation « Titre - AUTEUR »). */
+    suspend fun rename(fileId: String, newName: String): DriveFile
+
     /** files.update avec trashed = true : corbeille Drive (restaurable 30 jours), jamais de suppression définitive. */
     suspend fun trash(fileId: String): DriveFile
 

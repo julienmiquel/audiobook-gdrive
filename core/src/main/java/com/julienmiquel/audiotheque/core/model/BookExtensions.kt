@@ -15,6 +15,9 @@ val BookEntity.effectiveStatusChangedAt: Long get() = pendingSince ?: statusChan
 
 val BookEntity.hasPendingMove: Boolean get() = pendingStatus != null
 
+/** Nom du dossier/fichier dans Drive en tenant compte d'un renommage en attente. */
+val BookEntity.effectiveDriveName: String get() = pendingName ?: name
+
 /** Titre affiché : correction de l'utilisateur, sinon découpage automatique du nom. */
 val BookEntity.displayTitle: String
     get() = customTitle?.takeIf { it.isNotBlank() } ?: parsedTitle
@@ -31,7 +34,7 @@ val BookEntity.displayNarrator: String?
 val BookEntity.expectedAuthorKey: String?
     get() = TextNormalizer.keyOrNull(displayAuthor)
 
-val BookEntity.isPlayableKind: Boolean get() = kind != BookKind.ZIP
+val BookEntity.isPlayableKind: Boolean get() = true
 
 /** « Partie 4 · chapitre 4 », « Chapitre 12 » ou « Piste 3 ». */
 val TrackEntity.chapterLabel: String

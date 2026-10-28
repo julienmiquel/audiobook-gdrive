@@ -205,7 +205,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         c.selectedBookId,
         c.settings.settings.map { it.lastPlayedBookId }.distinctUntilChanged(),
         c.library.observeLibrary().map { items ->
-            items.filter { it.status == BookStatus.IN_PROGRESS && !it.isZip }.maxByOrNull { it.lastListenedAt ?: 0L }?.id
+            items.filter { it.status == BookStatus.IN_PROGRESS }.maxByOrNull { it.lastListenedAt ?: 0L }?.id
         }.distinctUntilChanged(),
     ) { selected, last, inProgress -> selected ?: last ?: inProgress }.distinctUntilChanged()
 
@@ -348,7 +348,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
     fun ensureLoaded() {
         val s = state.value
         val id = s.bookId ?: return
-        if (!s.isCurrent && s.presentCount > 0 && !s.anotherBookPlaying && s.item?.isZip != true) {
+        if (!s.isCurrent && s.presentCount > 0 && !s.anotherBookPlaying) {
             c.playBook(id, autoPlay = false)
         }
     }
@@ -548,7 +548,7 @@ private const val SHEET_HISTORY = "history"
 
 @Composable
 private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: PlayerViewModel, modifier: Modifier, onOpenSheet: (String) -> Unit) {
-    val canPlay = !item.isZip && state.presentCount > 0
+    val canPlay = state.presentCount > 0
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -632,7 +632,7 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
 
         StatusAction(item, vm)
 
-        if (state.presentCount < item.trackCount && !item.isZip) {
+        if (state.presentCount < item.trackCount || (item.isZip && item.trackCount == 0)) {
             DownloadStatus(state, item)
         }
         if (state.progress?.finished == true && item.status != BookStatus.DONE && item.status != BookStatus.ARCHIVED) {
@@ -785,7 +785,7 @@ private fun StatusAction(item: LibraryItem, vm: PlayerViewModel) {
     OutlinedButton(onClick = { vm.gesture(gesture) }) { Text(gesture.label) }
     val hint = when (gesture) {
         Gesture.REPRENDRE -> "Le dossier revient dans « En écoute » : ses pistes sont (re)téléchargées et la lecture reprend à la position gardée."
-        Gesture.COMMENCER -> "Le dossier passe dans « En écoute » : toutes ses pistes sont téléchargées pour une écoute hors ligne."
+        Gesture.COMMENCER -> "Le livre passe dans « En écoute » : toutes ses pistes sont téléchargées pour une écoute hors ligne."
         else -> null
     }
     hint?.let {
@@ -802,6 +802,10 @@ private fun StatusAction(item: LibraryItem, vm: PlayerViewModel) {
 private fun DownloadStatus(state: PlayerScreenState, item: LibraryItem) {
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
         val text = when {
+            item.isZip && item.trackCount == 0 && item.status == BookStatus.IN_PROGRESS ->
+                "Archive .zip en attente de téléchargement et de décompression sur le téléphone…"
+            item.isZip && item.trackCount == 0 ->
+                "Archive .zip sur Drive : touchez « Commencer » pour la télécharger et la décompresser."
             item.trackCount == 0 -> "Pistes en cours d'inventaire…"
             state.presentCount == 0 && item.status == BookStatus.IN_PROGRESS -> "Téléchargement en attente : la lecture démarre dès la première piste reçue."
             state.presentCount == 0 -> "Ce livre n'est pas sur le téléphone. Commencez-le pour le télécharger en entier."

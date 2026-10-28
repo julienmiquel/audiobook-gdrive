@@ -436,9 +436,16 @@ class SyncEngine(
 
         var networkLost = false
         val planned = downloader.plan()
-        if (planned.isNotEmpty()) {
+        val plannedZips = downloader.zipPlan()
+        val totalPlanned = planned.size + plannedZips.size
+        if (totalPlanned > 0) {
             if (!wifiRuleOk()) {
-                ctx.note = "Téléchargements en attente du Wi-Fi (${planned.size} pistes)"
+                val label = when {
+                    planned.isNotEmpty() && plannedZips.isNotEmpty() -> "${planned.size} pistes, ${plannedZips.size} archives"
+                    plannedZips.isNotEmpty() -> "${plannedZips.size} archive(s) .zip"
+                    else -> "${planned.size} pistes"
+                }
+                ctx.note = "Téléchargements en attente du Wi-Fi ($label)"
                 ctx.waitingForWifi = true
             } else {
                 onDownloadsStart()

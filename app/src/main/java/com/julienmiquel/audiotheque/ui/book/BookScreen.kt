@@ -199,12 +199,17 @@ class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel
 
     fun play(trackId: String? = null, positionMs: Long? = null) = c.playBook(bookId, trackId, positionMs)
 
-    fun saveCorrections(title: String, author: String, narrator: String) {
+    fun saveCorrections(title: String, author: String, narrator: String, renameDriveTo: String? = null) {
         viewModelScope.launch {
             c.editor.save(bookId, title, author, narrator)
+            if (renameDriveTo != null) {
+                c.renameBookInDrive(bookId, renameDriveTo)
+            }
             if (c.settings.current().googleBooksEnrichment) c.enrich(bookId, manual = false)
         }
     }
+
+    fun renameInDrive(newName: String) = c.renameBookInDrive(bookId, newName)
 
     fun confirmTitle() {
         viewModelScope.launch {
@@ -246,6 +251,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
     val state by vm.state.collectAsStateWithLifecycle()
     var menu by remember { mutableStateOf(false) }
     var editing by rememberSaveable { mutableStateOf(false) }
+    var renaming by rememberSaveable { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
 
     /** Exemplaire dont la suppression est à confirmer (cet exemplaire ou un autre). */
@@ -276,6 +282,14 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                                     onClick = {
                                         menu = false
                                         editing = true
+                                    },
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("Normaliser le nom sur Drive…") },
+                                    leadingIcon = { Icon(Icons.Filled.CloudUpload, null) },
+                                    onClick = {
+                                        menu = false
+                                        renaming = true
                                     },
                                 )
                                 DropdownMenuItem(
@@ -374,9 +388,19 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
         EditDialog(
             item = item,
             onDismiss = { editing = false },
-            onSave = { t, a, n ->
-                vm.saveCorrections(t, a, n)
+            onSave = { t, a, n, renameTarget ->
+                vm.saveCorrections(t, a, n, renameTarget)
                 editing = false
+            },
+        )
+    }
+    if (renaming && item != null) {
+        RenameDriveDialog(
+            item = item,
+            onDismiss = { renaming = false },
+            onRename = { newName ->
+                vm.renameInDrive(newName)
+                renaming = false
             },
         )
     }
@@ -445,7 +469,7 @@ private fun BookContent(
             item(key = "confirm") {
                 InfoCard(title = "Titre et auteur à confirmer", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
                     Text(
-                        "Découpage proposé d'après le nom du dossier Drive « ${book.name} ». Le dossier n'est jamais renommé : la correction reste dans l'app.",
+                        "Découpage proposé d'après « ${book.pendingName ?: book.name} ». Vous pouvez confirmer ou corriger ces informations (et normaliser le nom sur Drive si souhaité).",
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -585,12 +609,12 @@ private fun BookContent(
                             track = track,
                             isCurrent = progress?.trackId == track.driveId && embedded.size <= 1,
                             transfer = state.transfers[track.driveId],
-                            playable = item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP,
+                            playable = true,
                             onPlay = { onPlay(track.driveId, 0L) },
                         )
                     }
                     if (embedded.size > 1) {
-                        val present = track.state == TrackState.PRESENT && item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP
+                        val present = track.state == TrackState.PRESENT
                         val activeCh = if (progress?.trackId == track.driveId) {
                             (embedded.lastOrNull { progress.positionMs >= it.startMs } ?: embedded.first()).chapterIndex
                         } else {
@@ -630,6 +654,32 @@ private fun BookContent(
                     }
                 }
             }
+        } else if (book.kind == com.julienmiquel.audiotheque.core.model.BookKind.ZIP) {
+            item(key = "zip-pending") {
+                val transfer = state.transfers[book.driveId]
+                InfoCard(title = "Archive .zip", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
+                    if (transfer != null && transfer.totalBytes > 0) {
+                        Text(
+                            "Téléchargement et décompression en cours : ${Formats.size(transfer.doneBytes)} / ${Formats.size(transfer.totalBytes)}",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        androidx.compose.material3.LinearProgressIndicator(
+                            progress = { (transfer.doneBytes.toFloat() / transfer.totalBytes).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        Text(
+                            if (item.status == BookStatus.IN_PROGRESS) {
+                                "L'archive .zip sera téléchargée puis décompressée sur le téléphone à la synchro en cours."
+                            } else {
+                                "Archive .zip sur Drive : touchez « Commencer » pour la télécharger et décompresser automatiquement ses pistes hors ligne."
+                            },
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
         } else if (book.kind == com.julienmiquel.audiotheque.core.model.BookKind.FOLDER) {
             item(key = "no-tracks") {
                 Text(
@@ -654,8 +704,15 @@ private fun Header(item: LibraryItem) {
             item.narrator?.let { Text("Lu par $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 StatusTag(item.status)
-                if (item.pendingSync) Tag("déplacement Drive en attente", icon = Icons.Filled.CloudUpload)
-                if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip, container = MaterialTheme.colorScheme.errorContainer, content = MaterialTheme.colorScheme.onErrorContainer)
+                if (item.pendingSync) {
+                    val label = when {
+                        item.book.pendingName != null && item.book.pendingStatus == null -> "renommage Drive en attente"
+                        item.book.pendingName != null -> "opérations Drive en attente"
+                        else -> "déplacement Drive en attente"
+                    }
+                    Tag(label, icon = Icons.Filled.CloudUpload)
+                }
+                if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip)
                 if (item.finished) Tag("terminé", icon = Icons.Filled.DoneAll)
             }
         }
@@ -664,17 +721,10 @@ private fun Header(item: LibraryItem) {
 
 @Composable
 private fun Actions(state: BookUiState, item: LibraryItem, onPlay: (String?, Long?) -> Unit, onGesture: (Gesture) -> Unit, onMove: () -> Unit) {
-    val gestures = Gesture.forStatus(item.status).filter { !(item.isZip && (it == Gesture.COMMENCER || it == Gesture.REPRENDRE || it == Gesture.REECOUTER)) }
+    val gestures = Gesture.forStatus(item.status)
     Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        if (item.isZip) {
-            Text(
-                "Livre au format zip : affiché pour mémoire, non lisible dans cette version.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.error,
-            )
-        }
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!item.isZip && item.presentTracks > 0) {
+            if (item.presentTracks > 0) {
                 val resume = (state.progress?.percent ?: 0f) > 0f && state.progress?.finished != true
                 Button(onClick = { onPlay(null, null) }) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -720,7 +770,8 @@ private fun InfoSection(state: BookUiState, item: LibraryItem) {
             InfoRow("Sur le téléphone", "${local.size}/${book.trackCount} · ${Formats.size(local.sumOf { it.sizeBytes })}")
         }
         book.localDirName?.let { dir -> InfoRow("Dossier local", "${state.localRoot ?: "Audiobooks"}/$dir") }
-        InfoRow("Dossier Drive", book.name)
+        InfoRow(if (item.isZip) "Archive Drive" else "Dossier Drive", book.name)
+        book.pendingName?.let { pending -> InfoRow("Renommage en attente", pending) }
         InfoRow("Ajouté le", Formats.date(book.addedAt))
         InfoRow("Statut changé le", Formats.date(book.effectiveStatusChangedAt))
         cleanupInfo(state, item)?.let { (label, value) -> InfoRow(label, value) }
@@ -782,17 +833,25 @@ private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?
 }
 
 @Composable
-private fun EditDialog(item: LibraryItem, onDismiss: () -> Unit, onSave: (String, String, String) -> Unit) {
+private fun EditDialog(item: LibraryItem, onDismiss: () -> Unit, onSave: (String, String, String, String?) -> Unit) {
     var title by rememberSaveable { mutableStateOf(item.title) }
     var author by rememberSaveable { mutableStateOf(item.author.orEmpty()) }
     var narrator by rememberSaveable { mutableStateOf(item.narrator.orEmpty()) }
+    var renameOnDrive by rememberSaveable { mutableStateOf(false) }
+    val currentDriveName = item.book.pendingName ?: item.book.name
+    val normalizedPreview = com.julienmiquel.audiotheque.core.parse.FolderNameParser.normalizedDriveName(
+        title = title.ifBlank { item.title },
+        author = author.ifBlank { null },
+        originalName = currentDriveName,
+        kind = item.book.kind,
+    )
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text("Corriger le livre") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Dossier Drive : « ${item.book.name} ». Il n'est pas renommé : la correction est gardée par l'app.",
+                    "Nom actuel sur Drive : « $currentDriveName ».",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -806,9 +865,87 @@ private fun EditDialog(item: LibraryItem, onDismiss: () -> Unit, onSave: (String
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { renameOnDrive = !renameOnDrive }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    androidx.compose.material3.Checkbox(checked = renameOnDrive, onCheckedChange = { renameOnDrive = it })
+                    Spacer(Modifier.width(8.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text("Normaliser aussi le nom sur Drive", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "→ « $normalizedPreview »",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = { onSave(title, author, narrator) }, enabled = title.isNotBlank()) { Text("Enregistrer") } },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val target = if (renameOnDrive && normalizedPreview.isNotBlank() && normalizedPreview != currentDriveName) normalizedPreview else null
+                    onSave(title, author, narrator, target)
+                },
+                enabled = title.isNotBlank(),
+            ) { Text("Enregistrer") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
+    )
+}
+
+@Composable
+private fun RenameDriveDialog(item: LibraryItem, onDismiss: () -> Unit, onRename: (String) -> Unit) {
+    val currentDriveName = item.book.pendingName ?: item.book.name
+    val suggested = remember(item.title, item.author, currentDriveName, item.book.kind) {
+        com.julienmiquel.audiotheque.core.parse.FolderNameParser.normalizedDriveName(
+            title = item.title,
+            author = item.author,
+            originalName = currentDriveName,
+            kind = item.book.kind,
+        )
+    }
+    var name by rememberSaveable { mutableStateOf(suggested) }
+    val sanitized = com.julienmiquel.audiotheque.core.parse.FolderNameParser.sanitizeDriveName(name)
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Normaliser le nom sur Drive") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "Renomme directement l'élément dans Google Drive (aussitôt ou dès le retour du réseau, annulable pendant 10 s).",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    "Actuel : « $currentDriveName »",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text("Nouveau nom sur Drive") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                if (name != suggested) {
+                    TextButton(onClick = { name = suggested }) {
+                        Text("Rétablir « $suggested »")
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onRename(sanitized) },
+                enabled = sanitized.isNotBlank() && sanitized != currentDriveName,
+            ) { Text("Renommer sur Drive") }
+        },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Annuler") } },
     )
 }

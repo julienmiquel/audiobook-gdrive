@@ -31,8 +31,11 @@ import com.julienmiquel.audiotheque.sync.engine.NetworkStatus
 import com.julienmiquel.audiotheque.sync.engine.ProgressJson
 import com.julienmiquel.audiotheque.sync.engine.SyncEngine
 import com.julienmiquel.audiotheque.sync.engine.md5Hex
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.util.Collections
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.After
@@ -709,5 +712,135 @@ class SyncEngineTest {
         assertThat(db.pendingOperationDao().all()).isEmpty()
         // Hors des dossiers suivis : il quitte la bibliothèque par l'inventaire, pas par la corbeille.
         assertThat(events().any { it.type == SyncEventType.ERROR && it.bookId == doomed.driveId && it.message.orEmpty().contains("Drive fait foi") }).isTrue()
+    }
+
+    // ------------------------------------------------------------------ archives .zip & renommage Drive
+
+    @Test
+    fun `archive zip - téléchargée, décompressée hors ligne et progression synchronisée`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+
+        val zipBytes = ByteArrayOutputStream().apply {
+            ZipOutputStream(this).use { zos ->
+                zos.putNextEntry(ZipEntry("Voyage au centre de la Terre/02 - Chapitre 2.mp3"))
+                zos.write(File(fixtures, "chapitre_2.mp3").readBytes())
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("Voyage au centre de la Terre/01 - Chapitre 1.mp3"))
+                zos.write(File(fixtures, "chapitre_1.mp3").readBytes())
+                zos.closeEntry()
+                zos.putNextEntry(ZipEntry("Voyage au centre de la Terre/cover.jpg"))
+                zos.write(File(fixtures, "cover_police.jpg").readBytes())
+                zos.closeEntry()
+            }
+        }.toByteArray()
+
+        val created = fake.createFile("Voyage au centre de la Terre - Jules VERNE.zip", D.NEW_ID, zipBytes, "application/zip")
+        engine.sync(SyncTrigger.PERIODIC)
+
+        val zipBook = db.bookDao().get(created.id)!!
+        assertThat(zipBook.kind).isEqualTo(BookKind.ZIP)
+        assertThat(zipBook.trackCount).isEqualTo(0)
+
+        // Déplacement vers _En écoute : l'archive est téléchargée, décompressée et supprimée.
+        queueMove(zipBook, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        val extractedBook = db.bookDao().get(created.id)!!
+        val extractedTracks = db.trackDao().forBook(created.id)
+        assertThat(extractedBook.trackCount).isEqualTo(2)
+        assertThat(extractedBook.durationExact).isTrue()
+        assertThat(extractedBook.durationMs).isGreaterThan(0L)
+        assertThat(extractedBook.coverPath?.let(::File)?.exists()).isTrue()
+        assertThat(extractedTracks).hasSize(2)
+        assertThat(extractedTracks[0].name).isEqualTo("01 - Chapitre 1.mp3")
+        assertThat(extractedTracks[1].name).isEqualTo("02 - Chapitre 2.mp3")
+        assertThat(extractedTracks.all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+        assertThat(root.walkTopDown().none { it.name.endsWith(".zip.part") }).isTrue()
+
+        // Progression d'un livre .zip synchronisée dans le dossier de statut Drive.
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = created.id,
+                account = FakeDriveService.ACCOUNT,
+                trackId = extractedTracks[1].driveId,
+                trackIndex = 1,
+                positionMs = 4_200L,
+                percent = 55f,
+                lastListenedAt = now,
+                updatedAt = now,
+                dirty = true,
+            ),
+        )
+        assertThat(engine.pushProgress(created.id)).isTrue()
+        val synced = db.progressDao().get(created.id, FakeDriveService.ACCOUNT)!!
+        assertThat(synced.dirty).isFalse()
+        assertThat(synced.remoteFileId).isNotNull()
+    }
+
+    @Test
+    fun `renommage normalisé - mis en file hors ligne puis appliqué dans Drive au retour du réseau`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val target = book("Laurent Binet - PERSPECTIVE(S)")
+        val normalized = "Perspective(s) - Laurent BINET"
+
+        fake.offline = true
+        db.pendingOperationDao().insert(
+            PendingOperationEntity(
+                type = OperationType.RENAME_BOOK,
+                bookId = target.driveId,
+                fromParentId = target.parentId,
+                toParentId = target.parentId,
+                fromStatus = target.status,
+                toStatus = target.status,
+                createdAt = now,
+                targetName = normalized,
+            ),
+        )
+        db.bookDao().setPendingName(target.driveId, normalized)
+
+        val failed = engine.sync(SyncTrigger.STATUS_CHANGE)
+        assertThat(failed.result).isEqualTo(SyncResult.FAILED)
+        assertThat(db.bookDao().get(target.driveId)!!.pendingName).isEqualTo(normalized)
+
+        // Retour du réseau et délai de nouvel essai écoulé.
+        fake.offline = false
+        now += 60_000L
+        val ok = engine.sync(SyncTrigger.PERIODIC)
+        assertThat(ok.result).isEqualTo(SyncResult.SUCCESS)
+        assertThat(fake.getFile(target.driveId).name).isEqualTo(normalized)
+        val refreshed = db.bookDao().get(target.driveId)!!
+        assertThat(refreshed.name).isEqualTo(normalized)
+        assertThat(refreshed.pendingName).isNull()
+        assertThat(refreshed.parsedTitle).isEqualTo("Perspective(s)")
+        assertThat(refreshed.parsedAuthor).isEqualTo("Laurent Binet")
+        assertThat(db.pendingOperationDao().all()).isEmpty()
+    }
+
+    @Test
+    fun `renommage normalisé - refusé par Drive (403), l'ancien nom est conservé`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val target = book("Laurent Binet - PERSPECTIVE(S)")
+        fake.forbiddenMoves += target.driveId
+        db.pendingOperationDao().insert(
+            PendingOperationEntity(
+                type = OperationType.RENAME_BOOK,
+                bookId = target.driveId,
+                fromParentId = target.parentId,
+                toParentId = target.parentId,
+                fromStatus = target.status,
+                toStatus = target.status,
+                createdAt = now,
+                targetName = "Perspective(s) - Laurent BINET",
+            ),
+        )
+        db.bookDao().setPendingName(target.driveId, "Perspective(s) - Laurent BINET")
+
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+
+        val refreshed = db.bookDao().get(target.driveId)!!
+        assertThat(refreshed.name).isEqualTo("Laurent Binet - PERSPECTIVE(S)")
+        assertThat(refreshed.pendingName).isNull()
+        assertThat(db.pendingOperationDao().all()).isEmpty()
     }
 }

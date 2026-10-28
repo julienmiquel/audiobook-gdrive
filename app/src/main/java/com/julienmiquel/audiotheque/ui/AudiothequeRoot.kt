@@ -151,6 +151,7 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     LaunchedEffect(currentTab) { lastTab = currentTab }
     val engine by container.engine.status.collectAsStateWithLifecycle()
     val authRequired by container.authRequired.collectAsStateWithLifecycle(initialValue = false)
+    val libraryItems by container.library.observeLibrary().collectAsStateWithLifecycle(initialValue = emptyList())
     var finishedBook by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     NotificationPermission()
@@ -165,6 +166,18 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
                 duration = SnackbarDuration.Long,
             )
             if (result == SnackbarResult.ActionPerformed) container.undoMove(move)
+        }
+    }
+    // Bandeau « Annuler » : 10 s après un renommage Drive.
+    LaunchedEffect(Unit) {
+        container.renames.collectLatest { rename ->
+            val result = snackbar.showSnackbar(
+                message = "Drive : « ${rename.oldName} » → « ${rename.newName} »",
+                actionLabel = "Annuler",
+                withDismissAction = true,
+                duration = SnackbarDuration.Long,
+            )
+            if (result == SnackbarResult.ActionPerformed) container.undoRename(rename)
         }
     }
     LaunchedEffect(Unit) {
@@ -239,10 +252,60 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     }
 
     finishedBook?.let { (bookId, title) ->
+        val suggestions = remember(libraryItems, bookId) {
+            com.julienmiquel.audiotheque.library.BookRecommender.recommend(libraryItems, referenceBookId = bookId, limit = 3)
+        }
         AlertDialog(
             onDismissRequest = { finishedBook = null },
             title = { Text("Livre terminé") },
-            text = { Text("Vous avez écouté « $title » jusqu'au bout. Le marquer comme écouté et le ranger dans _Ecouté ?") },
+            text = {
+                Column {
+                    Text("Vous avez écouté « $title » jusqu'au bout. Le marquer comme écouté et le ranger dans _Ecouté ?")
+                    if (suggestions.isNotEmpty()) {
+                        androidx.compose.foundation.layout.Spacer(Modifier.padding(top = 12.dp))
+                        Text(
+                            "À écouter ensuite",
+                            style = MaterialTheme.typography.titleSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        suggestions.forEach { rec ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                com.julienmiquel.audiotheque.ui.common.BookCover(rec.item.cover, rec.item.title, size = 40.dp)
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        rec.item.title,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        rec.reason,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                                    )
+                                }
+                                TextButton(onClick = {
+                                    container.applyGesture(bookId, Gesture.MARQUER_ECOUTE)
+                                    val nextGesture = if (rec.item.status == BookStatus.LATER) Gesture.REPRENDRE else Gesture.COMMENCER
+                                    container.applyGesture(rec.item.id, nextGesture)
+                                    finishedBook = null
+                                    nav.navigate(BookDest(rec.item.id))
+                                }) {
+                                    Text(if (rec.item.status == BookStatus.LATER) "Reprendre" else "Commencer")
+                                }
+                            }
+                        }
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(onClick = {
                     container.applyGesture(bookId, Gesture.MARQUER_ECOUTE)

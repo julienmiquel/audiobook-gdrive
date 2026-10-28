@@ -1,5 +1,6 @@
 package com.julienmiquel.audiotheque.sync.engine
 
+import androidx.room.withTransaction
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
@@ -79,9 +80,21 @@ class Downloader(
 
     data class Task(val book: BookEntity, val track: TrackEntity)
 
-    /** Pistes à télécharger, dans l'ordre de priorité. */
-    suspend fun plan(): List<Task> {
-        val s = settings.current()
+    private sealed interface WorkItem {
+        val id: String
+        val book: BookEntity
+
+        data class TrackWork(val task: Task) : WorkItem {
+            override val id: String get() = task.track.driveId
+            override val book: BookEntity get() = task.book
+        }
+
+        data class ZipWork(override val book: BookEntity) : WorkItem {
+            override val id: String get() = zipTransferId(book.driveId)
+        }
+    }
+
+    private suspend fun fullModeCandidates(): List<BookEntity> {
         val pairs = db.syncPairDao().all()
         val inProgressPair = pairs.firstOrNull { it.status == BookStatus.IN_PROGRESS }
         val candidates = mutableListOf<BookEntity>()
@@ -92,8 +105,34 @@ class Downloader(
         pairs.filter { it.enabled && it.mode == PairMode.FULL && it.status == BookStatus.COLLECTION }.forEach { pair ->
             candidates += books.byParent(pair.driveFolderId)
         }
+        return candidates.distinctBy { it.driveId }
+    }
+
+    /** Livres livrés en archive `.zip` à télécharger et décompresser. */
+    suspend fun zipPlan(): List<BookEntity> {
+        val s = settings.current()
         val progressDao = db.progressDao()
-        val withProgress = candidates.filter { it.kind != BookKind.ZIP }.distinctBy { it.driveId }
+        return fullModeCandidates()
+            .filter { it.kind == BookKind.ZIP }
+            .filter { book ->
+                val bookTracks = tracks.forBook(book.driveId)
+                bookTracks.isEmpty() || bookTracks.any { t ->
+                    t.state != TrackState.PRESENT || t.localPath?.let { File(it).exists() } != true
+                }
+            }
+            .map { it to progressDao.get(it.driveId, s.accountKey) }
+            .sortedWith(
+                compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
+                    .thenByDescending { it.first.effectiveStatusChangedAt },
+            )
+            .map { it.first }
+    }
+
+    /** Pistes à télécharger, dans l'ordre de priorité. */
+    suspend fun plan(): List<Task> {
+        val s = settings.current()
+        val progressDao = db.progressDao()
+        val withProgress = fullModeCandidates().filter { it.kind != BookKind.ZIP }
             .map { it to progressDao.get(it.driveId, s.accountKey) }
             .sortedWith(
                 compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
@@ -116,8 +155,9 @@ class Downloader(
     }
 
     /**
-     * Télécharge le plan, 3 pistes à la fois. [canContinue] est consulté avant chaque piste et
-     * pendant les transferts : faux en mode « Wi-Fi uniquement » quand le réseau devient mesuré.
+     * Télécharge le plan, 3 éléments à la fois (pistes ou archives `.zip`). [canContinue] est
+     * consulté avant chaque élément et pendant les transferts : faux en mode « Wi-Fi uniquement »
+     * quand le réseau devient mesuré.
      */
     suspend fun run(
         drive: DriveService,
@@ -132,25 +172,35 @@ class Downloader(
         val stop = AtomicReference<DownloadStop?>(null)
         val lock = Mutex()
 
-        suspend fun next(): Task? = lock.withLock {
+        suspend fun next(): WorkItem? = lock.withLock {
             if (stop.get() != null) return@withLock null
             if (!canContinue()) {
                 stop.compareAndSet(null, DownloadStop.WAITING_FOR_WIFI)
                 return@withLock null
             }
-            val planned = plan().filter { it.book.driveId !in blockedBooks && (failures[it.track.driveId] ?: 0) < MAX_ATTEMPTS }
-            onSlot(planned.size)
-            for (task in planned) {
-                if (task.track.driveId in inFlight) continue
-                if (task.book.driveId !in checkedBooks) {
-                    if (!hasRoomFor(task.book, ctx)) {
-                        blockedBooks += task.book.driveId
+            val plannedTracks = plan()
+                .map { WorkItem.TrackWork(it) }
+                .filter { it.book.driveId !in blockedBooks && (failures[it.id] ?: 0) < MAX_ATTEMPTS }
+            val plannedZips = zipPlan()
+                .map { WorkItem.ZipWork(it) }
+                .filter { it.book.driveId !in blockedBooks && (failures[it.id] ?: 0) < MAX_ATTEMPTS }
+            val allPlanned: List<WorkItem> = plannedZips + plannedTracks
+            onSlot(allPlanned.size)
+            for (item in allPlanned) {
+                if (item.id in inFlight) continue
+                if (item.book.driveId !in checkedBooks) {
+                    val roomOk = when (item) {
+                        is WorkItem.TrackWork -> hasRoomFor(item.book, ctx)
+                        is WorkItem.ZipWork -> hasRoomForZip(item.book, ctx)
+                    }
+                    if (!roomOk) {
+                        blockedBooks += item.book.driveId
                         continue
                     }
-                    checkedBooks += task.book.driveId
+                    checkedBooks += item.book.driveId
                 }
-                inFlight += task.track.driveId
-                return@withLock task
+                inFlight += item.id
+                return@withLock item
             }
             null
         }
@@ -158,9 +208,12 @@ class Downloader(
         repeat(parallelism) {
             launch {
                 while (true) {
-                    val task = next() ?: break
+                    val item = next() ?: break
                     try {
-                        download(drive, task, ctx, canContinue)
+                        when (item) {
+                            is WorkItem.TrackWork -> download(drive, item.task, ctx, canContinue)
+                            is WorkItem.ZipWork -> downloadAndExtractZip(drive, item.book, ctx, canContinue)
+                        }
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: DriveAuthException) {
@@ -169,14 +222,15 @@ class Downloader(
                         stop.compareAndSet(null, DownloadStop.WAITING_FOR_WIFI)
                     } catch (e: Exception) {
                         val transientNetwork = e is IOException && e !is DriveHttpException &&
-                            e !is IntegrityException && e !is LocalWriteException
+                            e !is IntegrityException && e !is LocalWriteException &&
+                            e !is java.util.zip.ZipException
                         if (transientNetwork) {
                             // Réseau perdu : inutile d'essayer les pistes suivantes, un seul message.
                             if (stop.compareAndSet(null, DownloadStop.NETWORK_LOST)) {
                                 history.log(
                                     type = SyncEventType.ERROR,
-                                    path = task.book.name,
-                                    book = task.book,
+                                    path = item.book.name,
+                                    book = item.book,
                                     result = EventResult.ERROR,
                                     message = "Réseau perdu : téléchargements interrompus, reprise à la prochaine synchro (${e.message ?: e.javaClass.simpleName}).",
                                     runId = ctx.runId,
@@ -188,19 +242,27 @@ class Downloader(
                         val attempts = when (e) {
                             is DriveNotFoundException -> {
                                 // Piste supprimée ou remplacée dans Drive : la liste sera relue.
-                                books.invalidateTracks(listOf(task.book.driveId))
-                                MAX_ATTEMPTS.also { failures[task.track.driveId] = it }
+                                if (item is WorkItem.TrackWork) books.invalidateTracks(listOf(item.book.driveId))
+                                MAX_ATTEMPTS.also { failures[item.id] = it }
                             }
                             // Stockage plein ou accès retiré : réessayer tout de suite ne servirait à rien.
-                            is LocalWriteException -> MAX_ATTEMPTS.also { failures[task.track.driveId] = it }
-                            else -> failures.merge(task.track.driveId, 1, Int::plus) ?: 1
+                            is LocalWriteException -> MAX_ATTEMPTS.also { failures[item.id] = it }
+                            else -> failures.merge(item.id, 1, Int::plus) ?: 1
                         }
                         if (attempts >= MAX_ATTEMPTS) {
+                            val path = when (item) {
+                                is WorkItem.TrackWork -> "${item.book.name}/${item.task.track.relativePath}"
+                                is WorkItem.ZipWork -> item.book.name
+                            }
+                            val size = when (item) {
+                                is WorkItem.TrackWork -> item.task.track.sizeBytes
+                                is WorkItem.ZipWork -> item.book.sizeBytes
+                            }
                             history.log(
                                 type = SyncEventType.ERROR,
-                                path = "${task.book.name}/${task.track.relativePath}",
-                                book = task.book,
-                                sizeBytes = task.track.sizeBytes,
+                                path = path,
+                                book = item.book,
+                                sizeBytes = size,
                                 result = EventResult.ERROR,
                                 message = "Téléchargement interrompu : ${e.message ?: e.javaClass.simpleName}",
                                 runId = ctx.runId,
@@ -208,8 +270,8 @@ class Downloader(
                             ctx.errors.incrementAndGet()
                         }
                     } finally {
-                        inFlight -= task.track.driveId
-                        transfers.remove(task.track.driveId)
+                        inFlight -= item.id
+                        transfers.remove(item.id)
                     }
                 }
             }
@@ -236,6 +298,24 @@ class Downloader(
         return false
     }
 
+    /** Espace libre ≥ 2× l'archive `.zip` (archive temporaire + pistes extraites) + 500 Mo. */
+    private suspend fun hasRoomForZip(book: BookEntity, ctx: RunContext): Boolean {
+        val needed = (book.sizeBytes.coerceAtLeast(0L) * 2L)
+        val free = storage.freeBytes(storage.root())
+        if (free >= needed + SPACE_MARGIN_BYTES) return true
+        history.log(
+            type = SyncEventType.ERROR,
+            path = book.name,
+            book = book,
+            sizeBytes = needed,
+            result = EventResult.ERROR,
+            message = "Espace insuffisant pour décompresser l'archive .zip : il faut ${Formats.size(needed)} + 500 Mo de marge, ${Formats.size(free)} libres.",
+            runId = ctx.runId,
+        )
+        ctx.errors.incrementAndGet()
+        return false
+    }
+
     /** Verrou : deux livres de même nom téléchargés en même temps n'obtiennent pas le même dossier. */
     private val dirLock = Mutex()
 
@@ -248,6 +328,214 @@ class Downloader(
             unique
         }
         File(storage.root(), name)
+    }
+
+    suspend fun downloadAndExtractZip(
+        drive: DriveService,
+        targetBook: BookEntity,
+        ctx: RunContext,
+        canContinue: () -> Boolean = { true },
+    ) = withContext(Dispatchers.IO) {
+        val book = books.get(targetBook.driveId) ?: return@withContext
+        val existingTracks = tracks.forBook(book.driveId)
+        if (existingTracks.isNotEmpty() && existingTracks.all { it.state == TrackState.PRESENT && it.localPath?.let(::File)?.exists() == true }) {
+            return@withContext
+        }
+        val remoteFile = drive.getFile(book.driveId)
+        if (remoteFile.trashed) throw DriveNotFoundException("L'archive .zip est dans la corbeille")
+        val expectedSize = remoteFile.size ?: book.sizeBytes
+        val expectedMd5 = remoteFile.md5
+
+        val dir = bookDir(book)
+        dir.mkdirs()
+        val archivePart = File(dir, "_archive.zip.part")
+        val transferId = zipTransferId(book.driveId)
+
+        var start = if (archivePart.exists()) archivePart.length() else 0L
+        if (expectedSize in 1 until start) {
+            archivePart.delete()
+            start = 0
+        }
+        val title = book.displayTitle
+        if (expectedSize <= 0 || start < expectedSize) {
+            try {
+                drive.openContent(book.driveId, start).use { content ->
+                    if (start > 0 && !content.partial) {
+                        archivePart.delete()
+                        start = 0
+                    }
+                    val output = try {
+                        FileOutputStream(archivePart, start > 0)
+                    } catch (e: IOException) {
+                        throw LocalWriteException(archivePart, e)
+                    }
+                    output.use { out ->
+                        val buffer = ByteArray(64 * 1024)
+                        var done = start
+                        var lastUi = 0L
+                        var lastCheck = clock.now()
+                        val began = System.nanoTime()
+                        val startBytes = start
+                        while (true) {
+                            ensureActive()
+                            val n = content.stream.read(buffer)
+                            if (n < 0) break
+                            try {
+                                out.write(buffer, 0, n)
+                            } catch (e: IOException) {
+                                throw LocalWriteException(archivePart, e)
+                            }
+                            done += n
+                            val now = clock.now()
+                            if (now - lastUi >= 250) {
+                                val seconds = ((System.nanoTime() - began) / 1e9).coerceAtLeast(0.001)
+                                transfers.put(
+                                    Transfer(
+                                        trackId = transferId,
+                                        bookId = book.driveId,
+                                        bookTitle = title,
+                                        fileName = book.name,
+                                        totalBytes = expectedSize,
+                                        doneBytes = done,
+                                        bytesPerSecond = ((done - startBytes) / seconds).toLong(),
+                                    ),
+                                )
+                                lastUi = now
+                            }
+                            if (now - lastCheck >= 2000) {
+                                lastCheck = now
+                                if (!canContinue()) throw DownloadDeferredException()
+                            }
+                        }
+                    }
+                }
+            } catch (e: DriveRangeNotSatisfiableException) {
+                // Le « .part » est peut-être déjà complet : vérifié ci-dessous.
+            }
+        }
+
+        if (expectedSize > 0 && archivePart.length() != expectedSize) {
+            if (archivePart.length() > expectedSize) archivePart.delete()
+            throw IntegrityException("Taille inattendue pour l'archive .zip : ${archivePart.length()} octets au lieu de $expectedSize")
+        }
+        if (expectedMd5 != null && !archivePart.md5Hex().equals(expectedMd5, ignoreCase = true)) {
+            archivePart.delete()
+            throw IntegrityException("Checksum de l'archive .zip différent de celui de Drive")
+        }
+
+        transfers.put(
+            Transfer(
+                trackId = transferId,
+                bookId = book.driveId,
+                bookTitle = title,
+                fileName = "Décompression de ${book.name}…",
+                totalBytes = archivePart.length(),
+                doneBytes = archivePart.length(),
+                bytesPerSecond = 0L,
+            ),
+        )
+
+        val archiveBytes = archivePart.length()
+        val extracted = try {
+            ZipExtractor.extract(archivePart, dir, inspector) { ensureActive() }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: LocalWriteException) {
+            throw e
+        } catch (e: IOException) {
+            archivePart.delete()
+            throw IntegrityException("Archive .zip invalide ou corrompue : ${e.message ?: book.name}")
+        }
+        archivePart.delete()
+        transfers.remove(transferId)
+
+        val freshBook = books.get(book.driveId) ?: return@withContext
+        if (extracted.coverBytes != null && freshBook.coverPath?.let { File(it).exists() } != true) {
+            val ext = extracted.coverExt ?: "jpg"
+            val coverFile = File(storage.coversDir(), "${book.driveId}.$ext")
+            coverFile.writeBytes(extracted.coverBytes)
+            books.setCoverPath(book.driveId, coverFile.path)
+        }
+
+        val rawEntities = extracted.tracks.map { t ->
+            val exactDur = t.info?.durationMs?.takeIf { it > 0 }
+            val len = t.file.length()
+            TrackEntity(
+                driveId = zipTrackId(book.driveId, t.sortIndex),
+                bookId = book.driveId,
+                name = t.name,
+                relativePath = t.relativePath,
+                sortIndex = t.sortIndex,
+                number = t.number,
+                part = t.part,
+                chapter = t.chapter,
+                title = t.title,
+                durationMs = exactDur,
+                durationExact = exactDur != null,
+                sizeBytes = len,
+                md5 = null,
+                mimeType = t.mimeType,
+                localPath = t.file.path,
+                state = TrackState.PRESENT,
+                downloadedBytes = len,
+                modifiedAt = remoteFile.modifiedTime,
+            )
+        }
+        val known = rawEntities.filter { (it.durationMs ?: 0) > 0 && it.sizeBytes > 0 }
+        val msPerByte = if (known.isNotEmpty()) {
+            known.sumOf { it.durationMs!! }.toDouble() / known.sumOf { it.sizeBytes }
+        } else {
+            null
+        }
+        val completed = rawEntities.map { t ->
+            if (t.durationMs == null && msPerByte != null) {
+                t.copy(durationMs = (t.sizeBytes * msPerByte).toLong())
+            } else {
+                t
+            }
+        }
+        val totalDuration = completed.mapNotNull { it.durationMs }.sum()
+            .takeIf { completed.isNotEmpty() && completed.all { t -> t.durationMs != null } }
+        val allExact = completed.isNotEmpty() && completed.all { it.durationExact }
+
+        db.withTransaction {
+            if (books.get(book.driveId) == null) return@withTransaction
+            tracks.upsertAll(completed)
+            tracks.deleteMissing(book.driveId, completed.map { it.driveId })
+            extracted.tracks.forEach { t ->
+                val chs = t.info?.chapters.orEmpty()
+                val trackId = zipTrackId(book.driveId, t.sortIndex)
+                if (chs.size > 1) {
+                    db.embeddedChapterDao().replaceForTrack(
+                        trackId,
+                        chs.mapIndexed { idx, ch -> EmbeddedChapterEntity(book.driveId, trackId, idx, ch.title, ch.startMs, ch.endMs) },
+                    )
+                }
+            }
+            books.updateTrackStats(
+                id = book.driveId,
+                sizeBytes = if (expectedSize > 0) expectedSize else archiveBytes,
+                trackCount = completed.size,
+                durationMs = totalDuration ?: freshBook.durationMs,
+                durationExact = allExact,
+                syncedAt = clock.now(),
+            )
+            if (freshBook.tagNarrator == null && !extracted.narrator.isNullOrBlank()) {
+                books.setTagNarrator(book.driveId, extracted.narrator)
+            }
+        }
+
+        ctx.filesReceived.addAndGet(completed.size)
+        ctx.bytesReceived.addAndGet(archiveBytes)
+        val pair = db.syncPairDao().forFolder(book.parentId)
+        history.log(
+            type = SyncEventType.RECEIVED,
+            path = "${pair?.drivePath ?: ""}/${book.name}",
+            book = book,
+            sizeBytes = archiveBytes,
+            message = "Archive .zip téléchargée et décompressée (${completed.size} pistes)",
+            runId = ctx.runId,
+        )
     }
 
     suspend fun download(drive: DriveService, task: Task, ctx: RunContext, canContinue: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
@@ -385,6 +673,12 @@ class Downloader(
     companion object {
         const val SPACE_MARGIN_BYTES = 500L * 1000 * 1000
         const val MAX_ATTEMPTS = 3
+
+        fun zipTransferId(bookId: String): String = "zip_$bookId"
+
+        /** ID synthétique sans `:` (séparateur réservé par `MediaIds`). */
+        fun zipTrackId(bookId: String, sortIndex: Int): String =
+            "zip_${bookId}_${sortIndex.toString().padStart(4, '0')}"
     }
 }
 

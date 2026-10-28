@@ -149,12 +149,20 @@ class AppContainer(private val app: Application) {
         override val database: AppDatabase get() = this@AppContainer.database
         override val settings: SettingsRepository get() = this@AppContainer.settings
         override val progressSync: ProgressSyncRequester get() = progressBridge
+        override val onPlaybackStateChanged: () -> Unit = {
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+        }
     }
 
     private val _moves = MutableSharedFlow<MoveResult>(extraBufferCapacity = 4)
 
     /** Gestes de statut récents, pour le bandeau « Annuler » (10 s). */
     val moves: SharedFlow<MoveResult> = _moves.asSharedFlow()
+
+    private val _renames = MutableSharedFlow<com.julienmiquel.audiotheque.library.RenameResult>(extraBufferCapacity = 4)
+
+    /** Renommages Drive récents, pour le bandeau « Annuler » (10 s). */
+    val renames: SharedFlow<com.julienmiquel.audiotheque.library.RenameResult> = _renames.asSharedFlow()
 
     private val _trashes = MutableSharedFlow<TrashResult>(extraBufferCapacity = 4)
 
@@ -181,9 +189,12 @@ class AppContainer(private val app: Application) {
             player.state.map { it.bookId }.distinctUntilChanged().collect { id -> if (id != null) _selectedBookId.value = id }
         }
         // Fin de chaque synchro : pochettes manquantes reprises (Google Books joignable à nouveau ?)
-        // et pochettes téléchargées déposées dans Drive.
+        // et pochettes téléchargées déposées dans Drive ; le widget d'accueil est rafraîchi.
         appScope.launch {
-            engine.status.map { it.running }.distinctUntilChanged().drop(1).filter { !it }.collect { enrichMissingCovers() }
+            engine.status.map { it.running }.distinctUntilChanged().drop(1).filter { !it }.collect {
+                com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+                enrichMissingCovers()
+            }
         }
     }
 
@@ -201,6 +212,22 @@ class AppContainer(private val app: Application) {
             val result = gestures.apply(bookId, gesture)
             if (result == null) message("Dossier de statut introuvable : vérifiez les dossiers synchronisés") else announceMove(result)
         }
+    }
+
+    /** Renomme le dossier ou le fichier du livre dans Google Drive via la file d'opérations (annulable 10 s). */
+    fun renameBookInDrive(bookId: String, newName: String) {
+        appScope.launch {
+            val result = gestures.rename(bookId, newName)
+            when {
+                result == null -> message("Renommage impossible")
+                result.changed -> _renames.tryEmit(result)
+                else -> message("Le dossier porte déjà le nom « ${result.newName} » sur Drive")
+            }
+        }
+    }
+
+    fun undoRename(result: com.julienmiquel.audiotheque.library.RenameResult) {
+        appScope.launch { gestures.undoRename(result) }
     }
 
     /**
@@ -235,6 +262,7 @@ class AppContainer(private val app: Application) {
                 return@launch
             }
             database.bookDao().setCover(bookId, written.path, uploadPending = true)
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
             message("Pochette mise à jour : elle sera déposée dans le dossier Drive du livre")
             engine.uploadPendingCovers()
         }

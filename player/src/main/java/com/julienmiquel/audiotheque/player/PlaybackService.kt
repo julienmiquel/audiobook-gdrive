@@ -288,8 +288,30 @@ class PlaybackService : MediaLibraryService() {
         exo.removeListener(listener)
         exo.release()
         BookInUse.set(null)
+        PlayerRuntime.updateActivePlayback(ActivePlaybackSnapshot())
+        deps.onPlaybackStateChanged?.invoke()
         scope.cancel()
         super.onDestroy()
+    }
+
+    private fun notifyWidgetState() {
+        val book = currentBook
+        val item = exo.currentMediaItem
+        val ref = item?.mediaId?.let(MediaIds::parseTrack)
+        val label = if (book != null && ref != null && ref.bookId == book.driveId) {
+            item.mediaMetadata.title?.toString()
+                ?: currentTracks.firstOrNull { it.driveId == ref.trackId }?.chapterLabel
+        } else {
+            null
+        }
+        PlayerRuntime.updateActivePlayback(
+            ActivePlaybackSnapshot(
+                bookId = book?.driveId,
+                isPlaying = exo.isPlaying,
+                chapterLabel = label,
+            ),
+        )
+        deps.onPlaybackStateChanged?.invoke()
     }
 
     private fun updateShakeRegistration() {
@@ -409,12 +431,14 @@ class PlaybackService : MediaLibraryService() {
                 // Pause : la position part dans Drive, pour reprendre sur l'autre téléphone.
                 persistNow(push = true)
             }
+            notifyWidgetState()
         }
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             finishedEmitted = false
             // Nouvelle liste (livre chargé) : rien à enregistrer, ce n'est pas une écoute.
             if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) persistNow()
+            notifyWidgetState()
         }
 
         override fun onPositionDiscontinuity(oldPosition: Player.PositionInfo, newPosition: Player.PositionInfo, reason: Int) {
@@ -632,6 +656,7 @@ class PlaybackService : MediaLibraryService() {
         if (s.listened && settings.lastPlayedBookId != s.book.driveId) {
             deps.settings.update { it.copy(lastPlayedBookId = s.book.driveId) }
         }
+        deps.onPlaybackStateChanged?.invoke()
         // Après l'écriture locale : l'envoi relit la base, la position est à jour.
         if (s.push) deps.progressSync?.pushProgress(s.book.driveId)
     }

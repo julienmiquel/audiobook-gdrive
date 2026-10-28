@@ -36,5 +36,18 @@
         <meta-data
             android:name="com.google.android.gms.car.application"
             android:resource="@xml/automotive_app_desc" />
+
+        <!-- Widget d'accueil : pochette, avancement et lecture/pause directe. -->
+        <receiver
+            android:name=".widget.AudiothequeWidgetProvider"
+            android:exported="true"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/audiotheque_widget_info" />
+        </receiver>
     </application>
 </manifest>

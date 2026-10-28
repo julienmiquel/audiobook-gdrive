@@ -6,11 +6,14 @@ import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.PendingOperationEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
+import com.julienmiquel.audiotheque.core.parse.FolderNameParser
+import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
@@ -58,6 +61,10 @@ class OperationExecutor(
                     executeTrash(drive, op, book, file, pairs, pairFolders, ctx)
                     continue
                 }
+                if (op.type == OperationType.RENAME_BOOK) {
+                    executeRename(drive, op, book, file, pairs, ctx)
+                    continue
+                }
                 if (file.trashed) throw DriveNotFoundException("Le dossier est dans la corbeille")
                 val parents = file.parents
                 val otherStatusParents = parents.filter { it != op.toParentId && (it in pairFolders || it == op.fromParentId) }
@@ -76,18 +83,22 @@ class OperationExecutor(
             } catch (e: DriveAuthException) {
                 throw e
             } catch (e: DriveNotFoundException) {
-                if (op.type == OperationType.TRASH_BOOK) {
+                when (op.type) {
                     // Déjà disparu de Drive : la suppression est faite, le livre quitte la bibliothèque.
-                    onTrashed(op, book, pairs, ctx, alreadyGone = true)
-                } else {
-                    onPermanentFailure(op, book, pairs, e, ctx)
+                    OperationType.TRASH_BOOK -> onTrashed(op, book, pairs, ctx, alreadyGone = true)
+                    OperationType.RENAME_BOOK -> onRenameRefused(op, book, e, ctx)
+                    OperationType.MOVE_BOOK -> onPermanentFailure(op, book, pairs, e, ctx)
                 }
             } catch (e: DriveHttpException) {
                 if (e.isTransient) {
                     reschedule(op, book, e, ctx)
                     return false
                 }
-                if (op.type == OperationType.TRASH_BOOK) onTrashRefused(op, book, e, ctx) else onPermanentFailure(op, book, pairs, e, ctx)
+                when (op.type) {
+                    OperationType.TRASH_BOOK -> onTrashRefused(op, book, e, ctx)
+                    OperationType.RENAME_BOOK -> onRenameRefused(op, book, e, ctx)
+                    OperationType.MOVE_BOOK -> onPermanentFailure(op, book, pairs, e, ctx)
+                }
             } catch (e: IOException) {
                 // Réseau indisponible : inutile d'essayer les opérations suivantes maintenant.
                 reschedule(op, book, e, ctx)
@@ -95,6 +106,76 @@ class OperationExecutor(
             }
         }
         return ops.all().isEmpty()
+    }
+
+    // ------------------------------------------------------------------ renommage Drive
+
+    private suspend fun executeRename(
+        drive: DriveService,
+        op: PendingOperationEntity,
+        book: BookEntity,
+        file: DriveFile,
+        pairs: List<SyncPairEntity>,
+        ctx: RunContext?,
+    ) {
+        if (file.trashed) throw DriveNotFoundException("Le dossier est dans la corbeille")
+        val targetName = op.targetName?.trim()?.takeIf { it.isNotEmpty() }
+        if (targetName == null) {
+            db.withTransaction {
+                ops.delete(op.id)
+                if (ops.latestOfType(op.bookId, OperationType.RENAME_BOOK) == null) {
+                    books.setPendingName(op.bookId, null)
+                }
+            }
+            return
+        }
+        val previousName = file.name
+        val updatedFile = if (file.name == targetName) file else drive.rename(op.bookId, targetName)
+        val parsed = FolderNameParser.parse(updatedFile.name, isFile = book.kind != BookKind.FOLDER)
+        db.withTransaction {
+            books.updateDriveName(
+                op.bookId,
+                updatedFile.name,
+                parsed.title,
+                parsed.author,
+                parsed.narrator,
+                TextNormalizer.key(parsed.title),
+                TextNormalizer.keyOrNull(parsed.author),
+            )
+            books.updateModifiedAt(op.bookId, updatedFile.modifiedTime)
+            val deleted = ops.deleteIfRenameTarget(op.id, targetName)
+            if (deleted > 0 && ops.latestOfType(op.bookId, OperationType.RENAME_BOOK) == null) {
+                books.setPendingName(op.bookId, null)
+            }
+        }
+        if (previousName != updatedFile.name) {
+            history.log(
+                type = SyncEventType.LIBRARY_CHANGE,
+                path = "${pathOf(book.parentId, pairs)}/${updatedFile.name}",
+                book = book,
+                message = "Renommé dans Drive : « $previousName » → « ${updatedFile.name} »",
+                runId = ctx?.runId,
+            )
+            ctx?.moves?.incrementAndGet()
+        }
+    }
+
+    private suspend fun onRenameRefused(op: PendingOperationEntity, book: BookEntity, e: DriveHttpException, ctx: RunContext?) {
+        db.withTransaction {
+            ops.delete(op.id)
+            if (ops.latestOfType(op.bookId, OperationType.RENAME_BOOK) == null) {
+                books.setPendingName(op.bookId, null)
+            }
+        }
+        history.log(
+            type = SyncEventType.ERROR,
+            path = book.name,
+            book = book,
+            result = EventResult.ERROR,
+            message = "Renommage refusé par Drive (${e.code}) : le livre conserve le nom « ${book.name} ».",
+            runId = ctx?.runId,
+        )
+        ctx?.errors?.incrementAndGet()
     }
 
     // ------------------------------------------------------------------ corbeille (doublons)
@@ -189,7 +270,7 @@ class OperationExecutor(
             }
             val deleted = ops.deleteIfTarget(op.id, op.toParentId)
             if (deleted > 0) {
-                if (ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
+                if (ops.latestOfType(op.bookId, OperationType.MOVE_BOOK) == null) books.setPending(op.bookId, null, null, null)
             } else {
                 // Geste modifié pendant l'appel (« Annuler », autre statut) : l'opération reste en
                 // file avec sa nouvelle cible, au départ du dossier où le livre vient d'arriver.
@@ -255,7 +336,7 @@ class OperationExecutor(
     private suspend fun abandon(op: PendingOperationEntity) {
         db.withTransaction {
             ops.delete(op.id)
-            if (ops.latestForBook(op.bookId) == null) books.setPending(op.bookId, null, null, null)
+            if (ops.latestOfType(op.bookId, OperationType.MOVE_BOOK) == null) books.setPending(op.bookId, null, null, null)
             if (op.toStatus == BookStatus.DONE) db.progressDao().clearFinishedUnlessAtEnd(op.bookId, clock.now())
         }
     }
@@ -265,12 +346,17 @@ class OperationExecutor(
         val delay = retryDelayMs(attempts)
         ops.update(op.copy(attempts = attempts, nextAttemptAt = clock.now() + delay, lastError = e.message))
         if (attempts == 1) {
+            val action = when (op.type) {
+                OperationType.RENAME_BOOK -> "Renommage"
+                OperationType.TRASH_BOOK -> "Suppression"
+                OperationType.MOVE_BOOK -> "Déplacement"
+            }
             history.log(
                 type = SyncEventType.ERROR,
                 path = book.name,
                 book = book,
                 result = EventResult.ERROR,
-                message = "Déplacement en attente (${e.message ?: "réseau"}) : nouvel essai dans ${Formats.elapsed(delay)}.",
+                message = "$action en attente (${e.message ?: "réseau"}) : nouvel essai dans ${Formats.elapsed(delay)}.",
                 runId = ctx?.runId,
             )
         }

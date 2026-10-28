@@ -32,7 +32,7 @@ class FakeDriveService(
 
     private data class Node(
         val id: String,
-        val name: String,
+        var name: String,
         val mimeType: String,
         var parents: List<String>,
         val fixture: String? = null,
@@ -119,6 +119,16 @@ class FakeDriveService(
         if (fileId in busyMoves) throw DriveHttpException(503, "backendError", "Drive 503 : service momentanément indisponible")
         val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
         node.parents = (node.parents - removeParents.toSet() + addParent).distinct()
+        node.modifiedTime = clock.now()
+        changeLog += fileId
+        node.toFile()
+    }
+
+    override suspend fun rename(fileId: String, newName: String): DriveFile = op {
+        if (fileId in forbiddenMoves) throw DriveHttpException(403, "insufficientFilePermissions", "Drive 403 : permission refusée")
+        if (fileId in busyMoves) throw DriveHttpException(503, "backendError", "Drive 503 : service momentanément indisponible")
+        val node = nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")
+        node.name = newName
         node.modifiedTime = clock.now()
         changeLog += fileId
         node.toFile()

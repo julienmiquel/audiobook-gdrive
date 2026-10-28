@@ -87,6 +87,8 @@ data class BookEntity(
     /** Suppression demandée (doublon) : masqué aussitôt, dossier mis à la corbeille Drive par la file d'opérations. */
     @ColumnInfo(defaultValue = "0")
     val trashPending: Boolean = false,
+    /** Renommage Drive en attente dans la file d'opérations (« Titre - AUTEUR »). */
+    val pendingName: String? = null,
 )
 
 /** Piste = un fichier audio du dossier du livre. */
@@ -224,7 +226,7 @@ data class SyncRunEntity(
     val message: String? = null,
 )
 
-/** File d'opérations : un geste de statut = un déplacement de dossier à rejouer dans Drive. */
+/** File d'opérations : écritures Drive (déplacement, renommage ou corbeille) à rejouer hors ligne. */
 @Entity(tableName = "pending_ops", indices = [Index("bookId")])
 data class PendingOperationEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -238,6 +240,7 @@ data class PendingOperationEntity(
     val attempts: Int = 0,
     val nextAttemptAt: Long = 0,
     val lastError: String? = null,
+    val targetName: String? = null,
 )
 
 /** Paire de dossiers synchronisés : une par statut par défaut, sans limite. */

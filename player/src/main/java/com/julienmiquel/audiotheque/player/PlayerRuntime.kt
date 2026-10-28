@@ -20,6 +20,9 @@ interface PlayerDependencies {
 
     /** Progression échangée avec Drive (null : aucun compte, ou tests). */
     val progressSync: ProgressSyncRequester? get() = null
+
+    /** Appelé quand l'état de lecture, le chapitre ou la progression change (widget d'accueil). */
+    val onPlaybackStateChanged: (() -> Unit)? get() = null
 }
 
 interface PlayerDependenciesProvider {
@@ -125,6 +128,13 @@ data class JumpEntry(
     val timestamp: Long,
 )
 
+/** Instantané léger de la lecture active (pour le widget d'accueil, sans démarrer le service). */
+data class ActivePlaybackSnapshot(
+    val bookId: String? = null,
+    val isPlaying: Boolean = false,
+    val chapterLabel: String? = null,
+)
+
 /** État partagé entre le service de lecture et l'interface (même processus). */
 object PlayerRuntime {
     const val EXTEND_MS = 10 * 60_000L
@@ -140,8 +150,15 @@ object PlayerRuntime {
     private val _seekHistory = MutableStateFlow<List<JumpEntry>>(emptyList())
     val seekHistory: StateFlow<List<JumpEntry>> = _seekHistory.asStateFlow()
 
+    private val _activePlayback = MutableStateFlow(ActivePlaybackSnapshot())
+    val activePlayback: StateFlow<ActivePlaybackSnapshot> = _activePlayback.asStateFlow()
+
     private val _events = MutableSharedFlow<PlaybackEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<PlaybackEvent> = _events.asSharedFlow()
+
+    internal fun updateActivePlayback(snapshot: ActivePlaybackSnapshot) {
+        _activePlayback.value = snapshot
+    }
 
     fun startTimer(minutes: Int, now: Long = System.currentTimeMillis()) {
         val clamped = minutes.coerceIn(1, 240)

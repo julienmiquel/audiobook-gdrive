@@ -1,5 +1,6 @@
 package com.julienmiquel.audiotheque.core.parse
 
+import com.julienmiquel.audiotheque.core.model.BookKind
 import java.util.Locale
 
 /** Proposition de titre, d'auteur et de voix tirée d'un nom de dossier (à confirmer). */
@@ -180,5 +181,55 @@ object FolderNameParser {
                 }
             }
         }.joinToString(" ")
+    }
+
+    /**
+     * Formate un nom d'auteur selon la convention Drive « Prénom NOM » (« Laurent BINET »,
+     * « Guy de MAUPASSANT »). Un auteur d'un seul mot garde sa casse de nom propre (« Platon »)
+     * afin de ne pas être confondu avec un titre en majuscules.
+     */
+    fun formatAuthorForDrive(author: String): String {
+        val pretty = prettyName(author.replace(spaces, " ").trim())
+        val words = pretty.split(' ').filter { it.isNotBlank() }
+        if (words.size < 2) return pretty
+        val head = words.dropLast(1).joinToString(" ")
+        val last = words.last().uppercase(Locale.FRENCH)
+        return "$head $last"
+    }
+
+    /** Nettoie un nom proposé pour Google Drive (supprime `/` et les caractères de contrôle). */
+    fun sanitizeDriveName(raw: String): String =
+        raw.replace('/', '-')
+            .replace('\\', '-')
+            .filter { it >= ' ' }
+            .replace(spaces, " ")
+            .trim()
+
+    /**
+     * Construit le nom normalisé « Titre - AUTEUR » (ou « Titre » sans auteur) pour un dossier ou
+     * un fichier Drive, en préservant l'extension d'origine (`.zip`, `.mp3`, `.m4b`…) lorsqu'il
+     * ne s'agit pas d'un dossier.
+     */
+    fun normalizedDriveName(
+        title: String,
+        author: String?,
+        originalName: String = "",
+        kind: BookKind = BookKind.FOLDER,
+    ): String {
+        val ext = if (kind != BookKind.FOLDER) {
+            fileExtension.find(originalName.trim())?.value?.lowercase(Locale.ROOT).orEmpty()
+        } else {
+            ""
+        }
+        val cleanTitle = sanitizeDriveName(title).let {
+            if (ext.isNotEmpty()) it.replace(fileExtension, "").trim() else it
+        }.ifEmpty { sanitizeDriveName(originalName.replace(fileExtension, "")).ifEmpty { "Sans titre" } }
+        val cleanAuthor = author?.let(::sanitizeDriveName)?.takeIf { it.isNotBlank() }
+        val base = if (cleanAuthor != null) {
+            "$cleanTitle - ${formatAuthorForDrive(cleanAuthor)}"
+        } else {
+            cleanTitle
+        }
+        return base + ext
     }
 }

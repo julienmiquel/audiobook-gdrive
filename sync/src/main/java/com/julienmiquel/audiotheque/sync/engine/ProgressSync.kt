@@ -63,7 +63,6 @@ class ProgressSync(
         val adopted = mutableListOf<RemoteProgress>()
         for (id in remote.keys + dirtyIds) {
             val book = books.get(id) ?: continue
-            if (book.kind == BookKind.ZIP) continue
             // Livre sans dossier : absent de la requête globale, localisé un par un, seulement s'il a quelque chose à envoyer.
             if (id !in remote && book.kind != BookKind.FOLDER && id !in dirtyIds) continue
             guarded(book, runId) { syncBook(drive, account, book, remote[id], write = true, runId = runId) }?.let { adopted += it }
@@ -76,7 +75,6 @@ class ProgressSync(
         for (local in progress.dirty(account)) {
             if (bookId != null && local.bookId != bookId) continue
             val book = books.get(local.bookId) ?: continue
-            if (book.kind == BookKind.ZIP) continue
             guarded(book, null) { syncBook(drive, account, book, known = null, write = true, runId = null) }
         }
     }
@@ -119,7 +117,6 @@ class ProgressSync(
      */
     suspend fun pull(drive: DriveService, account: String, bookId: String): RemoteProgress? = mutex.withLock {
         val book = books.get(bookId) ?: return@withLock null
-        if (book.kind == BookKind.ZIP) return@withLock null
         val now = clock.now()
         val local = progress.get(bookId, account)
         if (local != null && local.dirty && now - local.updatedAt in 0 until LOCAL_FRESH_MS) return@withLock null

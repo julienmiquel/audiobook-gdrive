@@ -1,6 +1,7 @@
 package com.julienmiquel.audiotheque.core.parse
 
 import com.google.common.truth.Truth.assertThat
+import com.julienmiquel.audiotheque.core.model.BookKind
 import org.junit.Test
 
 /** Noms observés dans /AudioBook (cf. spécification, « Anomalies que l'app doit tolérer »). */
@@ -67,5 +68,37 @@ class FolderNameParserTest {
         val p = FolderNameParser.parse("Le Horla - Guy de MAUPASSANT")
         assertThat(p.title).isEqualTo("Le Horla")
         assertThat(p.author).isEqualTo("Guy de Maupassant")
+    }
+
+    @Test
+    fun `nom normalisé Titre - AUTEUR pour dossier et fichier`() {
+        assertThat(
+            FolderNameParser.normalizedDriveName(
+                title = "Perspective(s)",
+                author = "Laurent Binet",
+                originalName = "Laurent Binet - PERSPECTIVE(S)",
+                kind = BookKind.FOLDER,
+            ),
+        ).isEqualTo("Perspective(s) - Laurent BINET")
+
+        assertThat(
+            FolderNameParser.normalizedDriveName(
+                title = "Le Horla",
+                author = "Guy de Maupassant",
+                originalName = "Le Horla",
+                kind = BookKind.FOLDER,
+            ),
+        ).isEqualTo("Le Horla - Guy de MAUPASSANT")
+
+        val zipName = FolderNameParser.normalizedDriveName(
+            title = "La Guerre des mondes",
+            author = "H. G. Wells",
+            originalName = "La Guerre des mondes.zip",
+            kind = BookKind.ZIP,
+        )
+        assertThat(zipName).isEqualTo("La Guerre des mondes - H. G. WELLS.zip")
+        val reparsed = FolderNameParser.parse(zipName, isFile = true)
+        assertThat(reparsed.title).isEqualTo("La Guerre des mondes")
+        assertThat(reparsed.author).isEqualTo("H. G. Wells")
     }
 }

@@ -19,10 +19,12 @@ import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayAuthor
 import com.julienmiquel.audiotheque.core.model.displayNarrator
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.model.effectiveDriveName
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
+import com.julienmiquel.audiotheque.core.parse.FolderNameParser
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
@@ -153,7 +155,7 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
             lastListenedAt = row.lastListenedAt,
             finished = row.finished == true,
             isDuplicate = row.duplicateCount > 1,
-            pendingSync = b.pendingStatus != null,
+            pendingSync = b.pendingStatus != null || b.pendingName != null,
             cover = b.coverPath ?: b.coverUrl,
         )
     }
@@ -305,9 +307,9 @@ class StatusGestures(
             val book = books.get(bookId) ?: return@withTransaction null
             val from = book.effectiveStatus
             val fromParentId = book.effectiveParentId
-            val existing = ops.latestForBook(bookId)
             // Suppression en file : plus de geste de statut sur ce livre.
-            if (existing?.type == OperationType.TRASH_BOOK || book.trashPending) return@withTransaction null
+            if (book.trashPending || ops.latestOfType(bookId, OperationType.TRASH_BOOK) != null) return@withTransaction null
+            val existing = ops.latestOfType(bookId, OperationType.MOVE_BOOK)
             val now = clock.now()
             if (existing != null) {
                 // Un déplacement est déjà en file : on change sa cible (ou on revient au départ).
@@ -384,6 +386,57 @@ class StatusGestures(
         if (restored != current) dao.upsert(restored.copy(updatedAt = clock.now(), dirty = true))
     }
 
+    // ------------------------------------------------------------------ renommage normalisé Drive
+
+    /**
+     * Renomme le dossier (ou le fichier) Drive du livre via la file d'opérations hors ligne,
+     * avec possibilité d'annuler pendant 10 s.
+     */
+    suspend fun rename(bookId: String, newName: String): RenameResult? {
+        val cleaned = FolderNameParser.sanitizeDriveName(newName)
+        if (cleaned.isEmpty()) return null
+        val result = db.withTransaction {
+            val book = books.get(bookId) ?: return@withTransaction null
+            if (book.trashPending || ops.latestOfType(bookId, OperationType.TRASH_BOOK) != null) return@withTransaction null
+            val previousEffective = book.effectiveDriveName
+            val existing = ops.latestOfType(bookId, OperationType.RENAME_BOOK)
+            val now = clock.now()
+            if (existing != null) {
+                ops.update(
+                    existing.copy(
+                        targetName = cleaned,
+                        createdAt = now,
+                        attempts = 0,
+                        nextAttemptAt = 0,
+                        lastError = null,
+                    ),
+                )
+                books.setPendingName(bookId, cleaned)
+            } else if (cleaned == book.name) {
+                books.setPendingName(bookId, null)
+            } else {
+                ops.insert(
+                    PendingOperationEntity(
+                        type = OperationType.RENAME_BOOK,
+                        bookId = bookId,
+                        fromParentId = book.parentId,
+                        toParentId = book.parentId,
+                        fromStatus = book.status,
+                        toStatus = book.status,
+                        createdAt = now,
+                        targetName = cleaned,
+                    ),
+                )
+                books.setPendingName(bookId, cleaned)
+            }
+            RenameResult(bookId = bookId, title = book.displayTitle, oldName = previousEffective, newName = cleaned)
+        } ?: return null
+        if (result.changed) sync.requestSync(SyncTrigger.STATUS_CHANGE)
+        return result
+    }
+
+    suspend fun undoRename(result: RenameResult): RenameResult? = rename(result.bookId, result.oldName)
+
     // ------------------------------------------------------------------ doublons
 
     /**
@@ -413,6 +466,7 @@ class StatusGestures(
                 ),
             )
             books.setPending(bookId, null, null, null)
+            books.setPendingName(bookId, null)
             books.setTrashPending(bookId, true)
             TrashResult(bookId, book.displayTitle, book.name)
         }?.also { sync.requestSync(SyncTrigger.STATUS_CHANGE) }
@@ -435,6 +489,16 @@ class StatusGestures(
         /** Au-delà, un livre est considéré comme fini (Réécouter repart du début). */
         const val FINISHED_PERCENT = 99f
     }
+}
+
+/** Renommage normalisé demandé : de quoi proposer « Annuler » pendant 10 s. */
+data class RenameResult(
+    val bookId: String,
+    val title: String,
+    val oldName: String,
+    val newName: String,
+) {
+    val changed: Boolean get() = oldName != newName
 }
 
 /** Suppression d'un doublon demandée : de quoi afficher « Annuler » pendant 10 s. */

@@ -139,6 +139,16 @@ class RestDriveService(
         return send<FileDto>(request, retry = true).toModel()
     }
 
+    override suspend fun rename(fileId: String, newName: String): DriveFile {
+        val url = api("drive/v3/files/$fileId")
+            .addQueryParameter("fields", FILE_FIELDS)
+            .addQueryParameter("supportsAllDrives", "true")
+            .build()
+        val body = json.encodeToString(RenameFileDto.serializer(), RenameFileDto(newName)).toRequestBody(jsonType)
+        val request = Request.Builder().url(url).patch(body)
+        return send<FileDto>(request, retry = true).toModel()
+    }
+
     override suspend fun trash(fileId: String): DriveFile {
         val url = api("drive/v3/files/$fileId")
             .addQueryParameter("fields", FILE_FIELDS)
@@ -334,6 +344,9 @@ internal data class QuotaDto(val limit: String? = null, val usage: String? = nul
 
 @Serializable
 internal data class NewFileDto(val name: String, val parents: List<String>, val mimeType: String? = null)
+
+@Serializable
+internal data class RenameFileDto(val name: String)
 
 @Serializable
 internal data class ErrorEnvelopeDto(val error: ErrorDto? = null)

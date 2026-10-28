@@ -128,6 +128,7 @@ data class LibraryUiState(
     val counts: Map<String, Int> = emptyMap(),
     val selected: LibraryTab? = null,
     val items: List<LibraryItem> = emptyList(),
+    val recommendations: List<com.julienmiquel.audiotheque.library.BookRecommendation> = emptyList(),
     val query: String = "",
     val narrator: String? = null,
     val narrators: List<String> = emptyList(),
@@ -169,12 +170,18 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
                 LibraryRepository.filter(all, selected.status, "", filters.narrator, settings.showHidden).filter { selected.matches(it) }
             else -> emptyList()
         }
+        val recommendations = if (filters.query.isBlank() && filters.narrator == null && selected?.status == BookStatus.NEW) {
+            com.julienmiquel.audiotheque.library.BookRecommender.recommend(visible, limit = 5)
+        } else {
+            emptyList()
+        }
         LibraryUiState(
             loaded = true,
             tabs = tabs,
             counts = counts,
             selected = selected,
             items = items,
+            recommendations = recommendations,
             query = filters.query,
             narrator = filters.narrator,
             narrators = LibraryRepository.narrators(visible),
@@ -422,7 +429,7 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
     )
 }
 
-/** Synchro en cours et déplacements Drive en attente, sous les onglets. */
+/** Synchro en cours et opérations Drive en attente, sous les onglets. */
 @Composable
 private fun ActivityBar(state: LibraryUiState) {
     val engine = state.engine
@@ -451,7 +458,7 @@ private fun ActivityBar(state: LibraryUiState) {
             Icon(Icons.Filled.CloudUpload, contentDescription = null, tint = MaterialTheme.colorScheme.tertiary, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(6.dp))
             Text(
-                if (state.pendingMoves == 1) "1 déplacement Drive en attente" else "${state.pendingMoves} déplacements Drive en attente",
+                if (state.pendingMoves == 1) "1 opération Drive en attente" else "${state.pendingMoves} opérations Drive en attente",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -477,6 +484,14 @@ private fun BookList(
                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                 )
             }
+        } else if (state.recommendations.isNotEmpty()) {
+            item(key = "recommendations", contentType = "recommendations") {
+                RecommendationsStrip(
+                    recommendations = state.recommendations,
+                    onOpenBook = onOpenBook,
+                    onGesture = onGesture,
+                )
+            }
         }
         if (state.loaded && state.items.isEmpty()) {
             item(key = "empty") { EmptyLibrary(state) }
@@ -491,6 +506,82 @@ private fun BookList(
             )
             HorizontalDivider(Modifier.padding(start = 88.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
         }
+    }
+}
+
+@Composable
+private fun RecommendationsStrip(
+    recommendations: List<com.julienmiquel.audiotheque.library.BookRecommendation>,
+    onOpenBook: (String) -> Unit,
+    onGesture: (LibraryItem, Gesture) -> Unit,
+) {
+    Column(Modifier.fillMaxWidth().padding(top = 10.dp, bottom = 6.dp)) {
+        Text(
+            "À écouter ensuite",
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        )
+        androidx.compose.foundation.lazy.LazyRow(
+            contentPadding = PaddingValues(horizontal = 16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            items(recommendations, key = { "rec-${it.item.id}" }) { rec ->
+                androidx.compose.material3.OutlinedCard(
+                    onClick = { onOpenBook(rec.item.id) },
+                    modifier = Modifier.width(248.dp),
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            BookCover(rec.item.cover, rec.item.title, size = 48.dp)
+                            Spacer(Modifier.width(10.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    rec.item.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                rec.item.author?.let { author ->
+                                    Text(
+                                        author,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                rec.reason,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            val gesture = if (rec.item.status == BookStatus.LATER) Gesture.REPRENDRE else Gesture.COMMENCER
+                            FilledTonalButton(
+                                onClick = { onGesture(rec.item, gesture) },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
+                                modifier = Modifier.height(30.dp),
+                            ) {
+                                Text(gesture.label, style = MaterialTheme.typography.labelMedium, maxLines = 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalDivider(
+            Modifier.padding(top = 10.dp),
+            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f),
+        )
     }
 }
 
@@ -520,7 +611,7 @@ fun BookRow(
     onPlay: () -> Unit,
 ) {
     var menu by remember { mutableStateOf(false) }
-    val gestures = if (item.isZip) Gesture.forStatus(item.status).filter { it != Gesture.COMMENCER && it != Gesture.REPRENDRE && it != Gesture.REECOUTER } else Gesture.forStatus(item.status)
+    val gestures = Gesture.forStatus(item.status)
     Box {
         Row(
             modifier = Modifier
@@ -578,7 +669,7 @@ fun BookRow(
 @Composable
 private fun BookBadges(item: LibraryItem) {
     val colors = MaterialTheme.colorScheme
-    if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip, container = colors.errorContainer, content = colors.onErrorContainer)
+    if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip)
     if (item.isDuplicate) Tag("doublon", icon = Icons.Filled.ContentCopy, container = colors.tertiaryContainer, content = colors.onTertiaryContainer)
     if (item.pendingSync) Tag("en attente", icon = Icons.Filled.CloudUpload)
     if (item.finished) Tag("terminé", icon = Icons.Filled.DoneAll)
@@ -592,7 +683,6 @@ private fun BookBadges(item: LibraryItem) {
 private fun InlineAction(item: LibraryItem, onGesture: (Gesture) -> Unit, onPlay: () -> Unit) {
     val gesture = LibraryViewModel.inlineGesture(item)
     when {
-        item.isZip -> Unit
         item.presentTracks > 0 && (item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION) ->
             FilledTonalIconButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, contentDescription = "Écouter ${item.title}") }
         gesture != null ->

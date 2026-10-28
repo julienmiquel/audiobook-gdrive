@@ -10,6 +10,7 @@ import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.DriveLibraryDefaults
 import com.julienmiquel.audiotheque.core.model.EventResult
+import com.julienmiquel.audiotheque.core.model.OperationType
 import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
@@ -219,16 +220,30 @@ class LibraryScanner(
         }
         if (existing.name != file.name) {
             val parsed = FolderNameParser.parse(file.name, isFile = kind != BookKind.FOLDER)
-            books.updateDriveName(
-                file.id, file.name, parsed.title, parsed.author, parsed.narrator,
-                TextNormalizer.key(parsed.title), TextNormalizer.keyOrNull(parsed.author),
-            )
+            db.withTransaction {
+                books.updateDriveName(
+                    file.id, file.name, parsed.title, parsed.author, parsed.narrator,
+                    TextNormalizer.key(parsed.title), TextNormalizer.keyOrNull(parsed.author),
+                )
+                if (existing.pendingName == file.name) {
+                    db.pendingOperationDao().deleteByBookAndType(file.id, OperationType.RENAME_BOOK)
+                    books.setPendingName(file.id, null)
+                }
+            }
         } else if (existing.authorKey != existing.expectedAuthorKey) {
             // Clé d'auteur absente (base antérieure) ou périmée.
             books.setAuthorKey(file.id, existing.expectedAuthorKey)
         }
         if (existing.modifiedAt != file.modifiedTime) books.updateModifiedAt(file.id, file.modifiedTime)
-        if (kind != BookKind.FOLDER && file.size != null && file.size != existing.sizeBytes) books.updateSize(file.id, file.size)
+        if (kind == BookKind.ZIP && file.size != null && file.size != existing.sizeBytes && existing.trackCount > 0) {
+            tracks.forBook(file.id).forEach { localFiles.deleteTrackFiles(it, updateDb = false) }
+            db.withTransaction {
+                tracks.deleteMissing(file.id, listOf("__none__"))
+                books.updateTrackStats(file.id, file.size, 0, null, false, now)
+            }
+        } else if (kind != BookKind.FOLDER && file.size != null && file.size != existing.sizeBytes) {
+            books.updateSize(file.id, file.size)
+        }
         if (kind == BookKind.SINGLE_FILE) refreshSingleTrack(file)
         if (existing.parentId != pair.driveFolderId) {
             val pairs = pairsDao.all()
@@ -236,7 +251,7 @@ class LibraryScanner(
                 books.updateConfirmedLocation(file.id, pair.driveFolderId, pair.status, now)
                 if (existing.pendingParentId == pair.driveFolderId) {
                     // Drive a déjà la valeur attendue par le geste en attente.
-                    db.pendingOperationDao().deleteForBook(file.id)
+                    db.pendingOperationDao().deleteByBookAndType(file.id, OperationType.MOVE_BOOK)
                     books.setPending(file.id, null, null, null)
                 }
             }
@@ -472,7 +487,7 @@ class MetadataProber(
                 val f = fileById.getValue(candidate.id)
                 val old = existing[candidate.id]
                 val changed = old != null && ((f.md5 != null && old.md5 != null && old.md5 != f.md5) || old.sizeBytes != (f.size ?: 0))
-                if (changed && old != null) staleFiles += old
+                if (changed) staleFiles += old
                 val keep = old != null && !changed
                 TrackEntity(
                     driveId = candidate.id,

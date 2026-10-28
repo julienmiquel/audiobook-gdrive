@@ -1,4 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Audiothèque</string>
+    <string name="widget_description">Reprendre la lecture de votre livre audio en cours depuis l\'écran d\'accueil</string>
+    <string name="widget_empty_title">Aucun livre en écoute</string>
+    <string name="widget_empty_subtitle">Touchez pour ouvrir Audiothèque</string>
+    <string name="widget_cover_desc">Pochette du livre</string>
+    <string name="widget_rewind_desc">Reculer</string>
+    <string name="widget_play_pause_desc">Lecture ou pause</string>
+    <string name="widget_forward_desc">Avancer</string>
 </resources>
