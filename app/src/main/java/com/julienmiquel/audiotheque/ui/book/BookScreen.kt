@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Bookmarks
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.CloudUpload
@@ -98,6 +99,7 @@ import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
+import com.julienmiquel.audiotheque.core.model.meaningfulTitle
 import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.library.Gesture
@@ -704,6 +706,7 @@ private fun Header(item: LibraryItem) {
             item.narrator?.let { Text("Lu par $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 StatusTag(item.status)
+                item.series?.let { Tag(it.displayLabel, icon = Icons.Filled.Bookmarks) }
                 if (item.pendingSync) {
                     val label = when {
                         item.book.pendingName != null && item.book.pendingStatus == null -> "renommage Drive en attente"
@@ -762,6 +765,7 @@ private fun InfoSection(state: BookUiState, item: LibraryItem) {
     val pair = state.pairs.firstOrNull { it.driveFolderId == book.effectiveParentId }
     InfoCard(title = "Informations", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
         InfoRow("Statut", Labels.status(item.status) + (pair?.let { " (${it.name})" } ?: ""))
+        item.series?.let { InfoRow("Série", it.displayLabel) }
         InfoRow("Durée", Formats.duration(book.durationMs, approximate = book.durationMs != null && !book.durationExact) + if (book.durationMs != null && !book.durationExact) " (estimée)" else "")
         InfoRow("Taille", Formats.size(book.sizeBytes))
         InfoRow("Pistes", book.trackCount.toString())
@@ -796,6 +800,7 @@ private fun cleanupInfo(state: BookUiState, item: LibraryItem): Pair<String, Str
 @Composable
 private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?, playable: Boolean, onPlay: () -> Unit) {
     val present = track.state == TrackState.PRESENT
+    val cleanTitle = track.meaningfulTitle()
     Row(
         Modifier
             .fillMaxWidth()
@@ -816,7 +821,7 @@ private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?
         Spacer(Modifier.width(16.dp))
         Column(Modifier.weight(1f)) {
             Text(
-                track.title,
+                cleanTitle ?: track.chapterLabel,
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
                 color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
@@ -824,7 +829,11 @@ private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?
                 overflow = TextOverflow.Ellipsis,
             )
             Text(
-                listOfNotNull(track.chapterLabel, track.durationMs?.let { Formats.duration(it, !track.durationExact) }, Formats.size(track.sizeBytes)).joinToString(" · "),
+                listOfNotNull(
+                    if (cleanTitle != null) track.chapterLabel else null,
+                    track.durationMs?.let { Formats.duration(it, !track.durationExact) },
+                    Formats.size(track.sizeBytes),
+                ).joinToString(" · "),
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

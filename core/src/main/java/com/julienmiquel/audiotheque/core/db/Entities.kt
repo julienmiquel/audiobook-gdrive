@@ -256,3 +256,17 @@ data class SyncPairEntity(
     val position: Int,
     val lastInventoryAt: Long? = null,
 )
+
+/** Session d'écoute réelle enregistrée sur le téléphone (hors pauses), pour les statistiques. */
+@Entity(
+    tableName = "listening_sessions",
+    indices = [Index(value = ["account", "startedAt"]), Index("bookId")],
+)
+data class ListeningSessionEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val bookId: String,
+    val account: String,
+    val startedAt: Long,
+    val endedAt: Long,
+    val durationMs: Long,
+)

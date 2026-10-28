@@ -83,14 +83,17 @@ import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import com.julienmiquel.audiotheque.ui.library.LibraryScreen
 import com.julienmiquel.audiotheque.ui.onboarding.OnboardingScreen
+import com.julienmiquel.audiotheque.ui.player.MiniPlayerBar
 import com.julienmiquel.audiotheque.ui.player.PlayerScreen
 import com.julienmiquel.audiotheque.ui.settings.SettingsScreen
+import com.julienmiquel.audiotheque.ui.stats.StatsScreen
 import com.julienmiquel.audiotheque.ui.sync.SyncScreen
 import com.julienmiquel.audiotheque.ui.theme.AudiothequeTheme
 import com.julienmiquel.audiotheque.ui.theme.isDarkTheme
 import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 
@@ -105,6 +108,9 @@ data object SyncDest
 
 @Serializable
 data object SettingsDest
+
+@Serializable
+data object StatsDest
 
 @Serializable
 data class BookDest(val bookId: String)
@@ -152,7 +158,20 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     val engine by container.engine.status.collectAsStateWithLifecycle()
     val authRequired by container.authRequired.collectAsStateWithLifecycle(initialValue = false)
     val libraryItems by container.library.observeLibrary().collectAsStateWithLifecycle(initialValue = emptyList())
+    val playerState by container.player.state.collectAsStateWithLifecycle()
+    val selectedBookId by container.selectedBookId.collectAsStateWithLifecycle()
+    val appSettings by container.settings.settings.collectAsStateWithLifecycle(initialValue = null)
     var finishedBook by remember { mutableStateOf<Pair<String, String>?>(null) }
+
+    val miniBookId = playerState.bookId ?: selectedBookId ?: appSettings?.lastPlayedBookId
+    val miniItem = remember(libraryItems, miniBookId) {
+        miniBookId?.let { id -> libraryItems.firstOrNull { it.id == id } }
+    }
+    val miniTracks by remember(miniItem?.id) {
+        val id = miniItem?.id
+        if (id != null) container.library.observeTracks(id) else flowOf(emptyList())
+    }.collectAsStateWithLifecycle(initialValue = emptyList())
+    val onPlayerScreen = destination?.hasRoute(PlayerDest::class) == true
 
     NotificationPermission()
 
@@ -227,6 +246,23 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
         bottomBar = {
             Column {
                 if (authRequired) AuthRenewalBanner(container)
+                if (!onPlayerScreen && miniItem != null && (playerState.bookId == miniItem.id || miniItem.presentTracks > 0)) {
+                    MiniPlayerBar(
+                        item = miniItem,
+                        tracks = miniTracks,
+                        playerState = playerState,
+                        skipSeconds = appSettings?.skipSeconds ?: 30,
+                        onOpenPlayer = { nav.navigateToTab(TopTab.PLAYER) },
+                        onTogglePlay = {
+                            if (playerState.bookId == miniItem.id) {
+                                container.player.togglePlayPause()
+                            } else {
+                                container.playBook(miniItem.id)
+                            }
+                        },
+                        onSeekBack = { container.player.seekBack() },
+                    )
+                }
                 NavigationBar {
                     TopTab.entries.forEach { tab ->
                         NavigationBarItem(
@@ -325,6 +361,7 @@ private fun AppNavHost(nav: NavHostController, padding: PaddingValues) {
                 onOpenBook = { nav.navigate(BookDest(it)) },
                 onOpenPlayer = { nav.navigateToTab(TopTab.PLAYER) },
                 onOpenSettings = { nav.navigate(SettingsDest) { launchSingleTop = true } },
+                onOpenStats = { nav.navigate(StatsDest) { launchSingleTop = true } },
                 contentPadding = padding,
             )
         }
@@ -339,7 +376,18 @@ private fun AppNavHost(nav: NavHostController, padding: PaddingValues) {
             SyncScreen(onOpenSettings = { nav.navigate(SettingsDest) { launchSingleTop = true } }, contentPadding = padding)
         }
         composable<SettingsDest> {
-            SettingsScreen(onBack = { nav.popBackStack() }, contentPadding = padding)
+            SettingsScreen(
+                onBack = { nav.popBackStack() },
+                onOpenStats = { nav.navigate(StatsDest) { launchSingleTop = true } },
+                contentPadding = padding,
+            )
+        }
+        composable<StatsDest> {
+            StatsScreen(
+                onBack = { nav.popBackStack() },
+                onOpenBook = { nav.navigate(BookDest(it)) },
+                contentPadding = padding,
+            )
         }
         composable<BookDest> { entry ->
             val route = entry.toRoute<BookDest>()

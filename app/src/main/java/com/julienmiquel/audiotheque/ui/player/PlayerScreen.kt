@@ -103,6 +103,7 @@ import com.julienmiquel.audiotheque.core.model.BinauralRoom
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.TrackState
+import com.julienmiquel.audiotheque.core.model.meaningfulTitle
 import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.library.Gesture
@@ -579,8 +580,16 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
             }
         } else {
             state.currentTrack?.let { track ->
-                Text(track.chapterLabel, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
-                Text(track.title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                val totalTracks = state.tracks.size
+                val header = if (totalTracks > 1 && track.part == null && track.chapter == null) {
+                    "Piste ${track.sortIndex + 1} / $totalTracks"
+                } else {
+                    track.chapterLabel
+                }
+                Text(header, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
+                track.meaningfulTitle(item.title, item.author)?.let { subtitle ->
+                    Text(subtitle, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                }
             }
         }
 
@@ -1173,8 +1182,9 @@ private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity, Long) 
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 Column(Modifier.weight(1f)) {
+                                    val cleanTitle = track.meaningfulTitle(state.item?.title, state.item?.author)
                                     Text(
-                                        track.title,
+                                        cleanTitle ?: track.chapterLabel,
                                         style = MaterialTheme.typography.bodyLarge,
                                         fontWeight = if (current) FontWeight.Bold else FontWeight.Normal,
                                         color = when {
@@ -1183,11 +1193,17 @@ private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity, Long) 
                                             else -> MaterialTheme.colorScheme.onSurfaceVariant
                                         },
                                     )
-                                    Text(
-                                        listOfNotNull(track.chapterLabel, track.durationMs?.let { Formats.duration(it, !track.durationExact) }).joinToString(" · "),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
+                                    val secondary = listOfNotNull(
+                                        if (cleanTitle != null) track.chapterLabel else null,
+                                        track.durationMs?.let { Formats.duration(it, !track.durationExact) },
+                                    ).joinToString(" · ")
+                                    if (secondary.isNotEmpty()) {
+                                        Text(
+                                            secondary,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        )
+                                    }
                                 }
                                 if (!present) Icon(Icons.Filled.CloudQueue, contentDescription = "Pas encore téléchargé", tint = MaterialTheme.colorScheme.onSurfaceVariant)
                             }

@@ -1,6 +1,8 @@
 package com.julienmiquel.audiotheque.core.parse
 
 import com.google.common.truth.Truth.assertThat
+import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.meaningfulTitle
 import org.junit.Test
 
 class TrackNameParserTest {
@@ -55,4 +57,31 @@ class TrackNameParserTest {
         val sorted = TrackOrdering.sort(names.mapIndexed { i, n -> TrackCandidate("id$i", n, n) })
         assertThat(sorted.map { it.first.name }).containsExactly("1.mp3", "2.mp3", "10.mp3").inOrder()
     }
+
+    @Test
+    fun `meaningfulTitle masque les noms redondants et garde les vrais titres`() {
+        fun track(title: String, chapter: Int? = null, sortIndex: Int = 3) =
+            TrackEntity(
+                driveId = "t$sortIndex",
+                bookId = "b1",
+                name = "$title.mp3",
+                relativePath = "$title.mp3",
+                mimeType = "audio/mpeg",
+                sizeBytes = 1000L,
+                modifiedAt = 0L,
+                md5 = null,
+                sortIndex = sortIndex,
+                part = null,
+                chapter = chapter,
+                title = title,
+            )
+
+        assertThat(track("Piste 4").meaningfulTitle("Civilisations", "Laurent Binet")).isNull()
+        assertThat(track("Chapitre 4", chapter = 4).meaningfulTitle("Civilisations", "Laurent Binet")).isNull()
+        assertThat(track("Civilisations - 04").meaningfulTitle("Civilisations", "Laurent Binet")).isNull()
+        assertThat(track("Laurent Binet - Civilisations - Piste 04").meaningfulTitle("Civilisations", "Laurent Binet")).isNull()
+        assertThat(track("Les aventures de Cervantès", chapter = 4).meaningfulTitle("Civilisations", "Laurent Binet"))
+            .isEqualTo("Les aventures de Cervantès")
+    }
 }
+

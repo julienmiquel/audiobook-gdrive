@@ -6,6 +6,7 @@ import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.BookListRow
 import com.julienmiquel.audiotheque.core.db.BookmarkEntity
 import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
+import com.julienmiquel.audiotheque.core.db.ListeningSessionEntity
 import com.julienmiquel.audiotheque.core.db.PendingOperationEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
@@ -25,7 +26,9 @@ import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
 import com.julienmiquel.audiotheque.core.parse.FolderNameParser
+import com.julienmiquel.audiotheque.core.parse.SeriesInfo
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
+import com.julienmiquel.audiotheque.core.settings.LibrarySort
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.sync.SyncRequester
@@ -58,6 +61,8 @@ data class LibraryItem(
     val cover: String?,
     /** Clé de tri alphabétique, calculée une fois. */
     val sortKey: String = TextNormalizer.key(title),
+    /** Série et numéro de tome détectés automatiquement, le cas échéant. */
+    val series: SeriesInfo? = FolderNameParser.extractSeries(title, book.effectiveDriveName),
 ) {
     val id: String get() = book.driveId
     val isZip: Boolean get() = book.kind == BookKind.ZIP
@@ -85,6 +90,9 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
         account.flatMapLatest { db.progressDao().observe(bookId, it) }
 
     fun observeBookmarks(bookId: String): Flow<List<BookmarkEntity>> = db.bookmarkDao().observeForBook(bookId)
+
+    fun observeListeningSessions(): Flow<List<ListeningSessionEntity>> =
+        account.flatMapLatest { db.listeningSessionDao().observeForAccount(it) }
 
     fun observePairs(): Flow<List<SyncPairEntity>> = db.syncPairDao().observeAll()
 
@@ -169,7 +177,7 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
 
         /**
          * Filtre et tri d'un onglet. La recherche porte sur toute la bibliothèque (titre, auteur,
-         * voix, nom du dossier) quand [query] n'est pas vide.
+         * voix, série, nom du dossier) quand [query] n'est pas vide.
          */
         fun filter(
             items: List<LibraryItem>,
@@ -178,27 +186,51 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
             narrator: String? = null,
             showHidden: Boolean = false,
             includeArchives: Boolean = true,
+            offlineOnly: Boolean = false,
+            sort: LibrarySort = LibrarySort.DEFAULT,
         ): List<LibraryItem> {
             val q = query.trim()
             val narratorKey = narrator?.let(TextNormalizer::key)
             return items.asSequence()
                 .filter { showHidden || !it.book.hidden }
+                .filter { !offlineOnly || it.presentTracks > 0 }
                 .filter { if (q.isNotEmpty()) includeArchives || it.status != BookStatus.ARCHIVED else status == null || it.status == status }
                 .filter { narratorKey == null || (it.narrator != null && TextNormalizer.key(it.narrator) == narratorKey) }
                 .filter {
                     q.isEmpty() || TextNormalizer.matches(it.title, q) || TextNormalizer.matches(it.author, q) ||
-                        TextNormalizer.matches(it.narrator, q) || TextNormalizer.matches(it.book.name, q)
+                        TextNormalizer.matches(it.narrator, q) || TextNormalizer.matches(it.series?.name, q) ||
+                        TextNormalizer.matches(it.book.name, q)
                 }
-                .sortedWith(comparatorFor(if (q.isNotEmpty()) null else status))
+                .sortedWith(comparatorFor(if (q.isNotEmpty()) null else status, sort))
                 .toList()
         }
 
-        private fun comparatorFor(status: BookStatus?): Comparator<LibraryItem> = when (status) {
-            BookStatus.IN_PROGRESS -> compareByDescending<LibraryItem> { it.lastListenedAt ?: 0L }
+        private fun comparatorFor(status: BookStatus?, sort: LibrarySort): Comparator<LibraryItem> = when (sort) {
+            LibrarySort.DEFAULT -> when (status) {
+                BookStatus.IN_PROGRESS -> compareByDescending<LibraryItem> { it.lastListenedAt ?: 0L }
+                    .thenByDescending { it.book.effectiveStatusChangedAt }
+                BookStatus.NEW -> compareByDescending { it.book.addedAt }
+                BookStatus.LATER, BookStatus.DONE -> compareByDescending { it.book.effectiveStatusChangedAt }
+                else -> compareBy<LibraryItem> { it.series?.let { s -> TextNormalizer.key(s.name) } ?: it.sortKey }
+                    .thenBy { it.series?.volume ?: Int.MAX_VALUE }
+                    .thenBy { it.sortKey }
+            }
+            LibrarySort.RECENTLY_LISTENED -> compareByDescending<LibraryItem> { it.lastListenedAt ?: 0L }
                 .thenByDescending { it.book.effectiveStatusChangedAt }
-            BookStatus.NEW -> compareByDescending { it.book.addedAt }
-            BookStatus.LATER, BookStatus.DONE -> compareByDescending { it.book.effectiveStatusChangedAt }
-            else -> compareBy { it.sortKey }
+                .thenBy { it.sortKey }
+            LibrarySort.ADDED_DESC -> compareByDescending<LibraryItem> { it.book.addedAt }
+                .thenBy { it.sortKey }
+            LibrarySort.TITLE_ASC -> compareBy<LibraryItem> { it.series?.let { s -> TextNormalizer.key(s.name) } ?: it.sortKey }
+                .thenBy { it.series?.volume ?: Int.MAX_VALUE }
+                .thenBy { it.sortKey }
+            LibrarySort.AUTHOR_ASC -> compareBy<LibraryItem> { TextNormalizer.keyOrNull(it.author) ?: "\uFFFF" }
+                .thenBy { it.series?.let { s -> TextNormalizer.key(s.name) } ?: it.sortKey }
+                .thenBy { it.series?.volume ?: Int.MAX_VALUE }
+                .thenBy { it.sortKey }
+            LibrarySort.DURATION_ASC -> compareBy<LibraryItem> { it.durationMs ?: Long.MAX_VALUE }
+                .thenBy { it.sortKey }
+            LibrarySort.DURATION_DESC -> compareByDescending<LibraryItem> { it.durationMs ?: -1L }
+                .thenBy { it.sortKey }
         }
     }
 }

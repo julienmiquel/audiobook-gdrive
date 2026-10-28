@@ -26,6 +26,22 @@ import kotlinx.coroutines.flow.map
 
 enum class ThemeMode { DARK, LIGHT, SYSTEM }
 
+/** Ordre de tri choisi par l'utilisateur dans la bibliothèque. */
+enum class LibrarySort(val label: String) {
+    DEFAULT("Tri intelligent (par défaut)"),
+    RECENTLY_LISTENED("Écoutés récemment"),
+    ADDED_DESC("Ajoutés récemment"),
+    TITLE_ASC("Titre (A → Z et tomes)"),
+    AUTHOR_ASC("Auteur (A → Z)"),
+    DURATION_ASC("Durée (du plus court)"),
+    DURATION_DESC("Durée (du plus long)"),
+    ;
+
+    companion object {
+        fun fromName(name: String?): LibrarySort = entries.firstOrNull { it.name == name } ?: DEFAULT
+    }
+}
+
 /** Réglages de l'app (écrans Réglages et Dossiers synchronisés). */
 data class AppSettings(
     val accountEmail: String? = null,
@@ -66,6 +82,10 @@ data class AppSettings(
     val binauralAzimuthDeg: Int = 0,
     /** Pièce simulée en mode binaural. */
     val binauralRoom: BinauralRoom = BinauralRoom.SMALL,
+    /** Tri actif de la bibliothèque. */
+    val librarySort: LibrarySort = LibrarySort.DEFAULT,
+    /** Affichage de la bibliothèque en grille de pochettes (sinon liste détaillée). */
+    val libraryGrid: Boolean = false,
 ) {
     /** Clé de compte de la progression (propre à chaque utilisateur). */
     val accountKey: String
@@ -145,6 +165,8 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val customTimerMinutes = intPreferencesKey("custom_timer_minutes")
         val binauralAzimuthDeg = intPreferencesKey("binaural_azimuth_deg")
         val binauralRoom = stringPreferencesKey("binaural_room")
+        val librarySort = stringPreferencesKey("library_sort")
+        val libraryGrid = booleanPreferencesKey("library_grid")
 
         val pageToken = stringPreferencesKey("sync_page_token")
         val pageTokenAccount = stringPreferencesKey("sync_page_token_account")
@@ -182,6 +204,8 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             customTimerMinutes = (this[K.customTimerMinutes] ?: d.customTimerMinutes).coerceIn(5, 180),
             binauralAzimuthDeg = (this[K.binauralAzimuthDeg] ?: d.binauralAzimuthDeg).coerceIn(-45, 45),
             binauralRoom = BinauralRoom.fromName(this[K.binauralRoom]),
+            librarySort = LibrarySort.fromName(this[K.librarySort]),
+            libraryGrid = this[K.libraryGrid] ?: d.libraryGrid,
         )
     }
 
@@ -210,6 +234,8 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p[K.customTimerMinutes] = customTimerMinutes
         p[K.binauralAzimuthDeg] = binauralAzimuthDeg
         p[K.binauralRoom] = binauralRoom.name
+        p[K.librarySort] = librarySort.name
+        p[K.libraryGrid] = libraryGrid
     }
 
     private fun Preferences.toSyncState() = SyncState(

@@ -292,6 +292,12 @@ interface BookmarkDao {
     @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY trackIndex, positionMs")
     fun observeForBook(bookId: String): Flow<List<BookmarkEntity>>
 
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY trackIndex, positionMs")
+    suspend fun forBook(bookId: String): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks ORDER BY bookId, trackIndex, positionMs")
+    suspend fun all(): List<BookmarkEntity>
+
     @Insert
     suspend fun insert(bookmark: BookmarkEntity): Long
 
@@ -475,3 +481,25 @@ interface SyncPairDao {
         insertAll(pairs)
     }
 }
+
+@Dao
+interface ListeningSessionDao {
+    @Insert
+    suspend fun insert(session: ListeningSessionEntity): Long
+
+    @Update
+    suspend fun update(session: ListeningSessionEntity)
+
+    @Query("SELECT * FROM listening_sessions WHERE id = :id")
+    suspend fun get(id: Long): ListeningSessionEntity?
+
+    @Query("SELECT * FROM listening_sessions WHERE account = :account ORDER BY startedAt DESC")
+    fun observeForAccount(account: String): Flow<List<ListeningSessionEntity>>
+
+    @Query("SELECT * FROM listening_sessions WHERE account = :account ORDER BY startedAt DESC")
+    suspend fun forAccount(account: String): List<ListeningSessionEntity>
+
+    @Query("UPDATE listening_sessions SET account = :to WHERE account = :from")
+    suspend fun migrateAccount(from: String, to: String)
+}
+

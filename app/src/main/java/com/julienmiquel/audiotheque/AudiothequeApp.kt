@@ -111,6 +111,7 @@ class AppContainer(private val app: Application) {
     val library = LibraryRepository(database, settings)
     val gestures = StatusGestures(database, settings, scheduler, clock)
     val editor = BookEditor(database)
+    val backup = com.julienmiquel.audiotheque.library.BackupManager(database, settings, clock)
 
     /**
      * Sources de pochettes, dans l'ordre : Google Books (résumé compris), Apple Books (vraies
@@ -432,6 +433,7 @@ class AppContainer(private val app: Application) {
     suspend fun onSignedIn(email: String, name: String?) = accountLock.withLock {
         settings.update { it.copy(accountEmail = email, accountName = name, onboardingDone = true) }
         database.progressDao().migrateAccount(Accounts.LOCAL, email)
+        database.listeningSessionDao().migrateAccount(Accounts.LOCAL, email)
         settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
         syncNotifications.dismissAuthRequired()
         scheduler.schedulePeriodic(settings.current())

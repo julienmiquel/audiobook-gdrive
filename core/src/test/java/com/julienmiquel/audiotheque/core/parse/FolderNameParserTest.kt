@@ -101,4 +101,33 @@ class FolderNameParserTest {
         assertThat(reparsed.title).isEqualTo("La Guerre des mondes")
         assertThat(reparsed.author).isEqualTo("H. G. Wells")
     }
+
+    @Test
+    fun `détection automatique des séries et numéros de tome`() {
+        assertThat(FolderNameParser.extractSeries("[Les Rois maudits 2] La Reine étranglée"))
+            .isEqualTo(SeriesInfo("Les Rois maudits", 2))
+        assertThat(FolderNameParser.extractSeries("Fondation (Le Cycle de Fondation, Tome 1)"))
+            .isEqualTo(SeriesInfo("Le Cycle de Fondation", 1))
+        assertThat(FolderNameParser.extractSeries("Harry Potter (Tome 4)"))
+            .isEqualTo(SeriesInfo("Harry Potter", 4))
+        assertThat(FolderNameParser.extractSeries("Les Rois maudits - Tome 2 : La Reine étranglée"))
+            .isEqualTo(SeriesInfo("Les Rois maudits", 2))
+        assertThat(FolderNameParser.extractSeries("Dune T01"))
+            .isEqualTo(SeriesInfo("Dune", 1))
+        assertThat(FolderNameParser.extractSeries("Dune - T.3"))
+            .isEqualTo(SeriesInfo("Dune", 3))
+        assertThat(FolderNameParser.extractSeries("Millénium, Vol. 3 - La Reine dans le palais"))
+            .isEqualTo(SeriesInfo("Millénium", 3))
+        assertThat(FolderNameParser.extractSeries("Le Seigneur des Anneaux - Livre 2 : Les Deux Tours"))
+            .isEqualTo(SeriesInfo("Le Seigneur des Anneaux", 2))
+        assertThat(FolderNameParser.extractSeries("Millénium 1 - Les Hommes qui n'aimaient pas les femmes"))
+            .isEqualTo(SeriesInfo("Millénium", 1))
+
+        assertThat(FolderNameParser.extractSeries("Civilisations")).isNull()
+        assertThat(FolderNameParser.extractSeries("1984")).isNull()
+        assertThat(FolderNameParser.extractSeries("Fahrenheit 451")).isNull()
+        assertThat(FolderNameParser.extractSeries("2001 - L'Odyssée de l'espace")).isNull()
+        assertThat(FolderNameParser.extractSeries("Partie 1 - Le départ")).isNull()
+    }
 }
+

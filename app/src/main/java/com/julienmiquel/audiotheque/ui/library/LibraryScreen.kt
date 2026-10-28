@@ -1,7 +1,10 @@
-@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 
 package com.julienmiquel.audiotheque.ui.library
 
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -12,6 +15,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -19,19 +23,32 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.LibraryBooks
+import androidx.compose.material.icons.automirrored.filled.Sort
+import androidx.compose.material.icons.automirrored.filled.ViewList
 import androidx.compose.material.icons.filled.Archive
+import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Bookmarks
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Downloading
 import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.OfflinePin
@@ -42,6 +59,8 @@ import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.WatchLater
+import androidx.compose.material3.AssistChip
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -53,8 +72,10 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.PrimaryScrollableTabRow
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
@@ -70,9 +91,12 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -83,13 +107,17 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import coil3.compose.AsyncImage
 import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
+import com.julienmiquel.audiotheque.core.settings.LibrarySort
 import com.julienmiquel.audiotheque.core.util.Formats
+import com.julienmiquel.audiotheque.library.BookRecommendation
+import com.julienmiquel.audiotheque.library.BookRecommender
 import com.julienmiquel.audiotheque.library.Gesture
 import com.julienmiquel.audiotheque.library.LibraryItem
 import com.julienmiquel.audiotheque.library.LibraryRepository
@@ -101,6 +129,7 @@ import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
 import com.julienmiquel.audiotheque.ui.common.StatusTag
 import com.julienmiquel.audiotheque.ui.common.Tag
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -128,10 +157,13 @@ data class LibraryUiState(
     val counts: Map<String, Int> = emptyMap(),
     val selected: LibraryTab? = null,
     val items: List<LibraryItem> = emptyList(),
-    val recommendations: List<com.julienmiquel.audiotheque.library.BookRecommendation> = emptyList(),
+    val recommendations: List<BookRecommendation> = emptyList(),
     val query: String = "",
     val narrator: String? = null,
     val narrators: List<String> = emptyList(),
+    val offlineOnly: Boolean = false,
+    val sort: LibrarySort = LibrarySort.DEFAULT,
+    val gridView: Boolean = false,
     val engine: EngineStatus = EngineStatus(),
     val refreshingPairs: Set<Long> = emptySet(),
     val pendingMoves: Int = 0,
@@ -140,13 +172,20 @@ data class LibraryUiState(
     val searching: Boolean get() = query.isNotBlank()
 }
 
-private data class Filters(val query: String, val narrator: String?, val selectedKey: String?)
+private data class Filters(
+    val query: String,
+    val narrator: String?,
+    val selectedKey: String?,
+    val offlineOnly: Boolean,
+)
+
 private data class Activity(val engine: EngineStatus, val refreshing: Set<Long>, val pendingMoves: Int)
 
 class LibraryViewModel(private val c: AppContainer) : ViewModel() {
     private val query = MutableStateFlow("")
     private val narrator = MutableStateFlow<String?>(null)
     private val selectedKey = MutableStateFlow<String?>(null)
+    private val offlineOnly = MutableStateFlow(false)
     private val lastRefresh = mutableMapOf<Long, Long>()
 
     /** Listes, onglets et compteurs : recalculés hors du thread principal, seulement si la bibliothèque ou les filtres changent. */
@@ -154,24 +193,51 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
         c.library.observeLibrary(),
         c.library.observePairs(),
         c.settings.settings,
-        combine(query, narrator, selectedKey) { q, n, s -> Filters(q, n, s) },
+        combine(query, narrator, selectedKey, offlineOnly) { q, n, s, o -> Filters(q, n, s, o) },
     ) { all, pairs, settings, filters ->
         val tabs = buildTabs(pairs, settings.showArchives)
         val visible = all.filter { settings.showHidden || !it.book.hidden }
-        val counts = tabs.associate { tab -> tab.key to visible.count { tab.matches(it) } }
+        val baseCounts = tabs.associate { tab -> tab.key to visible.count { tab.matches(it) } }
+        val counts = if (filters.offlineOnly) {
+            tabs.associate { tab -> tab.key to visible.count { tab.matches(it) && it.presentTracks > 0 } }
+        } else {
+            baseCounts
+        }
         val selected = tabs.firstOrNull { it.key == filters.selectedKey }
-            ?: tabs.firstOrNull { it.status == BookStatus.IN_PROGRESS && (counts[it.key] ?: 0) > 0 }
+            ?: tabs.firstOrNull { it.status == BookStatus.IN_PROGRESS && (baseCounts[it.key] ?: 0) > 0 }
             ?: tabs.firstOrNull { it.status == BookStatus.NEW }
             ?: tabs.firstOrNull()
         val items = when {
             filters.query.isNotBlank() ->
-                LibraryRepository.filter(all, null, filters.query, filters.narrator, settings.showHidden, settings.showArchives)
+                LibraryRepository.filter(
+                    items = all,
+                    status = null,
+                    query = filters.query,
+                    narrator = filters.narrator,
+                    showHidden = settings.showHidden,
+                    includeArchives = settings.showArchives,
+                    offlineOnly = filters.offlineOnly,
+                    sort = settings.librarySort,
+                )
             selected != null ->
-                LibraryRepository.filter(all, selected.status, "", filters.narrator, settings.showHidden).filter { selected.matches(it) }
+                LibraryRepository.filter(
+                    items = all,
+                    status = selected.status,
+                    query = "",
+                    narrator = filters.narrator,
+                    showHidden = settings.showHidden,
+                    offlineOnly = filters.offlineOnly,
+                    sort = settings.librarySort,
+                ).filter { selected.matches(it) }
             else -> emptyList()
         }
-        val recommendations = if (filters.query.isBlank() && filters.narrator == null && selected?.status == BookStatus.NEW) {
-            com.julienmiquel.audiotheque.library.BookRecommender.recommend(visible, limit = 5)
+        val recommendations = if (
+            filters.query.isBlank() &&
+            filters.narrator == null &&
+            !filters.offlineOnly &&
+            selected?.status == BookStatus.NEW
+        ) {
+            BookRecommender.recommend(visible, limit = 5)
         } else {
             emptyList()
         }
@@ -185,6 +251,9 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
             query = filters.query,
             narrator = filters.narrator,
             narrators = LibraryRepository.narrators(visible),
+            offlineOnly = filters.offlineOnly,
+            sort = settings.librarySort,
+            gridView = settings.libraryGrid,
             totalBooks = visible.size,
         )
     }.flowOn(Dispatchers.Default)
@@ -206,6 +275,20 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
     fun setQuery(text: String) = query.update { text }
 
     fun setNarrator(name: String?) = narrator.update { name }
+
+    fun toggleOfflineOnly() = offlineOnly.update { !it }
+
+    fun setSort(sort: LibrarySort) {
+        viewModelScope.launch {
+            c.settings.update { it.copy(librarySort = sort) }
+        }
+    }
+
+    fun toggleGridView() {
+        viewModelScope.launch {
+            c.settings.update { it.copy(libraryGrid = !it.libraryGrid) }
+        }
+    }
 
     fun select(tab: LibraryTab) {
         selectedKey.value = tab.key
@@ -276,6 +359,7 @@ fun LibraryScreen(
     onOpenBook: (String) -> Unit,
     onOpenPlayer: () -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenStats: () -> Unit = {},
     contentPadding: PaddingValues,
 ) {
     val container = LocalAppContainer.current
@@ -284,6 +368,7 @@ fun LibraryScreen(
     // Texte de recherche lu directement (sans attendre le calcul des résultats en arrière-plan).
     val queryText by vm.queryText.collectAsStateWithLifecycle()
     var searchOpen by rememberSaveable { mutableStateOf(false) }
+    var sortMenu by remember { mutableStateOf(false) }
     var narratorMenu by remember { mutableStateOf(false) }
     var pulling by remember { mutableStateOf(false) }
 
@@ -312,31 +397,46 @@ fun LibraryScreen(
                 TopAppBar(
                     title = { Text("Bibliothèque") },
                     actions = {
-                        IconButton(onClick = { searchOpen = true }) { Icon(Icons.Filled.Search, contentDescription = "Rechercher") }
+                        IconButton(onClick = { searchOpen = true }) {
+                            Icon(Icons.Filled.Search, contentDescription = "Rechercher")
+                        }
                         Box {
-                            IconButton(onClick = { narratorMenu = true }, enabled = state.narrators.isNotEmpty()) {
-                                Icon(Icons.Filled.RecordVoiceOver, contentDescription = "Filtrer par voix (Lu par)")
+                            IconButton(onClick = { sortMenu = true }) {
+                                Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = "Trier la bibliothèque")
                             }
-                            DropdownMenu(expanded = narratorMenu, onDismissRequest = { narratorMenu = false }) {
-                                DropdownMenuItem(
-                                    text = { Text("Toutes les voix") },
-                                    onClick = {
-                                        vm.setNarrator(null)
-                                        narratorMenu = false
-                                    },
-                                )
-                                state.narrators.forEach { name ->
+                            DropdownMenu(expanded = sortMenu, onDismissRequest = { sortMenu = false }) {
+                                LibrarySort.entries.forEach { sortOption ->
+                                    val active = sortOption == state.sort
                                     DropdownMenuItem(
-                                        text = { Text("Lu par $name") },
+                                        text = {
+                                            Text(
+                                                sortOption.label,
+                                                fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                            )
+                                        },
+                                        leadingIcon = if (active) {
+                                            { Icon(Icons.Filled.Check, contentDescription = null) }
+                                        } else {
+                                            null
+                                        },
                                         onClick = {
-                                            vm.setNarrator(name)
-                                            narratorMenu = false
+                                            vm.setSort(sortOption)
+                                            sortMenu = false
                                         },
                                     )
                                 }
                             }
                         }
-                        IconButton(onClick = onOpenSettings) { Icon(Icons.Filled.Settings, contentDescription = "Réglages") }
+                        IconButton(onClick = vm::toggleGridView) {
+                            if (state.gridView) {
+                                Icon(Icons.AutoMirrored.Filled.ViewList, contentDescription = "Affichage en liste")
+                            } else {
+                                Icon(Icons.Filled.GridView, contentDescription = "Affichage en grille")
+                            }
+                        }
+                        IconButton(onClick = onOpenSettings) {
+                            Icon(Icons.Filled.Settings, contentDescription = "Réglages")
+                        }
                     },
                 )
             }
@@ -362,16 +462,15 @@ fun LibraryScreen(
                 }
             }
             ActivityBar(state)
-            if (state.narrator != null) {
-                Row(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                    FilterChip(
-                        selected = true,
-                        onClick = { vm.setNarrator(null) },
-                        label = { Text("Lu par ${state.narrator}") },
-                        trailingIcon = { Icon(Icons.Filled.Close, contentDescription = "Retirer le filtre", modifier = Modifier.size(18.dp)) },
-                    )
-                }
-            }
+            QuickFilterRow(
+                state = state,
+                narratorMenu = narratorMenu,
+                onNarratorMenuChange = { narratorMenu = it },
+                onToggleOffline = vm::toggleOfflineOnly,
+                onSelectNarrator = vm::setNarrator,
+                onResetSort = { vm.setSort(LibrarySort.DEFAULT) },
+                onOpenStats = onOpenStats,
+            )
             val refreshing = pulling || (state.selected?.pair?.id?.let { it in state.refreshingPairs } ?: false)
             PullToRefreshBox(
                 isRefreshing = refreshing,
@@ -381,16 +480,110 @@ fun LibraryScreen(
                 },
                 modifier = Modifier.fillMaxSize(),
             ) {
-                BookList(
-                    state = state,
-                    onOpenBook = onOpenBook,
-                    onGesture = vm::gesture,
-                    onPlay = { item ->
-                        vm.play(item)
-                        onOpenPlayer()
-                    },
+                val onPlayBook: (LibraryItem) -> Unit = { item ->
+                    vm.play(item)
+                    onOpenPlayer()
+                }
+                if (state.gridView && !(state.loaded && state.items.isEmpty())) {
+                    BookGrid(
+                        state = state,
+                        onOpenBook = onOpenBook,
+                        onGesture = vm::gesture,
+                        onPlay = onPlayBook,
+                    )
+                } else {
+                    BookList(
+                        state = state,
+                        onOpenBook = onOpenBook,
+                        onGesture = vm::gesture,
+                        onPlay = onPlayBook,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun QuickFilterRow(
+    state: LibraryUiState,
+    narratorMenu: Boolean,
+    onNarratorMenuChange: (Boolean) -> Unit,
+    onToggleOffline: () -> Unit,
+    onSelectNarrator: (String?) -> Unit,
+    onResetSort: () -> Unit,
+    onOpenStats: () -> Unit,
+) {
+    LazyRow(
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        item(key = "chip-offline") {
+            FilterChip(
+                selected = state.offlineOnly,
+                onClick = onToggleOffline,
+                label = { Text("Hors ligne", maxLines = 1) },
+                leadingIcon = { Icon(Icons.Filled.OfflinePin, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            )
+        }
+        if (state.narrators.isNotEmpty() || state.narrator != null) {
+            item(key = "chip-narrator") {
+                Box {
+                    FilterChip(
+                        selected = state.narrator != null,
+                        onClick = {
+                            if (state.narrator != null && state.narrators.isEmpty()) {
+                                onSelectNarrator(null)
+                            } else {
+                                onNarratorMenuChange(true)
+                            }
+                        },
+                        label = { Text(state.narrator?.let { "Lu par $it" } ?: "Voix", maxLines = 1) },
+                        leadingIcon = { Icon(Icons.Filled.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                        trailingIcon = if (state.narrator != null) {
+                            { Icon(Icons.Filled.Close, contentDescription = null, modifier = Modifier.size(16.dp)) }
+                        } else {
+                            null
+                        },
+                    )
+                    DropdownMenu(expanded = narratorMenu, onDismissRequest = { onNarratorMenuChange(false) }) {
+                        DropdownMenuItem(
+                            text = { Text("Toutes les voix") },
+                            onClick = {
+                                onSelectNarrator(null)
+                                onNarratorMenuChange(false)
+                            },
+                        )
+                        state.narrators.forEach { name ->
+                            DropdownMenuItem(
+                                text = { Text("Lu par $name") },
+                                onClick = {
+                                    onSelectNarrator(name)
+                                    onNarratorMenuChange(false)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+        if (state.sort != LibrarySort.DEFAULT) {
+            item(key = "chip-sort") {
+                FilterChip(
+                    selected = true,
+                    onClick = onResetSort,
+                    label = { Text(state.sort.label, maxLines = 1) },
+                    trailingIcon = { Icon(Icons.Filled.Close, contentDescription = "Réinitialiser le tri", modifier = Modifier.size(16.dp)) },
                 )
             }
+        }
+        item(key = "chip-stats") {
+            AssistChip(
+                onClick = onOpenStats,
+                label = { Text("Statistiques", maxLines = 1) },
+                leadingIcon = { Icon(Icons.Filled.BarChart, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            )
         }
     }
 }
@@ -407,7 +600,7 @@ private fun SearchTopBar(query: String, onQuery: (String) -> Unit, onClose: () -
             TextField(
                 value = query,
                 onValueChange = onQuery,
-                placeholder = { Text("Titre, auteur, voix…") },
+                placeholder = { Text("Titre, auteur, série, voix…") },
                 singleLine = true,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 colors = TextFieldDefaults.colors(
@@ -510,8 +703,206 @@ private fun BookList(
 }
 
 @Composable
+private fun BookGrid(
+    state: LibraryUiState,
+    onOpenBook: (String) -> Unit,
+    onGesture: (LibraryItem, Gesture) -> Unit,
+    onPlay: (LibraryItem) -> Unit,
+) {
+    val gridState = rememberLazyGridState()
+    LazyVerticalGrid(
+        columns = GridCells.Adaptive(minSize = 156.dp),
+        state = gridState,
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 6.dp, bottom = 24.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        if (state.searching) {
+            item(key = "search-header", span = { GridItemSpan(maxLineSpan) }) {
+                Text(
+                    "Résultats dans toute la bibliothèque · ${Labels.books(state.items.size)}",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
+                )
+            }
+        } else if (state.recommendations.isNotEmpty()) {
+            item(key = "recommendations", span = { GridItemSpan(maxLineSpan) }, contentType = "recommendations") {
+                RecommendationsStrip(
+                    recommendations = state.recommendations,
+                    onOpenBook = onOpenBook,
+                    onGesture = onGesture,
+                )
+            }
+        }
+        items(state.items, key = { it.id }, contentType = { "book-grid" }) { item ->
+            BookGridCard(
+                item = item,
+                showStatus = state.searching,
+                onClick = { onOpenBook(item.id) },
+                onGesture = { onGesture(item, it) },
+                onPlay = { onPlay(item) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun BookGridCard(
+    item: LibraryItem,
+    showStatus: Boolean,
+    onClick: () -> Unit,
+    onGesture: (Gesture) -> Unit,
+    onPlay: () -> Unit,
+) {
+    var menu by remember { mutableStateOf(false) }
+    val gestures = Gesture.forStatus(item.status)
+    Box {
+        OutlinedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(CardDefaults.outlinedShape)
+                .combinedClickable(
+                    onClickLabel = "Ouvrir la fiche",
+                    onLongClickLabel = "Changer de statut",
+                    onLongClick = { if (gestures.isNotEmpty()) menu = true },
+                    onClick = onClick,
+                ),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
+        ) {
+            Column {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .aspectRatio(1f)
+                        .background(MaterialTheme.colorScheme.secondaryContainer),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        text = gridInitials(item.title),
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.onSecondaryContainer,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clearAndSetSemantics { },
+                    )
+                    if (!item.cover.isNullOrBlank()) {
+                        AsyncImage(
+                            model = if (item.cover!!.startsWith("http")) item.cover else File(item.cover!!),
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                    if (item.isDownloaded) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.92f),
+                            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(8.dp),
+                        ) {
+                            Icon(
+                                Icons.Filled.OfflinePin,
+                                contentDescription = "Disponible hors ligne",
+                                modifier = Modifier
+                                    .padding(4.dp)
+                                    .size(16.dp),
+                            )
+                        }
+                    }
+                }
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    if (showStatus) {
+                        StatusTag(item.status)
+                    }
+                    item.series?.let { series ->
+                        Tag(series.displayLabel, icon = Icons.Filled.Bookmarks)
+                    }
+                    Text(
+                        item.title,
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    item.author?.let { author ->
+                        Text(
+                            author,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    val percent = item.percent
+                    if (percent != null && percent > 0f && !item.finished) {
+                        BookProgress(percent, label = Formats.percent(percent))
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            item.durationMs?.let { Formats.duration(it, approximate = !item.durationExact) } ?: "",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            modifier = Modifier.weight(1f),
+                        )
+                        val gesture = LibraryViewModel.inlineGesture(item)
+                        when {
+                            item.presentTracks > 0 && (item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION) ->
+                                FilledTonalIconButton(
+                                    onClick = onPlay,
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.PlayArrow,
+                                        contentDescription = "Écouter ${item.title}",
+                                        modifier = Modifier.size(18.dp),
+                                    )
+                                }
+                            gesture != null ->
+                                FilledTonalButton(
+                                    onClick = { onGesture(gesture) },
+                                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                                    modifier = Modifier.height(28.dp),
+                                ) {
+                                    Text(gesture.label, style = MaterialTheme.typography.labelSmall, maxLines = 1)
+                                }
+                        }
+                    }
+                }
+            }
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            gestures.forEach { g ->
+                DropdownMenuItem(
+                    text = { Text(g.label) },
+                    onClick = {
+                        menu = false
+                        onGesture(g)
+                    },
+                )
+            }
+        }
+    }
+}
+
+private fun gridInitials(title: String): String {
+    val words = title.split(' ', '-', '\'', '’').filter { w -> w.any { it.isLetterOrDigit() } }
+    val significant = words.filter { it.length > 2 }.ifEmpty { words }
+    return significant.take(2).joinToString("") { w -> w.first { it.isLetterOrDigit() }.uppercase() }.ifEmpty { "♪" }
+}
+
+@Composable
 private fun RecommendationsStrip(
-    recommendations: List<com.julienmiquel.audiotheque.library.BookRecommendation>,
+    recommendations: List<BookRecommendation>,
     onOpenBook: (String) -> Unit,
     onGesture: (LibraryItem, Gesture) -> Unit,
 ) {
@@ -523,12 +914,12 @@ private fun RecommendationsStrip(
             fontWeight = FontWeight.SemiBold,
             modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
         )
-        androidx.compose.foundation.lazy.LazyRow(
+        LazyRow(
             contentPadding = PaddingValues(horizontal = 16.dp),
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             items(recommendations, key = { "rec-${it.item.id}" }) { rec ->
-                androidx.compose.material3.OutlinedCard(
+                OutlinedCard(
                     onClick = { onOpenBook(rec.item.id) },
                     modifier = Modifier.width(248.dp),
                 ) {
@@ -591,6 +982,7 @@ private fun EmptyLibrary(state: LibraryUiState) {
     when {
         state.searching -> EmptyState(Icons.Filled.SearchOff, "Aucun résultat", "Rien ne correspond à « ${state.query} » dans la bibliothèque.")
         state.totalBooks == 0 && state.engine.running -> EmptyState(Icons.Filled.Sync, "Première synchro en cours", "Inventaire de /AudioBook et de ses dossiers de statut…")
+        state.offlineOnly -> EmptyState(Icons.Filled.OfflinePin, "Aucun livre hors ligne", "Aucun livre de cet onglet n'a encore de piste téléchargée sur le téléphone.")
         state.narrator != null -> EmptyState(Icons.Filled.RecordVoiceOver, "Aucun livre lu par ${state.narrator}", "dans cet onglet.")
         status == BookStatus.IN_PROGRESS -> EmptyState(Icons.Filled.Headphones, "Aucun livre en écoute", "Commencez un livre depuis l'onglet Nouveaux : il sera téléchargé en entier pour l'écoute hors ligne.")
         status == BookStatus.NEW -> EmptyState(Icons.Filled.Inbox, "Aucun nouveau livre", "Les livres déposés dans _Nouveaux sur Drive apparaissent ici.")
@@ -669,6 +1061,7 @@ fun BookRow(
 @Composable
 private fun BookBadges(item: LibraryItem) {
     val colors = MaterialTheme.colorScheme
+    item.series?.let { Tag(it.displayLabel, icon = Icons.Filled.Bookmarks) }
     if (item.isZip) Tag("zip", icon = Icons.Filled.FolderZip)
     if (item.isDuplicate) Tag("doublon", icon = Icons.Filled.ContentCopy, container = colors.tertiaryContainer, content = colors.onTertiaryContainer)
     if (item.pendingSync) Tag("en attente", icon = Icons.Filled.CloudUpload)

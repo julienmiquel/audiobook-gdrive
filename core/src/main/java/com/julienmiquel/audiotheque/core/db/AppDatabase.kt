@@ -21,8 +21,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SyncRunEntity::class,
         PendingOperationEntity::class,
         SyncPairEntity::class,
+        ListeningSessionEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
     autoMigrations = [
         // v2 : clé d'auteur pour les doublons (colonne facultative, remplie au fil des synchros).
@@ -35,6 +36,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AutoMigration(from = 4, to = 5),
         // v6 : renommage normalisé dans Drive (« Titre - AUTEUR ») via la file d'opérations.
         AutoMigration(from = 5, to = 6),
+        // v7 : sessions d'écoute locales pour les statistiques d'écoute.
+        AutoMigration(from = 6, to = 7),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -47,6 +50,7 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun syncRunDao(): SyncRunDao
     abstract fun pendingOperationDao(): PendingOperationDao
     abstract fun syncPairDao(): SyncPairDao
+    abstract fun listeningSessionDao(): ListeningSessionDao
 
     /**
      * v3 : la progression quitte l'espace caché (appDataFolder) pour un fichier dans le dossier

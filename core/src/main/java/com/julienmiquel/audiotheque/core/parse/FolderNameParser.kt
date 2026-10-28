@@ -6,6 +6,11 @@ import java.util.Locale
 /** Proposition de titre, d'auteur et de voix tirée d'un nom de dossier (à confirmer). */
 data class ParsedName(val title: String, val author: String?, val narrator: String?)
 
+/** Série et numéro de tome détectés dans le titre ou le nom de dossier (« Les Rois maudits · T.2 »). */
+data class SeriesInfo(val name: String, val volume: Int?) {
+    val displayLabel: String get() = if (volume != null) "$name · T.$volume" else name
+}
+
 /**
  * Découpage automatique d'un nom de dossier Drive en titre et auteur : « - » comme séparateur,
  * « _ » remplacé par une espace (cf. spécification, « Titre et auteur »).
@@ -231,5 +236,91 @@ object FolderNameParser {
             cleanTitle
         }
         return base + ext
+    }
+
+    private val nonSeriesKeys = setOf(
+        "chapitre", "chap", "chapter", "ch", "partie", "part", "cd", "disque", "disc",
+        "piste", "track", "plage", "mp3", "m4a", "m4b", "flac", "ogg", "opus",
+        "audiobook", "audio book", "livre audio", "integrale", "version integrale", "unabridged",
+        "tome", "volume", "vol", "livre", "book", "saison", "episode",
+    )
+
+    private val bracketedSeriesWithVol = Regex(
+        """[(\[]\s*([^)\]]+?)(?:[\s,:-]+(?:tome|vol(?:ume)?\.?|livre|book|t\.?)\s*|\s+#?)(\d{1,2})\s*[)\]]""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private val bracketedStandaloneVol = Regex(
+        """^(.*?)\s*[(\[]\s*(?:tome|vol(?:ume)?\.?|livre|book|t\.?)\s*(\d{1,2})\s*[)\]]""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private val inlineExplicitTomeOrVol = Regex(
+        """^(.+?)(?:[\s,:-]+(?:tome|vol(?:ume)?\.?)\s*|\s+t\.?\s*0*|\s*[-–—]\s*t\.?\s*0*|[\s,:-]+(?:livre|book)\s+)(\d{1,2})(?:\b|[\s,:.-].*|$)""",
+        RegexOption.IGNORE_CASE,
+    )
+
+    private val inlineNumberedSubtitle = Regex(
+        """^(\p{L}[^-–—:()\[\]]*?\p{L})\s+(\d{1,2})\s*[-–—:]\s*(.*\p{L}{3,}.*)$""",
+    )
+
+    /**
+     * Détecte une série et un numéro de tome éventuel à partir du titre affiché ou du nom Drive brut
+     * (« [Les Rois maudits 2] … », « Dune - T.3 », « Millénium, Vol. 3 », « Fondation - Tome 1 »).
+     */
+    fun extractSeries(title: String, rawName: String = ""): SeriesInfo? {
+        extractFromSingleCandidate(title)?.let { return it }
+        if (rawName.isNotBlank() && rawName != title) {
+            val normalizedRaw = rawName.replace('_', ' ').replace(spaces, " ").trim()
+            bracketedSeriesWithVol.find(normalizedRaw)?.let { m ->
+                buildSeriesInfo(m.groupValues[1], m.groupValues[2].toIntOrNull())?.let { return it }
+            }
+            val parsedRawTitle = parse(rawName).title
+            if (parsedRawTitle != title) {
+                extractFromSingleCandidate(parsedRawTitle)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun extractFromSingleCandidate(candidate: String): SeriesInfo? {
+        val clean = candidate.replace('_', ' ').replace(spaces, " ").trim()
+        if (clean.isEmpty()) return null
+
+        bracketedSeriesWithVol.find(clean)?.let { m ->
+            buildSeriesInfo(m.groupValues[1], m.groupValues[2].toIntOrNull())?.let { return it }
+        }
+
+        bracketedStandaloneVol.find(clean)?.let { m ->
+            val rawPrefix = m.groupValues[1].split(separator).firstOrNull().orEmpty()
+            buildSeriesInfo(rawPrefix, m.groupValues[2].toIntOrNull())?.let { return it }
+        }
+
+        inlineExplicitTomeOrVol.find(clean)?.let { m ->
+            buildSeriesInfo(m.groupValues[1], m.groupValues[2].toIntOrNull())?.let { return it }
+        }
+
+        inlineNumberedSubtitle.find(clean)?.let { m ->
+            val vol = m.groupValues[2].toIntOrNull()
+            if (vol != null && vol in 1..30) {
+                buildSeriesInfo(m.groupValues[1], vol)?.let { return it }
+            }
+        }
+
+        return null
+    }
+
+    private fun buildSeriesInfo(rawSeries: String, volume: Int?): SeriesInfo? {
+        if (volume != null && volume !in 1..99) return null
+        val trimmed = rawSeries
+            .replace(spaces, " ")
+            .trim()
+            .trim('-', '–', '—', ':', ',', ';', '.', '(', ')', '[', ']')
+            .trim()
+        if (trimmed.length < 2 || trimmed.none { it.isLetter() }) return null
+        val key = TextNormalizer.key(trimmed)
+        if (key.isBlank() || key in nonSeriesKeys) return null
+        if (trimmed.all { it.isDigit() }) return null
+        return SeriesInfo(name = prettyTitle(trimmed), volume = volume)
     }
 }

@@ -128,6 +128,12 @@ class PlaybackService : MediaLibraryService() {
     private var pausedAt: Long? = null
     private var waitingForNext = false
 
+    /** Suivi du temps d'écoute réel (horloge murale pendant la lecture effective uniquement). */
+    private var playStartedWallMs: Long? = null
+    private var openSessionId: Long? = null
+    private var openSessionBookId: String? = null
+    private var openSessionEndedAt: Long = 0L
+
     /** Faux tant que le livre chargé n'a été ni écouté ni déplacé par l'utilisateur. */
     private var persistEnabled = false
 
@@ -272,12 +278,14 @@ class PlaybackService : MediaLibraryService() {
 
     override fun onTaskRemoved(rootIntent: Intent?) {
         if (!exo.playWhenReady || exo.mediaItemCount == 0) {
+            recordListeningSlice(resetIfPlaying = false, closeSession = true)
             persistNow(push = true)
             stopSelf()
         }
     }
 
     override fun onDestroy() {
+        recordListeningSlice(resetIfPlaying = false, closeSession = true)
         persistNow(push = true)
         unregisterShake()
         shakeGraceJob?.cancel()
@@ -419,11 +427,13 @@ class PlaybackService : MediaLibraryService() {
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) {
+                playStartedWallMs = System.currentTimeMillis()
                 pausedAt = null
                 persistEnabled = true
                 listenedSinceSave = true
                 startTicker()
             } else {
+                recordListeningSlice(resetIfPlaying = false)
                 if (exo.playbackState != Player.STATE_ENDED && exo.playbackState != Player.STATE_BUFFERING) {
                     pausedAt = System.currentTimeMillis()
                 }
@@ -534,7 +544,75 @@ class PlaybackService : MediaLibraryService() {
         tickerJob = scope.launch {
             while (isActive) {
                 delay(SAVE_INTERVAL_MS)
+                recordListeningSlice(resetIfPlaying = true)
                 persistNow()
+            }
+        }
+    }
+
+    /**
+     * Enregistre une tranche de temps d'écoute réel (horloge murale pendant la lecture active).
+     * Deux tranches sur le même livre espacées de moins de 15 minutes le même jour sont fusionnées.
+     */
+    private fun recordListeningSlice(resetIfPlaying: Boolean, closeSession: Boolean = false) {
+        val now = System.currentTimeMillis()
+        val started = playStartedWallMs
+        playStartedWallMs = if (resetIfPlaying && exo.isPlaying) now else null
+        val bookId = currentBook?.driveId
+        val deltaMs = if (started != null && bookId != null) {
+            (now - started).coerceIn(0L, 5 * 60_000L)
+        } else {
+            0L
+        }
+        if (deltaMs < 500L && !closeSession) return
+        persistScope.launch(start = CoroutineStart.UNDISPATCHED) {
+            persistMutex.withLock {
+                if (deltaMs >= 500L && bookId != null && started != null) {
+                    val account = deps.settings.current().accountKey
+                    val dao = deps.database.listeningSessionDao()
+                    val existingId = openSessionId
+                    val zone = java.time.ZoneId.systemDefault()
+                    val sameDay = openSessionEndedAt > 0L &&
+                        java.time.Instant.ofEpochMilli(openSessionEndedAt).atZone(zone).toLocalDate() ==
+                        java.time.Instant.ofEpochMilli(now).atZone(zone).toLocalDate()
+                    val existing = if (
+                        existingId != null &&
+                        openSessionBookId == bookId &&
+                        sameDay &&
+                        (started - openSessionEndedAt) <= 15 * 60_000L
+                    ) {
+                        dao.get(existingId)
+                    } else {
+                        null
+                    }
+                    if (existing != null && existing.account == account) {
+                        dao.update(
+                            existing.copy(
+                                endedAt = maxOf(existing.endedAt, now),
+                                durationMs = existing.durationMs + deltaMs,
+                            ),
+                        )
+                        openSessionEndedAt = now
+                    } else {
+                        val newId = dao.insert(
+                            com.julienmiquel.audiotheque.core.db.ListeningSessionEntity(
+                                bookId = bookId,
+                                account = account,
+                                startedAt = started,
+                                endedAt = now,
+                                durationMs = deltaMs,
+                            ),
+                        )
+                        openSessionId = newId
+                        openSessionBookId = bookId
+                        openSessionEndedAt = now
+                    }
+                }
+                if (closeSession) {
+                    openSessionId = null
+                    openSessionBookId = null
+                    openSessionEndedAt = 0L
+                }
             }
         }
     }
@@ -787,8 +865,14 @@ class PlaybackService : MediaLibraryService() {
 
     /** Livre chargé : protégé du nettoyage, et complété au fil des téléchargements. */
     private fun bind(book: BookEntity, tracks: List<TrackEntity>, embeddedByTrack: Map<String, List<EmbeddedChapterEntity>>) {
+        if (currentBook?.driveId != book.driveId) {
+            recordListeningSlice(resetIfPlaying = false, closeSession = true)
+        }
         currentBook = book
         currentBookIdFlow.value = book.driveId
+        if (exo.isPlaying) {
+            playStartedWallMs = System.currentTimeMillis()
+        }
         currentTracks = tracks
         currentEmbedded = embeddedByTrack
         waitingForNext = false

@@ -2,9 +2,12 @@
 
 package com.julienmiquel.audiotheque.ui.settings
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
@@ -17,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
@@ -24,9 +28,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
+import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -67,12 +75,15 @@ import com.julienmiquel.audiotheque.core.settings.ThemeMode
 import com.julienmiquel.audiotheque.ui.common.InfoCard
 import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
+import java.time.LocalDate
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class SettingsViewModel(private val c: AppContainer) : ViewModel() {
     val settings: StateFlow<AppSettings?> = c.settings.settings.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
@@ -82,6 +93,9 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
 
     private val _storagePath = MutableStateFlow<String?>(null)
     val storagePath: StateFlow<String?> = _storagePath.asStateFlow()
+
+    private val _backupBusy = MutableStateFlow(false)
+    val backupBusy: StateFlow<Boolean> = _backupBusy.asStateFlow()
 
     fun refreshStorage() {
         _storageGranted.value = c.storage.sharedStorageGranted()
@@ -100,6 +114,51 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
         viewModelScope.launch {
             c.settings.update { it.copy(previewNew = enabled) }
             c.requestSync(SyncTrigger.MANUAL)
+        }
+    }
+
+    fun exportBackup(context: Context, uri: Uri) {
+        if (_backupBusy.value) return
+        _backupBusy.value = true
+        viewModelScope.launch {
+            try {
+                val summary = withContext(Dispatchers.IO) {
+                    val res = c.backup.exportBackup()
+                    val out = context.contentResolver.openOutputStream(uri)
+                        ?: error("Impossible d'écrire dans le fichier choisi")
+                    out.bufferedWriter(Charsets.UTF_8).use { it.write(res.json) }
+                    res
+                }
+                c.message("Sauvegarde exportée : ${summary.booksCount} livre(s), ${summary.bookmarksCount} signet(s)")
+            } catch (e: Exception) {
+                c.message("Échec de l'exportation : ${e.localizedMessage ?: "erreur d'écriture"}")
+            } finally {
+                _backupBusy.value = false
+            }
+        }
+    }
+
+    fun importBackup(context: Context, uri: Uri) {
+        if (_backupBusy.value) return
+        _backupBusy.value = true
+        viewModelScope.launch {
+            try {
+                val summary = withContext(Dispatchers.IO) {
+                    val raw = context.contentResolver.openInputStream(uri)
+                        ?.bufferedReader(Charsets.UTF_8)
+                        ?.use { it.readText() }
+                        ?: error("Impossible de lire le fichier choisi")
+                    c.backup.importBackup(raw)
+                }
+                c.message(
+                    "Restauration terminée : ${summary.matchedBooks} livre(s) rapproché(s), " +
+                        "${summary.restoredBookmarks} signet(s), ${summary.restoredCorrections} correction(s)",
+                )
+            } catch (e: Exception) {
+                c.message("Fichier de sauvegarde invalide ou illisible")
+            } finally {
+                _backupBusy.value = false
+            }
         }
     }
 
@@ -122,15 +181,27 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
 }
 
 @Composable
-fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
+fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadding: PaddingValues) {
     val container = LocalAppContainer.current
     val vm: SettingsViewModel = viewModel { SettingsViewModel(container) }
     val settings by vm.settings.collectAsStateWithLifecycle()
     val granted by vm.storageGranted.collectAsStateWithLifecycle()
     val path by vm.storagePath.collectAsStateWithLifecycle()
     val signingOut by vm.signingOut.collectAsStateWithLifecycle()
+    val backupBusy by vm.backupBusy.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmSignOut by remember { mutableStateOf(false) }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri != null) vm.exportBackup(context, uri)
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) vm.importBackup(context, uri)
+    }
 
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { vm.refreshStorage() }
 
@@ -153,6 +224,19 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            InfoCard(title = "Statistiques d'écoute") {
+                Text(
+                    "Suivez votre temps d'écoute quotidien (7 et 30 jours), votre série active, vos livres terminés et vos auteurs et voix favoris.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                FilledTonalButton(onClick = onOpenStats) {
+                    Icon(Icons.Filled.BarChart, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Voir mes statistiques")
+                }
+            }
+
             InfoCard(title = "Compte Google") {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.AccountCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
@@ -168,6 +252,35 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
+            }
+
+            InfoCard(title = "Sauvegarde et restauration") {
+                Text(
+                    "Exporte ou restaure vos signets, corrections locales de titre/auteur/voix, préférences audio par livre et sessions d'écoute dans un fichier JSON, sans toucher à Google Drive.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(
+                        onClick = { exportLauncher.launch("audiotheque-sauvegarde-${LocalDate.now()}.json") },
+                        enabled = !backupBusy,
+                    ) {
+                        Icon(Icons.Filled.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Exporter (.json)")
+                    }
+                    OutlinedButton(
+                        onClick = { importLauncher.launch(arrayOf("application/json", "text/plain", "*/*")) },
+                        enabled = !backupBusy,
+                    ) {
+                        Icon(Icons.Filled.UploadFile, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Importer (.json)")
+                    }
+                }
+                if (backupBusy) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
             }
 
             InfoCard(title = "Nettoyage du téléphone") {

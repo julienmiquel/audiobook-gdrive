@@ -35,8 +35,8 @@ android {
         applicationId = "com.julienmiquel.audiotheque"
         minSdk = 33
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.2.0"
+        versionCode = 4
+        versionName = "1.3.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "WEB_CLIENT_ID", "\"$webClientId\"")
         buildConfigField("String", "CUSTOM_SEARCH_KEY", "\"$customSearchKey\"")

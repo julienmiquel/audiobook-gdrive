@@ -48,6 +48,38 @@ val TrackEntity.chapterLabel: String
 val TrackEntity.partLabel: String?
     get() = part?.let { "Partie $it" }
 
+private val GENERIC_TRACK_WORDS = setOf(
+    "piste", "track", "plage", "chapitre", "chap", "chapter", "ch",
+    "partie", "part", "cd", "disque", "disc", "audio", "mp3", "m4a", "m4b", "flac", "sur", "of",
+)
+
+/**
+ * Titre de piste réellement informatif, ou `null` lorsque [TrackEntity.title] ne fait que répéter
+ * « Piste X », « Chapitre X », le titre du livre ou le nom brut numéroté du fichier.
+ */
+fun TrackEntity.meaningfulTitle(bookTitle: String? = null, bookAuthor: String? = null): String? {
+    val trimmed = title.trim()
+    if (trimmed.isEmpty()) return null
+    if (trimmed.equals(chapterLabel, ignoreCase = true)) return null
+    var key = " ${TextNormalizer.key(trimmed)} "
+    if (key.isBlank()) return null
+    val bookKey = TextNormalizer.keyOrNull(bookTitle)
+    if (bookKey != null) {
+        key = key.replace(" $bookKey ", " ")
+    }
+    val authorKey = TextNormalizer.keyOrNull(bookAuthor)
+    if (authorKey != null) {
+        key = key.replace(" $authorKey ", " ")
+    }
+    val remainingTokens = key.trim().split(' ').filter { token ->
+        token.isNotBlank() &&
+            !token.all { it.isDigit() } &&
+            token !in GENERIC_TRACK_WORDS &&
+            !Regex("""^(?:t|p|c|cd|ch|pt|vol)\d+$""").matches(token)
+    }
+    return if (remainingTokens.isEmpty()) null else trimmed
+}
+
 /** Clés de compte pour la progression. */
 object Accounts {
     /** Progression locale avant toute connexion Google. */
