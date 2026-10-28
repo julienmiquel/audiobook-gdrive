@@ -54,4 +54,50 @@ class Mp3ProbeTest {
         assertThat(Id3Tags(artist = "Romain Gary", composer = "Thierry Blanc").narrator()).isEqualTo("Thierry Blanc")
         assertThat(Id3Tags(artist = "Romain Gary", composer = "Romain Gary").narrator()).isNull()
     }
+
+    @Test
+    fun `chapitres ID3v2 CHAP avec sous-trames TIT2`() {
+        fun tit2Frame(title: String): ByteArray {
+            val payload = byteArrayOf(3) + title.toByteArray(Charsets.UTF_8) // encoding 3 = UTF-8
+            val size = payload.size
+            return "TIT2".toByteArray(Charsets.ISO_8859_1) +
+                byteArrayOf((size ushr 24).toByte(), (size ushr 16).toByte(), (size ushr 8).toByte(), size.toByte(), 0, 0) +
+                payload
+        }
+
+        fun chapFrame(id: String, startMs: Int, endMs: Int, title: String): ByteArray {
+            val sub = tit2Frame(title)
+            val body = java.io.ByteArrayOutputStream().also { out ->
+                out.write(id.toByteArray(Charsets.ISO_8859_1))
+                out.write(0)
+                java.io.DataOutputStream(out).apply {
+                    writeInt(startMs)
+                    writeInt(endMs)
+                    writeInt(-1)
+                    writeInt(-1)
+                }
+                out.write(sub)
+            }.toByteArray()
+            val s = body.size
+            return "CHAP".toByteArray(Charsets.ISO_8859_1) +
+                byteArrayOf((s ushr 24).toByte(), (s ushr 16).toByte(), (s ushr 8).toByte(), s.toByte(), 0, 0) +
+                body
+        }
+
+        val frames = chapFrame("chp2", 120_000, 300_000, "Chapitre 2") +
+            chapFrame("chp1", 0, 120_000, "Prologue")
+        val s = frames.size
+        val syncSafe = byteArrayOf(
+            ((s ushr 21) and 0x7F).toByte(),
+            ((s ushr 14) and 0x7F).toByte(),
+            ((s ushr 7) and 0x7F).toByte(),
+            (s and 0x7F).toByte(),
+        )
+        val id3 = "ID3".toByteArray(Charsets.ISO_8859_1) + byteArrayOf(3, 0, 0) + syncSafe + frames
+        val info = Mp3Probe.parse(id3)
+        assertThat(info.tags?.chapters).containsExactly(
+            EmbeddedChapter("Prologue", 0L, 120_000L),
+            EmbeddedChapter("Chapitre 2", 120_000L, 300_000L),
+        ).inOrder()
+    }
 }

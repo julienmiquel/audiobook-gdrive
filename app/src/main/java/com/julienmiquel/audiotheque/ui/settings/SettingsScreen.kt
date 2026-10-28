@@ -201,17 +201,54 @@ fun SettingsScreen(onBack: () -> Unit, contentPadding: PaddingValues) {
                         ) { Text(Labels.skip(sec)) }
                     }
                 }
-                Text("Son", style = MaterialTheme.typography.bodyLarge)
+                Text("Son (par défaut)", style = MaterialTheme.typography.bodyLarge)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AudioPreset.entries.forEach { preset ->
                         FilterChip(selected = s.audioPreset == preset, onClick = { vm.update { it.copy(audioPreset = preset) } }, label = { Text(preset.label) })
                     }
                 }
                 Text(
-                    s.audioPreset.description + " Appliqué à tous les livres, aussi en voiture et sur la montre ; modifiable depuis le lecteur (Son).",
+                    s.audioPreset.description + " Appliqué par défaut à tous les livres (personnalisable livre par livre depuis le lecteur).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                if (s.audioPreset == AudioPreset.BINAURAL) {
+                    Text("Position de la voix (binaural)", style = MaterialTheme.typography.bodyLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        com.julienmiquel.audiotheque.core.model.BinauralConfig.AZIMUTH_CHOICES.forEach { deg ->
+                            FilterChip(
+                                selected = s.binauralAzimuthDeg == deg,
+                                onClick = { vm.update { it.copy(binauralAzimuthDeg = deg) } },
+                                label = { Text(com.julienmiquel.audiotheque.core.model.BinauralConfig.azimuthLabel(deg)) },
+                            )
+                        }
+                    }
+                    Text("Acoustique de la pièce", style = MaterialTheme.typography.bodyLarge)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        com.julienmiquel.audiotheque.core.model.BinauralRoom.entries.forEach { room ->
+                            FilterChip(
+                                selected = s.binauralRoom == room,
+                                onClick = { vm.update { it.copy(binauralRoom = room) } },
+                                label = { Text(room.label) },
+                            )
+                        }
+                    }
+                }
+                ToggleRow(
+                    "Sauter les silences",
+                    "Raccourcit les blancs entre phrases sans déformer la voix",
+                    s.skipSilence,
+                ) { v -> vm.update { it.copy(skipSilence = v) } }
+                ToggleRow(
+                    "Recul intelligent à la reprise",
+                    "De 2 s après une courte pause jusqu'à 30 s le lendemain (sinon 5 s fixes)",
+                    s.smartRewind,
+                ) { v -> vm.update { it.copy(smartRewind = v) } }
+                ToggleRow(
+                    "Secouer pour prolonger la minuterie",
+                    "Ajoute 10 min quand la minuterie est active ou vient tout juste de mettre en pause",
+                    s.shakeToExtendTimer,
+                ) { v -> vm.update { it.copy(shakeToExtendTimer = v) } }
             }
 
             InfoCard(title = "Apparence") {

@@ -116,14 +116,15 @@ Les pochettes sont servies aux autres processus (voiture, System UI) par un four
 contenu en lecture seule, non exporté : le service accorde le droit de lecture à chaque application
 qui se connecte ([CoverArtProvider.kt](player/src/main/java/com/julienmiquel/audiotheque/player/CoverArtProvider.kt)).
 
-## Préréglages audio
+## Préréglages audio et confort d'écoute
 
-Lecteur › **Son** (ou Réglages › Lecture) : un traitement du signal appliqué à la lecture, pour
-tous les livres, aussi en voiture et sur la montre. Il s'insère dans la chaîne audio d'ExoPlayer
-avant le changement de vitesse ([PresetAudioProcessor.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/PresetAudioProcessor.kt)),
+Lecteur › **Son** (ou Réglages › Lecture) : un traitement du signal appliqué à la lecture, au choix
+**pour tous les livres** ou **mémorisé livre par livre** (synchronisé sur Drive entre vos appareils),
+aussi en voiture et sur la montre. Il s'insère dans la chaîne audio d'ExoPlayer avant le changement de
+vitesse ([PresetAudioProcessor.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/PresetAudioProcessor.kt)),
 change sans coupure pendant l'écoute (fondu de 15 ms) et repart à zéro à chaque saut. Les blocs
-([Dsp.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/Dsp.kt)) sont en
-Kotlin pur, assemblés par préréglage dans [PresetChain.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/PresetChain.kt).
+([Dsp.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/Dsp.kt)) sont en Kotlin pur,
+assemblés par préréglage dans [PresetChain.kt](player/src/main/java/com/julienmiquel/audiotheque/player/audio/PresetChain.kt).
 
 | Préréglage | Chaîne | Pour |
 | :--- | :--- | :--- |
@@ -131,11 +132,14 @@ Kotlin pur, assemblés par préréglage dans [PresetChain.kt](player/src/main/ja
 | Volume constant | Compression 2,5:1 à −18 dBFS → normalisation automatique vers −18 dBFS RMS (+14 dB au plus, figée sous −55 dBFS) → limiteur −1 dB | Même niveau d'un chapitre et d'un livre à l'autre |
 | Voix renforcée | Chaîne vocale « Netophonix » : coupe-bas 80 Hz → présence +3 dB à 3,5 kHz (Q 0,7) → compression 3:1 à −20 dBFS (5 ms / 50 ms) → normalisation vers −20 dBFS → limiteur | Voiture, bruit : articulation plus nette |
 | Niveau très bas | Compression 4:1 à −30 dBFS → normalisation vers −20 dBFS → limiteur → **−12 dB** en sortie | Écoute au casque à très faible volume (nuit) : les murmures restent audibles, le volume minimal devient vraiment bas |
-| Binaural (casque) | Chaîne vocale, puis la voix (mono) placée **devant l'auditeur dans une petite pièce** : modèle de tête de Brown & Duda (délai interaural de Woodworth, ombre de la tête par oreille), six premières réflexions filtrées, réverbération de Schroeder (RT60 0,45 s, −18 dB), limiteur | Son « hors de la tête », moins fatigant au casque |
+| Binaural (casque) | Chaîne vocale, puis la voix (mono) placée **dans une pièce** : modèle de tête de Brown & Duda (délai interaural de Woodworth, ombre de la tête par oreille), six premières réflexions filtrées, réverbération de Schroeder, limiteur | Son « hors de la tête », moins fatigant au casque ; **position de la voix** (−30° à +30°) et **acoustique** (*Intime*, *Petite pièce*, *Salon*) réglables |
 
-Le binaural est l'équivalent embarqué du moteur binaural (source statique à un azimut donné +
-bus de réverbération de pièce) : modèle paramétrique plutôt que base de HRIR, donc sans données
-externes ni convolution ; l'azimut et la pièce sont des constantes de `PresetChain` (0°, petite pièce).
+Confort d'écoute complémentaire :
+- **Saut des silences** (`skipSilenceEnabled`) activable d'un geste dans *Son* ou *Réglages › Lecture*.
+- **Minuterie de sommeil avancée** : durées prédéfinies, durée libre (5 à 120 min), arrêt en fin de chapitre, **fondu sonore progressif de 10 s** avant la pause et **secousse du téléphone (+10 min)** active uniquement pendant la minuterie (et 60 s après l'arrêt automatique).
+- **Recul intelligent à la reprise** : recul adapté à la durée d'interruption (0 s sous 2 s, 2 s sous 1 min, 5 s sous 10 min, 10 s sous 1 h, 20 s sous 24 h, 30 s au-delà).
+- **Positions récentes (annuler un saut)** : historique automatique avant chaque saut de chapitre, déplacement du curseur, signet ou minuterie.
+- **Chapitres intégrés `.m4b` / `.m4a` et ID3 `CHAP`** : lecture directe des boîtes ISO BMFF (`chpl` Nero et piste texte QuickTime `tref/chap`, même lorsque `moov` est en fin de fichier) et découpage par chapitre dans le lecteur et Android Auto.
 
 ## Architecture
 

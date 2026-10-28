@@ -28,14 +28,20 @@ data class PlayerUiState(
     val connected: Boolean = false,
     val bookId: String? = null,
     val trackId: String? = null,
+    val chapterIndex: Int? = null,
+    val chapterStartMs: Long = 0,
+    val chapterTitle: String? = null,
     val isPlaying: Boolean = false,
     val playWhenReady: Boolean = false,
     val buffering: Boolean = false,
     val ended: Boolean = false,
+    /** Position dans l'élément en cours (chapitre si découpé, sinon piste). */
     val positionMs: Long = 0,
+    /** Position non découpée dans la piste physique ([chapterStartMs] + [positionMs]). */
+    val trackPositionMs: Long = 0,
     val durationMs: Long = 0,
     val speed: Float = 1f,
-    /** Pistes présentes dans la liste de lecture (téléchargées), dans l'ordre. */
+    /** Pistes présentes dans la liste de lecture (téléchargées), dans l'ordre (sans doublons). */
     val playlistTrackIds: List<String> = emptyList(),
 )
 
@@ -91,7 +97,7 @@ class PlayerConnection(private val context: Context) {
     }
 
     /**
-     * Lit un livre : reprise à la position enregistrée (moins 5 s), ou piste et position données.
+     * Lit un livre : reprise à la position enregistrée (avec recul intelligent), ou piste et position données.
      * Avec [autoPlay] à faux, le livre est seulement positionné (barre de progression, chapitres).
      */
     fun playBook(bookId: String, trackId: String? = null, positionMs: Long? = null, autoPlay: Boolean = true) {
@@ -126,12 +132,35 @@ class PlayerConnection(private val context: Context) {
         it.setPlaybackSpeed(speed.coerceIn(PlaybackService.MIN_SPEED, PlaybackService.MAX_SPEED))
     }
 
-    /** Va à une piste téléchargée ; retourne faux si elle n'est pas encore là. */
+    /**
+     * Va à une piste téléchargée à la position non découpée [positionMs] (convertie en élément de
+     * chapitre si le fichier contient des chapitres intégrés) ; retourne faux si elle n'est pas encore là.
+     */
     fun seekToTrack(trackId: String, positionMs: Long): Boolean {
-        val index = _state.value.playlistTrackIds.indexOf(trackId)
-        if (index < 0) return false
-        withController { it.seekTo(index, positionMs.coerceAtLeast(0)) }
+        if (trackId !in _state.value.playlistTrackIds) return false
+        val clamped = positionMs.coerceAtLeast(0L)
+        withController { c ->
+            findPlaylistTarget(c, trackId, clamped)?.let { (itemIndex, localPos) ->
+                c.seekTo(itemIndex, localPos)
+            }
+        }
         return true
+    }
+
+    private fun findPlaylistTarget(c: MediaController, trackId: String, unclippedPosMs: Long): Pair<Int, Long>? {
+        val matching = (0 until c.mediaItemCount).filter { idx ->
+            MediaIds.parseTrack(c.getMediaItemAt(idx).mediaId)?.trackId == trackId
+        }
+        if (matching.isEmpty()) return null
+        if (matching.size == 1 && MediaIds.parseTrack(c.getMediaItemAt(matching[0]).mediaId)?.chapterIndex == null) {
+            return matching[0] to unclippedPosMs
+        }
+        val chosen = matching.lastOrNull { idx ->
+            val start = c.getMediaItemAt(idx).mediaMetadata.extras?.getLong(PlaybackService.EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+            unclippedPosMs >= start
+        } ?: matching.first()
+        val chosenStart = c.getMediaItemAt(chosen).mediaMetadata.extras?.getLong(PlaybackService.EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+        return chosen to (unclippedPosMs - chosenStart).coerceAtLeast(0L)
     }
 
     private fun withController(block: (MediaController) -> Unit) {
@@ -150,19 +179,28 @@ class PlayerConnection(private val context: Context) {
 
     private fun refresh() {
         val c = controller ?: return
-        val ref = c.currentMediaItem?.mediaId?.let { MediaIds.parseTrack(it) }
+        val item = c.currentMediaItem
+        val ref = item?.mediaId?.let { MediaIds.parseTrack(it) }
+        val chapterStart = item?.mediaMetadata?.extras?.getLong(PlaybackService.EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+        val pos = c.currentPosition.coerceAtLeast(0L)
         _state.value = PlayerUiState(
             connected = c.isConnected,
             bookId = ref?.bookId,
             trackId = ref?.trackId,
+            chapterIndex = ref?.chapterIndex,
+            chapterStartMs = chapterStart,
+            chapterTitle = if (ref?.chapterIndex != null) item.mediaMetadata.title?.toString() else null,
             isPlaying = c.isPlaying,
             playWhenReady = c.playWhenReady,
             buffering = c.playbackState == Player.STATE_BUFFERING,
             ended = c.playbackState == Player.STATE_ENDED,
-            positionMs = c.currentPosition.coerceAtLeast(0),
+            positionMs = pos,
+            trackPositionMs = chapterStart + pos,
             durationMs = c.duration.coerceAtLeast(0),
             speed = c.playbackParameters.speed,
-            playlistTrackIds = (0 until c.mediaItemCount).mapNotNull { MediaIds.parseTrack(c.getMediaItemAt(it).mediaId)?.trackId },
+            playlistTrackIds = (0 until c.mediaItemCount)
+                .mapNotNull { MediaIds.parseTrack(c.getMediaItemAt(it).mediaId)?.trackId }
+                .distinct(),
         )
     }
 }

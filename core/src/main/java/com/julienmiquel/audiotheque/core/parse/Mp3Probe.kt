@@ -3,6 +3,13 @@ package com.julienmiquel.audiotheque.core.parse
 import java.nio.charset.Charset
 import java.util.Locale
 
+/** Chapitre embarqué dans les métadonnées d'un fichier audio (.m4b, .m4a ou ID3 CHAP). */
+data class EmbeddedChapter(
+    val title: String,
+    val startMs: Long,
+    val endMs: Long,
+)
+
 /** Étiquettes ID3v2 utiles à l'app. */
 data class Id3Tags(
     val title: String? = null,
@@ -16,6 +23,8 @@ data class Id3Tags(
     val userTexts: Map<String, String> = emptyMap(),
     val picture: ByteArray? = null,
     val pictureMime: String? = null,
+    /** Chapitres ID3v2 (trames CHAP), triés par position de départ. */
+    val chapters: List<EmbeddedChapter> = emptyList(),
 ) {
     /**
      * Voix du livre quand les tags la portent : champ TXXX dédié, mention « lu par » dans un
@@ -37,9 +46,10 @@ data class Id3Tags(
         other is Id3Tags && title == other.title && artist == other.artist && album == other.album &&
             albumArtist == other.albumArtist && composer == other.composer && comment == other.comment &&
             genre == other.genre && userTexts == other.userTexts && pictureMime == other.pictureMime &&
+            chapters == other.chapters &&
             (picture?.contentEquals(other.picture ?: ByteArray(0)) ?: (other.picture == null))
 
-    override fun hashCode(): Int = listOf(title, artist, album, composer, comment, genre, userTexts).hashCode()
+    override fun hashCode(): Int = listOf(title, artist, album, composer, comment, genre, userTexts, chapters).hashCode()
 }
 
 /** Résultat de l'analyse des premiers Ko d'un mp3. */
@@ -240,6 +250,7 @@ object Mp3Probe {
         val headerSize = if (major == 2) 6 else 10
         val texts = HashMap<String, String>()
         val userTexts = LinkedHashMap<String, String>()
+        val rawChapters = mutableListOf<EmbeddedChapter>()
         var comment: String? = null
         var picture: ByteArray? = null
         var pictureMime: String? = null
@@ -263,6 +274,7 @@ object Mp3Probe {
                 key == "TXXX" -> parseUserText(body)?.let { (d, v) -> userTexts[d] = v }
                 key.startsWith("T") -> decodeText(body)?.let { texts[key] = it }
                 key == "COMM" -> if (comment == null) comment = parseComment(body)
+                key == "CHAP" && complete -> parseChap(body, major)?.let { rawChapters += it }
                 key == "APIC" && complete && picture == null -> parsePicture(body, major == 2)?.let {
                     pictureMime = it.first
                     picture = it.second
@@ -270,6 +282,7 @@ object Mp3Probe {
             }
             pos = bodyStart + size
         }
+        val chapters = normalizeChapters(rawChapters)
         return Id3Tags(
             title = texts["TIT2"],
             artist = texts["TPE1"],
@@ -281,7 +294,45 @@ object Mp3Probe {
             userTexts = userTexts,
             picture = picture,
             pictureMime = pictureMime,
+            chapters = chapters,
         )
+    }
+
+    private fun parseChap(body: ByteArray, major: Int): EmbeddedChapter? {
+        val idEnd = terminator(body, 0, 0)
+        var p = idEnd + 1
+        if (p + 16 > body.size) return null
+        val startMs = int32(body, p).toLong() and 0xFFFFFFFFL
+        val rawEnd = int32(body, p + 4).toLong() and 0xFFFFFFFFL
+        val endMs = if (rawEnd == 0xFFFFFFFFL) 0L else rawEnd
+        p += 16
+        var title: String? = null
+        while (p + 10 <= body.size) {
+            val subId = String(body, p, 4, Charsets.ISO_8859_1)
+            val subSize = if (major == 4) syncSafe(body, p + 4) else int32(body, p + 4)
+            if (subSize <= 0 || p + 10 + subSize > body.size || !subId.all { it.isLetterOrDigit() }) break
+            if (subId == "TIT2" && title == null) {
+                title = decodeText(body.copyOfRange(p + 10, p + 10 + subSize))
+            }
+            p += 10 + subSize
+        }
+        return EmbeddedChapter(title = title.orEmpty(), startMs = startMs, endMs = endMs)
+    }
+
+    fun normalizeChapters(raw: List<EmbeddedChapter>, totalDurationMs: Long? = null): List<EmbeddedChapter> {
+        if (raw.isEmpty()) return emptyList()
+        val sorted = raw.sortedBy { it.startMs }.distinctBy { it.startMs }
+        return sorted.mapIndexedNotNull { index, ch ->
+            val nextStart = sorted.getOrNull(index + 1)?.startMs
+            val resolvedEnd = when {
+                ch.endMs > ch.startMs && (nextStart == null || ch.endMs <= nextStart) -> ch.endMs
+                nextStart != null -> nextStart
+                totalDurationMs != null && totalDurationMs > ch.startMs -> totalDurationMs
+                else -> ch.endMs
+            }
+            val label = ch.title.trim().ifEmpty { "Chapitre ${index + 1}" }
+            EmbeddedChapter(label, ch.startMs.coerceAtLeast(0L), resolvedEnd.coerceAtLeast(ch.startMs))
+        }
     }
 
     private val v22Ids = mapOf(

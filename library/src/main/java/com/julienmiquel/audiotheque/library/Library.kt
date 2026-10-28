@@ -5,10 +5,12 @@ import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.BookListRow
 import com.julienmiquel.audiotheque.core.db.BookmarkEntity
+import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
 import com.julienmiquel.audiotheque.core.db.PendingOperationEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
+import com.julienmiquel.audiotheque.core.model.AudioPreset
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.OperationType
@@ -75,6 +77,8 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
 
     fun observeTracks(bookId: String): Flow<List<TrackEntity>> = db.trackDao().observeForBook(bookId)
 
+    fun observeEmbeddedChapters(bookId: String): Flow<List<EmbeddedChapterEntity>> = db.embeddedChapterDao().observeForBook(bookId)
+
     fun observeProgress(bookId: String): Flow<ProgressEntity?> =
         account.flatMapLatest { db.progressDao().observe(bookId, it) }
 
@@ -87,6 +91,8 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
     suspend fun book(bookId: String): BookEntity? = db.bookDao().get(bookId)
 
     suspend fun tracks(bookId: String): List<TrackEntity> = db.trackDao().forBook(bookId)
+
+    suspend fun embeddedChapters(bookId: String): List<EmbeddedChapterEntity> = db.embeddedChapterDao().forBook(bookId)
 
     /** Autres exemplaires du même livre (doublons). */
     suspend fun duplicatesOf(book: BookEntity): List<BookEntity> = db.bookDao().duplicatesOf(book.normalizedKey, book.authorKey, book.driveId)
@@ -114,6 +120,20 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
         val dao = db.progressDao()
         val existing = dao.get(bookId, account)
         dao.upsert((existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now)).copy(speed = speed, updatedAt = now, dirty = true))
+    }
+
+    /** Préréglage audio propre au livre (null = revient au préréglage commun de l'app). */
+    suspend fun setBookAudioPreset(bookId: String, preset: AudioPreset?, clock: Clock = Clock.SYSTEM) {
+        val account = settings.current().accountKey
+        val now = clock.now()
+        val dao = db.progressDao()
+        val existing = dao.get(bookId, account)
+        val newValue = preset?.name
+        if (existing?.audioPreset == newValue) return
+        dao.upsert(
+            (existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
+                .copy(audioPreset = newValue, updatedAt = now, dirty = true),
+        )
     }
 
     private fun toItem(row: BookListRow): LibraryItem {

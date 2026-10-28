@@ -299,6 +299,33 @@ interface BookmarkDao {
 }
 
 @Dao
+interface EmbeddedChapterDao {
+    @Query("SELECT * FROM embedded_chapters WHERE bookId = :bookId ORDER BY trackId, chapterIndex")
+    suspend fun forBook(bookId: String): List<EmbeddedChapterEntity>
+
+    @Query("SELECT * FROM embedded_chapters WHERE bookId = :bookId ORDER BY trackId, chapterIndex")
+    fun observeForBook(bookId: String): Flow<List<EmbeddedChapterEntity>>
+
+    @Query("SELECT * FROM embedded_chapters WHERE trackId = :trackId ORDER BY chapterIndex")
+    suspend fun forTrack(trackId: String): List<EmbeddedChapterEntity>
+
+    @Insert
+    suspend fun insertAll(chapters: List<EmbeddedChapterEntity>)
+
+    @Query("DELETE FROM embedded_chapters WHERE trackId = :trackId")
+    suspend fun deleteForTrack(trackId: String)
+
+    @Transaction
+    suspend fun replaceForTrack(trackId: String, chapters: List<EmbeddedChapterEntity>) {
+        deleteForTrack(trackId)
+        if (chapters.isNotEmpty()) insertAll(chapters)
+    }
+
+    @Query("DELETE FROM embedded_chapters")
+    suspend fun deleteAll()
+}
+
+@Dao
 interface SyncEventDao {
     @Insert
     suspend fun insert(event: SyncEventEntity): Long

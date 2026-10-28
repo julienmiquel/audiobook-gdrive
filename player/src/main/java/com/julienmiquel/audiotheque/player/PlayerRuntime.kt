@@ -44,10 +44,11 @@ object MediaIds {
         listOfNotNull(BOOK, bookId, trackId ?: if (positionMs != null) "" else null, positionMs?.toString())
             .joinToString(":")
 
-    fun track(bookId: String, trackId: String): String = "$TRACK:$bookId:$trackId"
+    fun track(bookId: String, trackId: String, chapterIndex: Int? = null): String =
+        if (chapterIndex != null) "$TRACK:$bookId:$trackId:$chapterIndex" else "$TRACK:$bookId:$trackId"
 
     data class BookRequest(val bookId: String, val trackId: String?, val positionMs: Long?)
-    data class TrackRef(val bookId: String, val trackId: String)
+    data class TrackRef(val bookId: String, val trackId: String, val chapterIndex: Int? = null)
 
     fun parseTab(mediaId: String): BookStatus? {
         val parts = mediaId.split(':')
@@ -63,12 +64,13 @@ object MediaIds {
 
     fun parseTrack(mediaId: String): TrackRef? {
         val parts = mediaId.split(':')
-        if (parts.size != 3 || parts[0] != TRACK) return null
-        return TrackRef(parts[1], parts[2])
+        if ((parts.size != 3 && parts.size != 4) || parts[0] != TRACK || parts[1].isEmpty() || parts[2].isEmpty()) return null
+        val chapter = if (parts.size == 4) parts[3].toIntOrNull() ?: return null else null
+        return TrackRef(parts[1], parts[2], chapter)
     }
 }
 
-/** Minuterie de sommeil : 15, 30, 45, 60 min ou fin du chapitre, prolongeable de 10 min. */
+/** Minuterie de sommeil : 15, 30, 45, 60 min, durée libre ou fin du chapitre, prolongeable de 10 min. */
 sealed interface SleepTimerState {
     data object Off : SleepTimerState
     data class Countdown(val endsAt: Long, val totalMs: Long) : SleepTimerState
@@ -85,21 +87,65 @@ sealed interface PlaybackEvent {
 
     /** Lecture reprise à la position enregistrée par un autre téléphone. */
     data class ProgressRestored(val bookId: String, val device: String?, val percent: Float) : PlaybackEvent
+
+    /** Minuterie prolongée (par exemple en secouant le téléphone). */
+    data class TimerExtended(val minutes: Int) : PlaybackEvent
 }
+
+/**
+ * Recul automatique à la reprise selon la durée d'interruption : nul sous 2 s, 2 s sous 1 min,
+ * 5 s sous 10 min, 10 s sous 1 h, 20 s sous 24 h, 30 s au-delà (ou 5 s fixes si désactivé).
+ */
+object SmartRewind {
+    const val FIXED_REWIND_MS = 5_000L
+    const val MIN_PAUSE_MS = 2_000L
+
+    fun computeMs(pauseDurationMs: Long, smart: Boolean = true): Long {
+        if (pauseDurationMs < MIN_PAUSE_MS) return 0L
+        if (!smart) return FIXED_REWIND_MS
+        return when {
+            pauseDurationMs < 60_000L -> 2_000L
+            pauseDurationMs < 10 * 60_000L -> 5_000L
+            pauseDurationMs < 60 * 60_000L -> 10_000L
+            pauseDurationMs < 24 * 60 * 60_000L -> 20_000L
+            else -> 30_000L
+        }
+    }
+}
+
+/** Position enregistrée avant un déplacement (chapitre, curseur, signet, minuterie) pour pouvoir y revenir. */
+data class JumpEntry(
+    val id: Long,
+    val bookId: String,
+    val trackId: String,
+    val chapterLabel: String,
+    /** Position non découpée dans la piste physique (compatible avec la progression). */
+    val positionMs: Long,
+    val reason: String,
+    val timestamp: Long,
+)
 
 /** État partagé entre le service de lecture et l'interface (même processus). */
 object PlayerRuntime {
     const val EXTEND_MS = 10 * 60_000L
     val TIMER_CHOICES_MINUTES = listOf(15, 30, 45, 60)
+    private const val MAX_HISTORY = 15
+    private const val DEDUP_WINDOW_MS = 5_000L
+
+    private var nextJumpId = 1L
 
     private val _sleepTimer = MutableStateFlow<SleepTimerState>(SleepTimerState.Off)
     val sleepTimer: StateFlow<SleepTimerState> = _sleepTimer.asStateFlow()
+
+    private val _seekHistory = MutableStateFlow<List<JumpEntry>>(emptyList())
+    val seekHistory: StateFlow<List<JumpEntry>> = _seekHistory.asStateFlow()
 
     private val _events = MutableSharedFlow<PlaybackEvent>(extraBufferCapacity = 8)
     val events: SharedFlow<PlaybackEvent> = _events.asSharedFlow()
 
     fun startTimer(minutes: Int, now: Long = System.currentTimeMillis()) {
-        _sleepTimer.value = SleepTimerState.Countdown(now + minutes * 60_000L, minutes * 60_000L)
+        val clamped = minutes.coerceIn(1, 240)
+        _sleepTimer.value = SleepTimerState.Countdown(now + clamped * 60_000L, clamped * 60_000L)
     }
 
     fun startEndOfChapter() {
@@ -115,6 +161,41 @@ object PlayerRuntime {
 
     fun cancelTimer() {
         _sleepTimer.value = SleepTimerState.Off
+    }
+
+    @Synchronized
+    fun recordJump(
+        bookId: String,
+        trackId: String,
+        chapterLabel: String,
+        positionMs: Long,
+        reason: String,
+        now: Long = System.currentTimeMillis(),
+    ) {
+        val current = _seekHistory.value
+        val head = current.firstOrNull()
+        if (head != null &&
+            head.bookId == bookId &&
+            head.trackId == trackId &&
+            kotlin.math.abs(head.positionMs - positionMs) < DEDUP_WINDOW_MS
+        ) {
+            return
+        }
+        val entry = JumpEntry(
+            id = nextJumpId++,
+            bookId = bookId,
+            trackId = trackId,
+            chapterLabel = chapterLabel,
+            positionMs = positionMs.coerceAtLeast(0L),
+            reason = reason,
+            timestamp = now,
+        )
+        _seekHistory.value = (listOf(entry) + current).take(MAX_HISTORY)
+    }
+
+    @Synchronized
+    fun clearHistoryForBook(bookId: String) {
+        _seekHistory.value = _seekHistory.value.filterNot { it.bookId == bookId }
     }
 
     internal fun emit(event: PlaybackEvent) {

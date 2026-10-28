@@ -2,6 +2,8 @@ package com.julienmiquel.audiotheque.player.audio
 
 import com.google.common.truth.Truth.assertThat
 import com.julienmiquel.audiotheque.core.model.AudioPreset
+import com.julienmiquel.audiotheque.core.model.BinauralConfig
+import com.julienmiquel.audiotheque.core.model.BinauralRoom
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.log10
@@ -203,6 +205,25 @@ class PresetChainTest {
         chain.process(l, r, l.size)
         assertThat(peak(l)).isEqualTo(0f)
         assertThat(sqrt(l.sumOf { it.toDouble() * it })).isEqualTo(0.0)
+    }
+
+    @Test
+    fun `binaural - configuration d'angle et d'acoustique de pièce`() {
+        val voice = sine(2_500.0, 0.3, 0.25)
+        val leftChain = PresetChain(fs, AudioPreset.BINAURAL, BinauralConfig(azimuthDeg = -30, room = BinauralRoom.INTIMATE))
+        val rightChain = PresetChain(fs, AudioPreset.BINAURAL, BinauralConfig(azimuthDeg = 30, room = BinauralRoom.MEETING))
+
+        val ll = voice.copyOf(); val lr = voice.copyOf()
+        leftChain.process(ll, lr, voice.size)
+        val rl = voice.copyOf(); val rr = voice.copyOf()
+        rightChain.process(rl, rr, voice.size)
+
+        val tail = fs / 10
+        assertThat(rmsDb(ll, tail) - rmsDb(lr, tail)).isGreaterThan(1.5)
+        assertThat(rmsDb(rr, tail) - rmsDb(rl, tail)).isGreaterThan(1.5)
+        assertThat(BinauralConfig.azimuthLabel(-30)).isEqualTo("30° G")
+        assertThat(BinauralConfig.azimuthLabel(0)).isEqualTo("Face (0°)")
+        assertThat(BinauralConfig.azimuthLabel(15)).isEqualTo("15° D")
     }
 
     private fun Double.pow(e: Double) = Math.pow(this, e)

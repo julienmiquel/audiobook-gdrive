@@ -3,6 +3,7 @@ package com.julienmiquel.audiotheque.sync.engine
 import androidx.room.withTransaction
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
+import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
@@ -18,6 +19,7 @@ import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
 import com.julienmiquel.audiotheque.core.parse.FolderNameParser
 import com.julienmiquel.audiotheque.core.parse.Mp3Probe
+import com.julienmiquel.audiotheque.core.parse.Mp4Probe
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.parse.TrackCandidate
 import com.julienmiquel.audiotheque.core.parse.TrackNameParser
@@ -555,7 +557,7 @@ class MetadataProber(
         books.setCover(book.driveId, file.path, uploadPending = false)
     }
 
-    /** Lit les premiers Ko de la première piste pour connaître le débit, puis estime la durée. */
+    /** Lit les premiers Ko (ou l'atome moov d'un .m4b/.m4a) pour connaître la durée, la voix, la pochette et les chapitres. */
     suspend fun probe(drive: DriveService, book: BookEntity) {
         // Pochette du dossier pas encore lue (liste faite sur réseau mesuré) : une requête légère.
         if (book.kind == BookKind.FOLDER && book.coverPath == null) {
@@ -564,6 +566,10 @@ class MetadataProber(
         val fresh = books.get(book.driveId) ?: return
         val bookTracks = tracks.forBook(book.driveId)
         val first = bookTracks.firstOrNull() ?: return
+        if (Mp4Probe.isMp4File(first.name, first.mimeType) && first.sizeBytes > 16) {
+            probeMp4(drive, fresh, bookTracks, first)
+            return
+        }
         val isMp3 = first.mimeType == "audio/mpeg" || first.name.endsWith(".mp3", ignoreCase = true)
         if (!isMp3) {
             books.markProbed(book.driveId, clock.now(), null)
@@ -578,22 +584,33 @@ class MetadataProber(
         }
         val info = Mp3Probe.parse(bytes)
         val bytesPerSecond = info.bytesPerSecond(first.sizeBytes)
+        var firstDuration: Long? = null
         if (bytesPerSecond != null && bytesPerSecond > 0) {
             var total = 0L
             var allExact = true
             db.withTransaction {
                 for (t in tracks.forBook(book.driveId)) {
                     if (t.durationExact && t.durationMs != null) {
+                        if (t.driveId == first.driveId) firstDuration = t.durationMs
                         total += t.durationMs!!
                     } else {
                         val estimate = ((t.sizeBytes - if (t.driveId == first.driveId) info.id3Size else 0) * 1000.0 / bytesPerSecond).toLong()
-                        tracks.updateEstimatedDuration(t.driveId, estimate.coerceAtLeast(0))
-                        total += estimate.coerceAtLeast(0)
+                        val clamped = estimate.coerceAtLeast(0)
+                        if (t.driveId == first.driveId) firstDuration = clamped
+                        tracks.updateEstimatedDuration(t.driveId, clamped)
+                        total += clamped
                         allExact = false
                     }
                 }
                 books.updateDuration(book.driveId, total, allExact)
             }
+        }
+        val chapters = Mp3Probe.normalizeChapters(info.tags?.chapters.orEmpty(), firstDuration)
+        if (chapters.size > 1) {
+            db.embeddedChapterDao().replaceForTrack(
+                first.driveId,
+                chapters.mapIndexed { idx, ch -> EmbeddedChapterEntity(book.driveId, first.driveId, idx, ch.title, ch.startMs, ch.endMs) },
+            )
         }
         val picture = info.tags?.picture
         if (picture != null && fresh.coverPath?.let { File(it).exists() } != true) {
@@ -603,6 +620,51 @@ class MetadataProber(
             books.setCoverPath(book.driveId, file.path)
         }
         books.markProbed(book.driveId, clock.now(), info.tags?.narrator())
+    }
+
+    private suspend fun probeMp4(drive: DriveService, fresh: BookEntity, bookTracks: List<TrackEntity>, first: TrackEntity) {
+        val mp4 = Mp4Probe.probe(first.sizeBytes) { off, len ->
+            val endInclusive = (off + len - 1L).coerceAtMost(first.sizeBytes - 1L)
+            drive.openContent(first.driveId, off, endInclusive).readUpTo(len)
+        }
+        val firstDuration = mp4?.durationMs?.takeIf { it > 0 }
+        if (firstDuration != null) {
+            db.withTransaction {
+                tracks.setExactDuration(first.driveId, firstDuration)
+                if (bookTracks.size == 1) {
+                    books.updateDuration(fresh.driveId, firstDuration, true)
+                } else if (first.sizeBytes > 0) {
+                    val bytesPerSecond = first.sizeBytes * 1000.0 / firstDuration
+                    var total = 0L
+                    var allExact = true
+                    for (t in tracks.forBook(fresh.driveId)) {
+                        if (t.durationExact && t.durationMs != null) {
+                            total += t.durationMs!!
+                        } else {
+                            val estimate = (t.sizeBytes * 1000.0 / bytesPerSecond).toLong().coerceAtLeast(0)
+                            tracks.updateEstimatedDuration(t.driveId, estimate)
+                            total += estimate
+                            allExact = false
+                        }
+                    }
+                    books.updateDuration(fresh.driveId, total, allExact)
+                }
+            }
+        }
+        if (mp4 != null && mp4.chapters.size > 1) {
+            db.embeddedChapterDao().replaceForTrack(
+                first.driveId,
+                mp4.chapters.mapIndexed { idx, ch -> EmbeddedChapterEntity(fresh.driveId, first.driveId, idx, ch.title, ch.startMs, ch.endMs) },
+            )
+        }
+        val picture = mp4?.tags?.picture
+        if (picture != null && fresh.coverPath?.let { File(it).exists() } != true) {
+            val ext = if (mp4.tags?.pictureMime?.contains("png") == true) "png" else "jpg"
+            val file = File(storage.coversDir(), "${fresh.driveId}.$ext")
+            file.writeBytes(picture)
+            books.setCoverPath(fresh.driveId, file.path)
+        }
+        books.markProbed(fresh.driveId, clock.now(), mp4?.tags?.narrator())
     }
 
     companion object {

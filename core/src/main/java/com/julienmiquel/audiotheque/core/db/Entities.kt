@@ -149,6 +149,34 @@ data class ProgressEntity(
     val remoteFileId: String? = null,
     /** modifiedTime Drive du fichier tel que lu ou écrit la dernière fois. */
     val remoteSyncedAt: Long? = null,
+    /** Préréglage audio propre à ce livre (null = suit le réglage commun de l'app). */
+    val audioPreset: String? = null,
+)
+
+/**
+ * Chapitre embarqué dans une piste unique (fichier .m4b / .m4a chapitré ou tags ID3 CHAP).
+ * Supprimé automatiquement si la piste disparaît.
+ */
+@Entity(
+    tableName = "embedded_chapters",
+    primaryKeys = ["bookId", "trackId", "chapterIndex"],
+    foreignKeys = [
+        ForeignKey(
+            entity = TrackEntity::class,
+            parentColumns = ["driveId"],
+            childColumns = ["trackId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("bookId"), Index("trackId")],
+)
+data class EmbeddedChapterEntity(
+    val bookId: String,
+    val trackId: String,
+    val chapterIndex: Int,
+    val title: String,
+    val startMs: Long,
+    val endMs: Long,
 )
 
 @Entity(tableName = "bookmarks", indices = [Index("bookId")])

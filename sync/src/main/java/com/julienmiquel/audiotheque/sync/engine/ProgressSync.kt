@@ -234,6 +234,7 @@ class ProgressSync(
         lastListenedAt = local.lastListenedAt,
         finished = local.finished,
         setAsideAtPercent = local.setAsideAtPercent,
+        audioPreset = local.audioPreset,
         updatedAt = local.updatedAt,
         device = deviceName,
         account = account,
@@ -268,6 +269,7 @@ class ProgressSync(
                             dirty = false,
                             remoteFileId = file.id,
                             remoteSyncedAt = remoteModified,
+                            audioPreset = json.audioPreset,
                         ),
                     )
                     if (local == null || movesListening(local, json)) {

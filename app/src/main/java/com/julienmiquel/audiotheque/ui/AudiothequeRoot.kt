@@ -198,6 +198,11 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
                         "Position reprise depuis ${event.device ?: "un autre appareil"} (${event.percent.roundToInt()} %)",
                         duration = SnackbarDuration.Short,
                     )
+                is PlaybackEvent.TimerExtended ->
+                    snackbar.showSnackbar(
+                        "Minuterie prolongée de ${event.minutes} min",
+                        duration = SnackbarDuration.Short,
+                    )
             }
         }
     }

@@ -127,6 +127,7 @@ data class BookUiState(
     val loaded: Boolean = false,
     val item: LibraryItem? = null,
     val tracks: List<TrackEntity> = emptyList(),
+    val embeddedChapters: List<com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity> = emptyList(),
     val progress: ProgressEntity? = null,
     val bookmarks: List<BookmarkEntity> = emptyList(),
     val pairs: List<SyncPairEntity> = emptyList(),
@@ -145,23 +146,32 @@ private data class Context(
     val duplicates: List<BookEntity>,
     val transfers: Map<String, Transfer>,
     val localRoot: String?,
+    val embeddedChapters: List<com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity>,
 )
 
 class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel() {
     private val duplicates = MutableStateFlow<List<BookEntity>>(emptyList())
     private val localRoot = MutableStateFlow<String?>(null)
 
+    private val extras: kotlinx.coroutines.flow.Flow<Context> = combine(
+        combine(c.library.observePairs(), c.settings.settings, duplicates) { p, s, d -> Triple(p, s, d) },
+        c.engine.transfers.transfers,
+        localRoot,
+        c.library.observeEmbeddedChapters(bookId),
+    ) { (p, s, d), t, r, emb -> Context(p, s, d, t, r, emb) }
+
     val state: StateFlow<BookUiState> = combine(
         c.library.observeItem(bookId),
         c.library.observeTracks(bookId),
         c.library.observeProgress(bookId),
         c.library.observeBookmarks(bookId),
-        combine(c.library.observePairs(), c.settings.settings, duplicates, c.engine.transfers.transfers, localRoot) { p, s, d, t, r -> Context(p, s, d, t, r) },
+        extras,
     ) { item, tracks, progress, bookmarks, ctx ->
         BookUiState(
             loaded = true,
             item = item,
             tracks = tracks,
+            embeddedChapters = ctx.embeddedChapters,
             progress = progress,
             bookmarks = bookmarks,
             pairs = ctx.pairs,
@@ -546,7 +556,14 @@ private fun BookContent(
             }
         }
         if (state.tracks.isNotEmpty()) {
-            item(key = "tracks-title") { SectionTitle("Pistes · ${Labels.tracks(state.tracks.size)}") }
+            val embeddedByTrack = state.embeddedChapters.groupBy { it.trackId }
+            val totalEmbedded = state.embeddedChapters.size
+            val sectionHeader = if (state.tracks.size == 1 && totalEmbedded > 1) {
+                "Chapitres intégrés · $totalEmbedded chapitres"
+            } else {
+                "Pistes · ${Labels.tracks(state.tracks.size)}"
+            }
+            item(key = "tracks-title") { SectionTitle(sectionHeader) }
             groups.forEach { group ->
                 val label = group.label
                 if (label != null) {
@@ -561,14 +578,56 @@ private fun BookContent(
                         )
                     }
                 }
-                items(group.tracks, key = { "t-${it.driveId}" }) { track ->
-                    TrackRow(
-                        track = track,
-                        isCurrent = progress?.trackId == track.driveId,
-                        transfer = state.transfers[track.driveId],
-                        playable = item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP,
-                        onPlay = { onPlay(track.driveId, 0L) },
-                    )
+                group.tracks.forEach { track ->
+                    val embedded = embeddedByTrack[track.driveId].orEmpty()
+                    item(key = "t-${track.driveId}") {
+                        TrackRow(
+                            track = track,
+                            isCurrent = progress?.trackId == track.driveId && embedded.size <= 1,
+                            transfer = state.transfers[track.driveId],
+                            playable = item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP,
+                            onPlay = { onPlay(track.driveId, 0L) },
+                        )
+                    }
+                    if (embedded.size > 1) {
+                        val present = track.state == TrackState.PRESENT && item.book.kind != com.julienmiquel.audiotheque.core.model.BookKind.ZIP
+                        val activeCh = if (progress?.trackId == track.driveId) {
+                            (embedded.lastOrNull { progress.positionMs >= it.startMs } ?: embedded.first()).chapterIndex
+                        } else {
+                            null
+                        }
+                        items(embedded, key = { "emb-${track.driveId}-${it.chapterIndex}" }) { ch ->
+                            val isActive = ch.chapterIndex == activeCh
+                            val dur = (ch.endMs - ch.startMs).coerceAtLeast(0L)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = present, onClickLabel = "Écouter ce chapitre") { onPlay(track.driveId, ch.startMs) }
+                                    .padding(start = 44.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        ch.title.ifBlank { "Chapitre ${ch.chapterIndex + 1}" },
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isActive) FontWeight.Bold else FontWeight.Normal,
+                                        color = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                    Text(
+                                        listOfNotNull(
+                                            "Chapitre ${ch.chapterIndex + 1}",
+                                            Formats.clock(ch.startMs),
+                                            dur.takeIf { it > 0 }?.let { Formats.duration(it, approximate = false) },
+                                        ).joinToString(" · "),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else if (book.kind == com.julienmiquel.audiotheque.core.model.BookKind.FOLDER) {

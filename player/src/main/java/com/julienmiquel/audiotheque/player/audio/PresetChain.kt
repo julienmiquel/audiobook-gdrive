@@ -1,6 +1,8 @@
 package com.julienmiquel.audiotheque.player.audio
 
 import com.julienmiquel.audiotheque.core.model.AudioPreset
+import com.julienmiquel.audiotheque.core.model.BinauralConfig
+import com.julienmiquel.audiotheque.core.model.BinauralRoom
 import kotlin.math.abs
 import kotlin.math.max
 
@@ -14,9 +16,13 @@ import kotlin.math.max
  * - **Niveau très bas** : compression 4:1 à −30 dBFS, normalisation vers −20 dBFS, limiteur, puis
  *   −12 dB en sortie.
  * - **Binaural** : la chaîne vocale, puis la source (mono) placée devant l'auditeur dans une
- *   petite pièce (modèle de tête, premières réflexions, réverbération), limiteur.
+ *   pièce configurable (modèle de tête, azimut réglable, premières réflexions, réverbération), limiteur.
  */
-class PresetChain(val sampleRate: Int, val preset: AudioPreset) {
+class PresetChain(
+    val sampleRate: Int,
+    val preset: AudioPreset,
+    val binauralConfig: BinauralConfig = BinauralConfig(),
+) {
 
     private val highPass: Array<Biquad>? = when (preset) {
         AudioPreset.VOICE_BOOST, AudioPreset.BINAURAL -> Array(2) { Biquad.highPass(sampleRate, 80.0) }
@@ -37,7 +43,16 @@ class PresetChain(val sampleRate: Int, val preset: AudioPreset) {
         AudioPreset.VOICE_BOOST, AudioPreset.BINAURAL, AudioPreset.NIGHT -> Agc(sampleRate, targetDb = -20.0)
         AudioPreset.NONE -> null
     }
-    private val binaural: Binaural? = if (preset == AudioPreset.BINAURAL) Binaural(sampleRate, azimuthDeg = 0.0, room = Binaural.Room.SMALL) else null
+    private val binaural: Binaural? = if (preset == AudioPreset.BINAURAL) {
+        val room = when (binauralConfig.room) {
+            BinauralRoom.INTIMATE -> Binaural.Room.INTIMATE
+            BinauralRoom.SMALL -> Binaural.Room.SMALL
+            BinauralRoom.MEETING -> Binaural.Room.MEETING
+        }
+        Binaural(sampleRate, azimuthDeg = binauralConfig.azimuthDeg.toDouble(), room = room)
+    } else {
+        null
+    }
     private val limiter: Limiter? = if (preset == AudioPreset.NONE) null else Limiter(sampleRate, ceilingDb = -1.0)
     private val outputGain: Float = if (preset == AudioPreset.NIGHT) dbToLinear(-12.0).toFloat() else 1f
     private val pair = FloatArray(2)

@@ -1,4 +1,4 @@
-@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalCoroutinesApi::class)
+@file:OptIn(ExperimentalMaterial3Api::class, ExperimentalCoroutinesApi::class, ExperimentalLayoutApi::class)
 
 package com.julienmiquel.audiotheque.ui.player
 
@@ -6,6 +6,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -22,10 +24,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.FormatListBulleted
-import androidx.compose.material.icons.automirrored.filled.LibraryBooks
 import androidx.compose.material.icons.filled.Bedtime
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkAdd
@@ -33,12 +35,15 @@ import androidx.compose.material.icons.filled.CloudQueue
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speed
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
@@ -56,6 +61,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -64,6 +70,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -72,6 +79,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
@@ -86,9 +94,12 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.core.db.BookmarkEntity
+import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.AudioPreset
+import com.julienmiquel.audiotheque.core.model.BinauralConfig
+import com.julienmiquel.audiotheque.core.model.BinauralRoom
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.TrackState
@@ -98,6 +109,7 @@ import com.julienmiquel.audiotheque.library.Gesture
 import com.julienmiquel.audiotheque.library.LibraryItem
 import com.julienmiquel.audiotheque.library.LibraryRepository
 import com.julienmiquel.audiotheque.player.Chapters
+import com.julienmiquel.audiotheque.player.JumpEntry
 import com.julienmiquel.audiotheque.player.PlaybackService
 import com.julienmiquel.audiotheque.player.PlayerRuntime
 import com.julienmiquel.audiotheque.player.PlayerUiState
@@ -124,6 +136,7 @@ import kotlinx.coroutines.launch
 private data class BookData(
     val item: LibraryItem?,
     val tracks: List<TrackEntity>,
+    val embeddedChapters: List<EmbeddedChapterEntity>,
     val progress: ProgressEntity?,
     val bookmarks: List<BookmarkEntity>,
 )
@@ -133,6 +146,8 @@ data class PlayerScreenState(
     val bookId: String? = null,
     val item: LibraryItem? = null,
     val tracks: List<TrackEntity> = emptyList(),
+    val embeddedChapters: List<EmbeddedChapterEntity> = emptyList(),
+    val currentEmbeddedChapter: EmbeddedChapterEntity? = null,
     val presentCount: Int = 0,
     val progress: ProgressEntity? = null,
     val bookmarks: List<BookmarkEntity> = emptyList(),
@@ -141,8 +156,12 @@ data class PlayerScreenState(
     val isPlaying: Boolean = false,
     val buffering: Boolean = false,
     val currentTrack: TrackEntity? = null,
+    /** Début du chapitre en cours dans la piste physique (0 si un fichier par chapitre). */
+    val chapterStartMs: Long = 0,
     /** Position dans le chapitre en cours. */
     val positionMs: Long = 0,
+    /** Position non découpée dans la piste physique. */
+    val trackPositionMs: Long = 0,
     /** Durée du chapitre en cours (0 si inconnue) : réelle quand le lecteur l'a, sinon estimée. */
     val chapterDurationMs: Long = 0,
     val globalMs: Long = 0,
@@ -157,12 +176,27 @@ data class PlayerScreenState(
     /** Durée de conservation des pistes d'un livre mis de côté (réglage). */
     val laterRetentionDays: Int = 7,
     val anotherBookPlaying: Boolean = false,
-    /** Préréglage audio en cours (pour tous les livres). */
+    /** Préréglage audio effectif (propre au livre s'il est défini, sinon global). */
     val audioPreset: AudioPreset = AudioPreset.NONE,
+    val globalAudioPreset: AudioPreset = AudioPreset.NONE,
+    val bookAudioPreset: AudioPreset? = null,
+    val skipSilence: Boolean = false,
+    val shakeToExtendTimer: Boolean = true,
+    val customTimerMinutes: Int = 20,
+    val binauralConfig: BinauralConfig = BinauralConfig(),
+    val jumpHistory: List<JumpEntry> = emptyList(),
 )
 
 /** Sous-ensemble des réglages utiles à l'écran de lecture. */
-private data class PlayerPrefs(val skipSeconds: Int, val laterRetentionDays: Int, val audioPreset: AudioPreset)
+private data class PlayerPrefs(
+    val skipSeconds: Int,
+    val laterRetentionDays: Int,
+    val audioPreset: AudioPreset,
+    val skipSilence: Boolean,
+    val shakeToExtendTimer: Boolean,
+    val customTimerMinutes: Int,
+    val binauralConfig: BinauralConfig,
+)
 
 class PlayerViewModel(private val c: AppContainer) : ViewModel() {
 
@@ -182,23 +216,57 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             combine(
                 c.library.observeItem(id),
                 c.library.observeTracks(id),
+                c.library.observeEmbeddedChapters(id),
                 c.library.observeProgress(id),
                 c.library.observeBookmarks(id),
-            ) { item, tracks, progress, bookmarks -> id to BookData(item, tracks, progress, bookmarks) }
+            ) { item, tracks, embedded, progress, bookmarks ->
+                id to BookData(item, tracks, embedded, progress, bookmarks)
+            }
         }
     }
+
+    private val prefsFlow: Flow<PlayerPrefs> = c.settings.settings.map {
+        PlayerPrefs(
+            skipSeconds = it.skipSeconds,
+            laterRetentionDays = it.laterRetentionDays,
+            audioPreset = it.audioPreset,
+            skipSilence = it.skipSilence,
+            shakeToExtendTimer = it.shakeToExtendTimer,
+            customTimerMinutes = it.customTimerMinutes,
+            binauralConfig = it.binauralConfig,
+        )
+    }.distinctUntilChanged()
 
     val state: StateFlow<PlayerScreenState> = combine(
         data,
         c.player.state,
         PlayerRuntime.sleepTimer,
-        c.settings.settings.map { PlayerPrefs(it.skipSeconds, it.laterRetentionDays, it.audioPreset) }.distinctUntilChanged(),
-    ) { (id, book), player, sleep, prefs -> build(id, book, player, sleep, prefs) }
+        PlayerRuntime.seekHistory,
+        prefsFlow,
+    ) { (id, book), player, sleep, history, prefs -> build(id, book, player, sleep, history, prefs) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlayerScreenState())
 
-    private fun build(id: String?, book: BookData?, player: PlayerUiState, sleep: SleepTimerState, prefs: PlayerPrefs): PlayerScreenState {
+    private fun build(
+        id: String?,
+        book: BookData?,
+        player: PlayerUiState,
+        sleep: SleepTimerState,
+        history: List<JumpEntry>,
+        prefs: PlayerPrefs,
+    ): PlayerScreenState {
         if (id == null || book == null) {
-            return PlayerScreenState(loaded = true, sleep = sleep, skipSeconds = prefs.skipSeconds, laterRetentionDays = prefs.laterRetentionDays, audioPreset = prefs.audioPreset)
+            return PlayerScreenState(
+                loaded = true,
+                sleep = sleep,
+                skipSeconds = prefs.skipSeconds,
+                laterRetentionDays = prefs.laterRetentionDays,
+                audioPreset = prefs.audioPreset,
+                globalAudioPreset = prefs.audioPreset,
+                skipSilence = prefs.skipSilence,
+                shakeToExtendTimer = prefs.shakeToExtendTimer,
+                customTimerMinutes = prefs.customTimerMinutes,
+                binauralConfig = prefs.binauralConfig,
+            )
         }
         val tracks = book.tracks
         val isCurrent = player.bookId == id && player.playlistTrackIds.isNotEmpty()
@@ -208,17 +276,41 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             tracks.firstOrNull { it.driveId == book.progress?.trackId } ?: tracks.getOrNull(book.progress?.trackIndex ?: 0)
         }
         val index = current?.let { tracks.indexOf(it) }?.takeIf { it >= 0 } ?: 0
-        val position = if (isCurrent) player.positionMs else book.progress?.positionMs ?: 0
+        val embeddedForCurrent = current?.let { tr -> book.embeddedChapters.filter { it.trackId == tr.driveId } }.orEmpty()
+        val hasEmbedded = embeddedForCurrent.size > 1
+        val trackPosition = if (isCurrent) player.trackPositionMs else book.progress?.positionMs ?: 0L
+        val currentEmbedded = when {
+            !hasEmbedded -> null
+            isCurrent && player.chapterIndex != null ->
+                embeddedForCurrent.firstOrNull { it.chapterIndex == player.chapterIndex }
+                    ?: embeddedForCurrent.lastOrNull { trackPosition >= it.startMs }
+            else -> embeddedForCurrent.lastOrNull { trackPosition >= it.startMs } ?: embeddedForCurrent.first()
+        }
+        val chapterStart = currentEmbedded?.startMs ?: 0L
+        val chapterPosition = if (isCurrent && currentEmbedded != null && player.chapterIndex != null) {
+            player.positionMs
+        } else {
+            (trackPosition - chapterStart).coerceAtLeast(0L)
+        }
         val speed = if (isCurrent) player.speed else book.progress?.speed ?: 1f
         var durations = ProgressMath.durations(tracks, book.item?.book?.durationMs)
-        if (isCurrent && current != null && player.durationMs > 0 && index < durations.size) {
+        if (isCurrent && current != null && !hasEmbedded && player.durationMs > 0 && index < durations.size) {
             durations = durations.toMutableList().also { it[index] = player.durationMs }
         }
+        val chapterDuration = if (currentEmbedded != null) {
+            val span = (currentEmbedded.endMs - currentEmbedded.startMs).coerceAtLeast(0L)
+            if (span > 0L) span else if (isCurrent) player.durationMs else 0L
+        } else {
+            durations.getOrElse(index) { 0L }
+        }
+        val bookPreset = AudioPreset.fromNameOrNull(book.progress?.audioPreset)
         return PlayerScreenState(
             loaded = true,
             bookId = id,
             item = book.item,
             tracks = tracks,
+            embeddedChapters = book.embeddedChapters,
+            currentEmbeddedChapter = currentEmbedded,
             presentCount = tracks.count { it.state == TrackState.PRESENT },
             progress = book.progress,
             bookmarks = book.bookmarks,
@@ -226,12 +318,14 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             isPlaying = isCurrent && player.isPlaying,
             buffering = isCurrent && player.buffering,
             currentTrack = current,
-            positionMs = position,
-            chapterDurationMs = durations.getOrElse(index) { 0L },
-            globalMs = ProgressMath.globalPosition(durations, index, position),
+            chapterStartMs = chapterStart,
+            positionMs = chapterPosition,
+            trackPositionMs = trackPosition,
+            chapterDurationMs = chapterDuration,
+            globalMs = ProgressMath.globalPosition(durations, index, trackPosition),
             totalMs = ProgressMath.total(durations),
-            percent = if (book.progress?.finished == true && !isCurrent) 100f else ProgressMath.percent(durations, index, position),
-            remainingMs = ProgressMath.remainingMs(durations, index, position, speed),
+            percent = if (book.progress?.finished == true && !isCurrent) 100f else ProgressMath.percent(durations, index, trackPosition),
+            remainingMs = ProgressMath.remainingMs(durations, index, trackPosition, speed),
             speed = speed,
             durations = durations,
             playlistTrackIds = if (isCurrent) player.playlistTrackIds else emptyList(),
@@ -239,7 +333,14 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             skipSeconds = prefs.skipSeconds,
             laterRetentionDays = prefs.laterRetentionDays,
             anotherBookPlaying = player.isPlaying && player.bookId != null && player.bookId != id,
-            audioPreset = prefs.audioPreset,
+            audioPreset = bookPreset ?: prefs.audioPreset,
+            globalAudioPreset = prefs.audioPreset,
+            bookAudioPreset = bookPreset,
+            skipSilence = prefs.skipSilence,
+            shakeToExtendTimer = prefs.shakeToExtendTimer,
+            customTimerMinutes = prefs.customTimerMinutes,
+            binauralConfig = prefs.binauralConfig,
+            jumpHistory = history.filter { it.bookId == id },
         )
     }
 
@@ -274,10 +375,12 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         if (state.value.isCurrent) action() else ensureLoaded()
     }
 
-    /** Barre du chapitre en cours : position dans ce chapitre. */
+    /** Barre du chapitre en cours : position dans ce chapitre (ajoutée au début du chapitre intégré s'il y en a un). */
     fun seekInChapter(positionMs: Long) {
-        val track = state.value.currentTrack ?: return
-        jumpTo(track, positionMs.coerceIn(0L, state.value.chapterDurationMs.coerceAtLeast(0L)))
+        val s = state.value
+        val track = s.currentTrack ?: return
+        val local = positionMs.coerceIn(0L, s.chapterDurationMs.coerceAtLeast(0L))
+        jumpTo(track, s.chapterStartMs + local)
     }
 
     fun jumpTo(track: TrackEntity, positionMs: Long = 0) {
@@ -290,6 +393,15 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         }
     }
 
+    fun jumpToHistory(entry: JumpEntry) {
+        val track = state.value.tracks.firstOrNull { it.driveId == entry.trackId } ?: return
+        jumpTo(track, entry.positionMs)
+    }
+
+    fun clearHistory() {
+        state.value.bookId?.let(PlayerRuntime::clearHistoryForBook)
+    }
+
     fun setSpeed(speed: Float) {
         val s = state.value
         val id = s.bookId ?: return
@@ -297,9 +409,38 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         if (s.isCurrent) c.player.setSpeed(value) else viewModelScope.launch { c.library.setSpeed(id, value) }
     }
 
-    /** Préréglage audio, mémorisé pour tous les livres ; pris en compte aussitôt par le lecteur. */
-    fun setAudioPreset(preset: AudioPreset) {
+    /** Préréglage audio global (pour tous les livres n'ayant pas de réglage dédié). */
+    fun setGlobalAudioPreset(preset: AudioPreset) {
         viewModelScope.launch { c.settings.update { it.copy(audioPreset = preset) } }
+    }
+
+    /** Préréglage audio mémorisé pour ce livre (null : suit le préréglage global). */
+    fun setBookAudioPreset(preset: AudioPreset?) {
+        val id = state.value.bookId ?: return
+        viewModelScope.launch {
+            c.library.setBookAudioPreset(id, preset)
+            c.progressBridge.pushProgress(id)
+        }
+    }
+
+    fun setSkipSilence(enabled: Boolean) {
+        viewModelScope.launch { c.settings.update { it.copy(skipSilence = enabled) } }
+    }
+
+    fun setBinauralAzimuth(deg: Int) {
+        viewModelScope.launch { c.settings.update { it.copy(binauralAzimuthDeg = deg) } }
+    }
+
+    fun setBinauralRoom(room: BinauralRoom) {
+        viewModelScope.launch { c.settings.update { it.copy(binauralRoom = room) } }
+    }
+
+    fun setShakeToExtend(enabled: Boolean) {
+        viewModelScope.launch { c.settings.update { it.copy(shakeToExtendTimer = enabled) } }
+    }
+
+    fun setCustomTimerMinutes(minutes: Int) {
+        viewModelScope.launch { c.settings.update { it.copy(customTimerMinutes = minutes.coerceIn(5, 120)) } }
     }
 
     fun startTimer(minutes: Int) = PlayerRuntime.startTimer(minutes)
@@ -314,9 +455,11 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         val s = state.value
         val id = s.bookId ?: return
         val track = s.currentTrack ?: return
+        val unclippedPos = s.trackPositionMs
+        val chLabel = s.currentEmbeddedChapter?.let { "Chapitre ${it.chapterIndex + 1}" } ?: track.chapterLabel
         viewModelScope.launch {
-            c.library.addBookmark(id, track, s.positionMs, note)
-            c.message("Signet ajouté : ${track.chapterLabel} · ${Formats.clock(s.positionMs)}")
+            c.library.addBookmark(id, track, unclippedPos, note)
+            c.message("Signet ajouté : $chLabel · ${Formats.clock(unclippedPos)}")
         }
     }
 
@@ -349,6 +492,15 @@ fun PlayerScreen(onOpenBook: (String) -> Unit, onOpenLibrary: () -> Unit, conten
                 title = { Text("Lecteur") },
                 actions = {
                     state.bookId?.let { id ->
+                        IconButton(onClick = { sheet = SHEET_HISTORY }) {
+                            if (state.jumpHistory.isNotEmpty()) {
+                                BadgedBox(badge = { Badge() }) {
+                                    Icon(Icons.Filled.History, contentDescription = "Positions récentes (${state.jumpHistory.size})")
+                                }
+                            } else {
+                                Icon(Icons.Filled.History, contentDescription = "Positions récentes")
+                            }
+                        }
                         IconButton(onClick = { onOpenBook(id) }) { Icon(Icons.Filled.Info, contentDescription = "Fiche du livre") }
                     }
                 },
@@ -373,13 +525,17 @@ fun PlayerScreen(onOpenBook: (String) -> Unit, onOpenLibrary: () -> Unit, conten
 
     when (sheet) {
         SHEET_SPEED -> SpeedSheet(state.speed, onSpeed = vm::setSpeed, onDismiss = { sheet = null })
-        SHEET_TIMER -> TimerSheet(state.sleep, vm, onDismiss = { sheet = null })
-        SHEET_CHAPTERS -> ChaptersSheet(state, onJump = { track ->
-            vm.jumpTo(track)
+        SHEET_TIMER -> TimerSheet(state, vm, onDismiss = { sheet = null })
+        SHEET_CHAPTERS -> ChaptersSheet(state, onJump = { track, pos ->
+            vm.jumpTo(track, pos)
             sheet = null
         }, onDismiss = { sheet = null })
         SHEET_BOOKMARKS -> BookmarksSheet(state, vm, onDismiss = { sheet = null })
-        SHEET_SOUND -> SoundSheet(state.audioPreset, onSelect = vm::setAudioPreset, onDismiss = { sheet = null })
+        SHEET_SOUND -> SoundSheet(state, vm, onDismiss = { sheet = null })
+        SHEET_HISTORY -> HistorySheet(state.jumpHistory, onJump = { entry ->
+            vm.jumpToHistory(entry)
+            sheet = null
+        }, onClear = vm::clearHistory, onDismiss = { sheet = null })
     }
 }
 
@@ -388,6 +544,7 @@ private const val SHEET_TIMER = "timer"
 private const val SHEET_CHAPTERS = "chapters"
 private const val SHEET_BOOKMARKS = "bookmarks"
 private const val SHEET_SOUND = "sound"
+private const val SHEET_HISTORY = "history"
 
 @Composable
 private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: PlayerViewModel, modifier: Modifier, onOpenSheet: (String) -> Unit) {
@@ -412,9 +569,19 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
         Spacer(Modifier.height(4.dp))
         Text(item.title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center, modifier = Modifier.semantics { heading() })
         item.author?.let { Text(it, style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center) }
-        state.currentTrack?.let { track ->
-            Text(track.chapterLabel, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
-            Text(track.title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        val embeddedCh = state.currentEmbeddedChapter
+        if (embeddedCh != null) {
+            val totalCh = state.embeddedChapters.count { it.trackId == embeddedCh.trackId }
+            val chHeader = "Chapitre ${embeddedCh.chapterIndex + 1}" + if (totalCh > 0) " / $totalCh" else ""
+            Text(chHeader, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
+            if (embeddedCh.title.isNotBlank() && !embeddedCh.title.equals("Chapitre ${embeddedCh.chapterIndex + 1}", ignoreCase = true)) {
+                Text(embeddedCh.title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
+        } else {
+            state.currentTrack?.let { track ->
+                Text(track.chapterLabel, style = MaterialTheme.typography.titleSmall, textAlign = TextAlign.Center)
+                Text(track.title, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, maxLines = 2, overflow = TextOverflow.Ellipsis)
+            }
         }
 
         ChapterSeekBar(state, enabled = canPlay, onSeek = vm::seekInChapter)
@@ -692,9 +859,10 @@ private fun SpeedSheet(speed: Float, onSpeed: (Float) -> Unit, onDismiss: () -> 
     }
 }
 
-/** Préréglages audio : un seul à la fois, mémorisé pour tous les livres (téléphone, voiture, montre). */
+/** Préréglages audio, saut des silences, portée (global ou par livre) et réglages binauraux. */
 @Composable
-private fun SoundSheet(current: AudioPreset, onSelect: (AudioPreset) -> Unit, onDismiss: () -> Unit) {
+private fun SoundSheet(state: PlayerScreenState, vm: PlayerViewModel, onDismiss: () -> Unit) {
+    val bookSpecific = state.bookAudioPreset != null
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(
             Modifier
@@ -704,18 +872,64 @@ private fun SoundSheet(current: AudioPreset, onSelect: (AudioPreset) -> Unit, on
                 .padding(bottom = 16.dp),
         ) {
             Text("Son", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 24.dp).semantics { heading() })
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .toggleable(
+                        value = state.skipSilence,
+                        role = Role.Switch,
+                        onValueChange = vm::setSkipSilence,
+                    )
+                    .padding(horizontal = 24.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Sauter les silences", style = MaterialTheme.typography.bodyLarge)
+                    Text("Raccourcit les pauses longues entre phrases", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(checked = state.skipSilence, onCheckedChange = null)
+            }
+            HorizontalDivider(Modifier.padding(vertical = 4.dp))
             Text(
-                "Traitement appliqué à la lecture, pour tous les livres — aussi en voiture et sur la montre.",
-                style = MaterialTheme.typography.bodyMedium,
+                "Portée du préréglage",
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
+            )
+            FlowRow(
+                Modifier.padding(horizontal = 24.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FilterChip(
+                    selected = !bookSpecific,
+                    onClick = { vm.setBookAudioPreset(null) },
+                    label = { Text("Pour tous les livres") },
+                )
+                FilterChip(
+                    selected = bookSpecific,
+                    onClick = { if (!bookSpecific) vm.setBookAudioPreset(state.audioPreset) },
+                    label = { Text("Seulement ce livre") },
+                )
+            }
+            Text(
+                if (bookSpecific) {
+                    "Ce livre garde son propre préréglage (synchronisé entre vos appareils)."
+                } else {
+                    "Traitement appliqué par défaut à tous les livres — aussi en voiture et sur la montre."
+                },
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 6.dp),
             )
             AudioPreset.entries.forEach { preset ->
-                val selected = preset == current
+                val selected = preset == state.audioPreset
                 Row(
                     Modifier
                         .fillMaxWidth()
-                        .clickable(onClickLabel = "Choisir ${preset.label}") { onSelect(preset) }
+                        .clickable(onClickLabel = "Choisir ${preset.label}") {
+                            if (bookSpecific) vm.setBookAudioPreset(preset) else vm.setGlobalAudioPreset(preset)
+                        }
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
@@ -727,12 +941,57 @@ private fun SoundSheet(current: AudioPreset, onSelect: (AudioPreset) -> Unit, on
                     }
                 }
             }
+            if (state.audioPreset == AudioPreset.BINAURAL) {
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Text(
+                    "Réglages binauraux",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                )
+                Text(
+                    "Position de la voix",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                )
+                FlowRow(
+                    Modifier.padding(horizontal = 24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    BinauralConfig.AZIMUTH_CHOICES.forEach { deg ->
+                        FilterChip(
+                            selected = state.binauralConfig.azimuthDeg == deg,
+                            onClick = { vm.setBinauralAzimuth(deg) },
+                            label = { Text(BinauralConfig.azimuthLabel(deg)) },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Acoustique de la pièce",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp),
+                )
+                FlowRow(
+                    Modifier.padding(horizontal = 24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    BinauralRoom.entries.forEach { room ->
+                        FilterChip(
+                            selected = state.binauralConfig.room == room,
+                            onClick = { vm.setBinauralRoom(room) },
+                            label = { Text(room.label) },
+                        )
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun TimerSheet(sleep: SleepTimerState, vm: PlayerViewModel, onDismiss: () -> Unit) {
+private fun TimerSheet(state: PlayerScreenState, vm: PlayerViewModel, onDismiss: () -> Unit) {
+    val sleep = state.sleep
     val remaining by produceState(initialValue = remainingOf(sleep), sleep) {
         while (true) {
             value = remainingOf(sleep)
@@ -740,17 +999,19 @@ private fun TimerSheet(sleep: SleepTimerState, vm: PlayerViewModel, onDismiss: (
             delay(1_000)
         }
     }
-    ModalBottomSheet(onDismissRequest = onDismiss) {
+    var customMin by remember(state.customTimerMinutes) { mutableIntStateOf(state.customTimerMinutes) }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(
             Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
                 .navigationBarsPadding()
                 .padding(bottom = 16.dp),
         ) {
             Text("Minuterie de sommeil", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 24.dp).semantics { heading() })
             Text(
                 when (sleep) {
-                    SleepTimerState.Off -> "Désactivée"
+                    SleepTimerState.Off -> "Désactivée (fondu doux de 10 s avant l'arrêt)"
                     SleepTimerState.EndOfChapter -> "Arrêt à la fin du chapitre"
                     is SleepTimerState.Countdown -> "Arrêt dans ${Formats.clock(remaining)}"
                 },
@@ -759,7 +1020,7 @@ private fun TimerSheet(sleep: SleepTimerState, vm: PlayerViewModel, onDismiss: (
                 modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
             )
             if (sleep != SleepTimerState.Off) {
-                Row(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Row(Modifier.padding(horizontal = 24.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     if (sleep is SleepTimerState.Countdown) {
                         Button(onClick = vm::extendTimer) { Text("+10 min") }
                     }
@@ -780,6 +1041,48 @@ private fun TimerSheet(sleep: SleepTimerState, vm: PlayerViewModel, onDismiss: (
                 vm.endOfChapter()
                 onDismiss()
             }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            Column(Modifier.padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Durée libre : $customMin min", style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f))
+                    Button(onClick = {
+                        vm.setCustomTimerMinutes(customMin)
+                        vm.startTimer(customMin)
+                        onDismiss()
+                    }) { Text("Démarrer") }
+                }
+                Slider(
+                    value = customMin.toFloat(),
+                    onValueChange = { customMin = ((it / 5f).roundToInt() * 5).coerceIn(5, 120) },
+                    onValueChangeFinished = { vm.setCustomTimerMinutes(customMin) },
+                    valueRange = 5f..120f,
+                    steps = 22,
+                    modifier = Modifier.semantics { contentDescription = "Durée libre en minutes" },
+                )
+            }
+            HorizontalDivider(Modifier.padding(vertical = 8.dp))
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .toggleable(
+                        value = state.shakeToExtendTimer,
+                        role = Role.Switch,
+                        onValueChange = vm::setShakeToExtend,
+                    )
+                    .padding(horizontal = 24.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text("Secouer pour prolonger (+10 min)", style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        "Actif pendant la minuterie et 60 s après la mise en pause automatique",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Spacer(Modifier.width(12.dp))
+                Switch(checked = state.shakeToExtendTimer, onCheckedChange = null)
+            }
         }
     }
 }
@@ -797,8 +1100,9 @@ private fun SheetChoice(label: String, onClick: () -> Unit) {
 }
 
 @Composable
-private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity) -> Unit, onDismiss: () -> Unit) {
+private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity, Long) -> Unit, onDismiss: () -> Unit) {
     val groups = remember(state.tracks) { Chapters.group(state.tracks) }
+    val embeddedByTrack = remember(state.embeddedChapters) { state.embeddedChapters.groupBy { it.trackId } }
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Text("Chapitres", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(horizontal = 24.dp).semantics { heading() })
         LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 32.dp)) {
@@ -816,34 +1120,74 @@ private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity) -> Uni
                         )
                     }
                 }
-                items(group.tracks, key = { it.driveId }) { track ->
-                    val current = track.driveId == state.currentTrack?.driveId
+                group.tracks.forEach { track ->
+                    val embedded = embeddedByTrack[track.driveId].orEmpty()
                     val present = track.state == TrackState.PRESENT
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clickable(enabled = present, onClickLabel = "Aller à ce chapitre") { onJump(track) }
-                            .padding(horizontal = 24.dp, vertical = 10.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                track.title,
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = if (current) FontWeight.Bold else FontWeight.Normal,
-                                color = when {
-                                    current -> MaterialTheme.colorScheme.primary
-                                    present -> MaterialTheme.colorScheme.onSurface
-                                    else -> MaterialTheme.colorScheme.onSurfaceVariant
-                                },
-                            )
-                            Text(
-                                listOfNotNull(track.chapterLabel, track.durationMs?.let { Formats.duration(it, !track.durationExact) }).joinToString(" · "),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
+                    if (embedded.size > 1) {
+                        items(embedded, key = { "emb-${track.driveId}-${it.chapterIndex}" }) { ch ->
+                            val current = track.driveId == state.currentTrack?.driveId &&
+                                state.currentEmbeddedChapter?.chapterIndex == ch.chapterIndex
+                            val span = (ch.endMs - ch.startMs).coerceAtLeast(0L)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = present, onClickLabel = "Aller à ce chapitre") { onJump(track, ch.startMs) }
+                                    .padding(horizontal = 24.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        ch.title.ifBlank { "Chapitre ${ch.chapterIndex + 1}" },
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = if (current) FontWeight.Bold else FontWeight.Normal,
+                                        color = when {
+                                            current -> MaterialTheme.colorScheme.primary
+                                            present -> MaterialTheme.colorScheme.onSurface
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                    )
+                                    Text(
+                                        listOfNotNull(
+                                            "Chapitre ${ch.chapterIndex + 1}",
+                                            span.takeIf { it > 0L }?.let { Formats.duration(it, false) },
+                                        ).joinToString(" · "),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (!present) Icon(Icons.Filled.CloudQueue, contentDescription = "Pas encore téléchargé", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
                         }
-                        if (!present) Icon(Icons.Filled.CloudQueue, contentDescription = "Pas encore téléchargé", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    } else {
+                        item(key = track.driveId) {
+                            val current = track.driveId == state.currentTrack?.driveId
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clickable(enabled = present, onClickLabel = "Aller à ce chapitre") { onJump(track, 0L) }
+                                    .padding(horizontal = 24.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        track.title,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        fontWeight = if (current) FontWeight.Bold else FontWeight.Normal,
+                                        color = when {
+                                            current -> MaterialTheme.colorScheme.primary
+                                            present -> MaterialTheme.colorScheme.onSurface
+                                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                                        },
+                                    )
+                                    Text(
+                                        listOfNotNull(track.chapterLabel, track.durationMs?.let { Formats.duration(it, !track.durationExact) }).joinToString(" · "),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                if (!present) Icon(Icons.Filled.CloudQueue, contentDescription = "Pas encore téléchargé", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                        }
                     }
                 }
             }
@@ -858,7 +1202,8 @@ private fun BookmarksSheet(state: PlayerScreenState, vm: PlayerViewModel, onDism
         Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Signets", style = MaterialTheme.typography.titleLarge, modifier = Modifier.semantics { heading() })
             state.currentTrack?.let { track ->
-                Text("Ici : ${track.chapterLabel} · ${Formats.clock(state.positionMs)}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                val chLabel = state.currentEmbeddedChapter?.let { "Chapitre ${it.chapterIndex + 1}" } ?: track.chapterLabel
+                Text("Ici : $chLabel · ${Formats.clock(state.trackPositionMs)}", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 OutlinedTextField(
                     value = note,
                     onValueChange = { note = it.take(LibraryRepository.MAX_NOTE_LENGTH) },
@@ -884,6 +1229,11 @@ private fun BookmarksSheet(state: PlayerScreenState, vm: PlayerViewModel, onDism
             }
             items(state.bookmarks, key = { it.id }) { bm ->
                 val track = state.tracks.firstOrNull { it.driveId == bm.trackId }
+                val emb = state.embeddedChapters
+                    .filter { it.trackId == bm.trackId }
+                    .takeIf { it.size > 1 }
+                    ?.lastOrNull { bm.positionMs >= it.startMs }
+                val chLabel = emb?.let { "Chapitre ${it.chapterIndex + 1}" } ?: track?.chapterLabel ?: "Piste ${bm.trackIndex + 1}"
                 Row(
                     Modifier
                         .fillMaxWidth()
@@ -899,7 +1249,7 @@ private fun BookmarksSheet(state: PlayerScreenState, vm: PlayerViewModel, onDism
                     Column(Modifier.weight(1f)) {
                         Text(bm.note.ifBlank { "Signet" }, style = MaterialTheme.typography.bodyLarge)
                         Text(
-                            "${track?.chapterLabel ?: "Piste ${bm.trackIndex + 1}"} · ${Formats.clock(bm.positionMs)} · ${Formats.date(bm.createdAt)}",
+                            "$chLabel · ${Formats.clock(bm.positionMs)} · ${Formats.date(bm.createdAt)}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -910,3 +1260,65 @@ private fun BookmarksSheet(state: PlayerScreenState, vm: PlayerViewModel, onDism
         }
     }
 }
+
+@Composable
+private fun HistorySheet(
+    entries: List<JumpEntry>,
+    onJump: (JumpEntry) -> Unit,
+    onClear: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(start = 24.dp, end = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "Positions récentes",
+                style = MaterialTheme.typography.titleLarge,
+                modifier = Modifier.weight(1f).semantics { heading() },
+            )
+            if (entries.isNotEmpty()) {
+                TextButton(onClick = onClear) { Text("Effacer") }
+            }
+        }
+        LazyColumn(Modifier.fillMaxWidth(), contentPadding = PaddingValues(bottom = 32.dp)) {
+            if (entries.isEmpty()) {
+                item {
+                    Text(
+                        "Aucune position récente pour ce livre. Audiothèque mémorise automatiquement votre place avant un saut de chapitre, un déplacement du curseur ou le démarrage de la minuterie.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(24.dp),
+                    )
+                }
+            }
+            items(entries, key = { it.id }) { entry ->
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(onClickLabel = "Revenir à cette position") { onJump(entry) }
+                        .padding(horizontal = 24.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(Icons.Filled.History, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Spacer(Modifier.width(16.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            "${entry.chapterLabel} · ${Formats.clock(entry.positionMs)}",
+                            style = MaterialTheme.typography.bodyLarge,
+                        )
+                        Text(
+                            "${entry.reason} · ${Formats.time(entry.timestamp)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+

@@ -2,6 +2,7 @@ package com.julienmiquel.audiotheque.sync.engine
 
 import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
+import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
@@ -346,6 +347,14 @@ class Downloader(
         val info = inspector.inspect(file)
         tracks.setLocalState(track.driveId, TrackState.PRESENT, file.path, file.length())
         info?.durationMs?.takeIf { it > 0 }?.let { tracks.setExactDuration(track.driveId, it) }
+        if (info != null && info.chapters.size > 1) {
+            db.embeddedChapterDao().replaceForTrack(
+                track.driveId,
+                info.chapters.mapIndexed { idx, ch ->
+                    EmbeddedChapterEntity(book.driveId, track.driveId, idx, ch.title, ch.startMs, ch.endMs)
+                },
+            )
+        }
         transfers.remove(track.driveId)
         if (received) {
             ctx.filesReceived.incrementAndGet()

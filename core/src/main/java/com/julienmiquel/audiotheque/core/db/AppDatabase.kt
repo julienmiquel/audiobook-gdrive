@@ -14,6 +14,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
     entities = [
         BookEntity::class,
         TrackEntity::class,
+        EmbeddedChapterEntity::class,
         ProgressEntity::class,
         BookmarkEntity::class,
         SyncEventEntity::class,
@@ -21,7 +22,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         PendingOperationEntity::class,
         SyncPairEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
     autoMigrations = [
         // v2 : clé d'auteur pour les doublons (colonne facultative, remplie au fil des synchros).
@@ -30,11 +31,14 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AutoMigration(from = 2, to = 3, spec = AppDatabase.ProgressInBookFolder::class),
         // v4 : suppression d'un doublon (dossier mis à la corbeille Drive par la file d'opérations).
         AutoMigration(from = 3, to = 4),
+        // v5 : préréglage audio par livre et chapitres embarqués (.m4b / ID3 CHAP).
+        AutoMigration(from = 4, to = 5),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {
     abstract fun bookDao(): BookDao
     abstract fun trackDao(): TrackDao
+    abstract fun embeddedChapterDao(): EmbeddedChapterDao
     abstract fun progressDao(): ProgressDao
     abstract fun bookmarkDao(): BookmarkDao
     abstract fun syncEventDao(): SyncEventDao
@@ -58,6 +62,7 @@ abstract class AppDatabase : RoomDatabase() {
      * historique, paires). La progression (par compte) et les signets restent sur le téléphone.
      */
     suspend fun clearLibrary() = withTransaction {
+        embeddedChapterDao().deleteAll()
         trackDao().deleteAll()
         pendingOperationDao().deleteAll()
         bookDao().deleteAll()

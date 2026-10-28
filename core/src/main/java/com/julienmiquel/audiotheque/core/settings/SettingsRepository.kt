@@ -14,6 +14,8 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStoreFile
 import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.AudioPreset
+import com.julienmiquel.audiotheque.core.model.BinauralConfig
+import com.julienmiquel.audiotheque.core.model.BinauralRoom
 import java.io.File
 import java.io.IOException
 import kotlinx.coroutines.flow.Flow
@@ -50,14 +52,28 @@ data class AppSettings(
     /** Enrichissement Google Books automatique après confirmation du titre et de l'auteur. */
     val googleBooksEnrichment: Boolean = true,
     val lastPlayedBookId: String? = null,
-    /** Préréglage audio du lecteur (normalisation, voix, niveau très bas, binaural), pour tous les livres. */
+    /** Préréglage audio par défaut du lecteur (normalisation, voix, niveau très bas, binaural). */
     val audioPreset: AudioPreset = AudioPreset.NONE,
+    /** Suppression automatique des silences entre les phrases. */
+    val skipSilence: Boolean = false,
+    /** Recul adaptatif à la reprise selon la durée de la pause (2 s à 30 s). */
+    val smartRewind: Boolean = true,
+    /** Secouer le téléphone pendant la minuterie de sommeil pour prolonger de 10 min. */
+    val shakeToExtendTimer: Boolean = true,
+    /** Dernière durée libre choisie pour la minuterie de sommeil (minutes). */
+    val customTimerMinutes: Int = 20,
+    /** Azimut de la voix en mode binaural (-30 à +30°). */
+    val binauralAzimuthDeg: Int = 0,
+    /** Pièce simulée en mode binaural. */
+    val binauralRoom: BinauralRoom = BinauralRoom.SMALL,
 ) {
     /** Clé de compte de la progression (propre à chaque utilisateur). */
     val accountKey: String
         get() = if (accountEmail.isNullOrBlank()) Accounts.LOCAL else accountEmail
 
     val isConnected: Boolean get() = !accountEmail.isNullOrBlank()
+
+    val binauralConfig: BinauralConfig get() = BinauralConfig(binauralAzimuthDeg, binauralRoom)
 
     companion object {
         val SKIP_CHOICES = listOf(10, 15, 30)
@@ -123,6 +139,12 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val googleBooks = booleanPreferencesKey("google_books")
         val lastPlayedBookId = stringPreferencesKey("last_played_book")
         val audioPreset = stringPreferencesKey("audio_preset")
+        val skipSilence = booleanPreferencesKey("skip_silence")
+        val smartRewind = booleanPreferencesKey("smart_rewind")
+        val shakeToExtendTimer = booleanPreferencesKey("shake_extend_timer")
+        val customTimerMinutes = intPreferencesKey("custom_timer_minutes")
+        val binauralAzimuthDeg = intPreferencesKey("binaural_azimuth_deg")
+        val binauralRoom = stringPreferencesKey("binaural_room")
 
         val pageToken = stringPreferencesKey("sync_page_token")
         val pageTokenAccount = stringPreferencesKey("sync_page_token_account")
@@ -154,6 +176,12 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             googleBooksEnrichment = this[K.googleBooks] ?: d.googleBooksEnrichment,
             lastPlayedBookId = this[K.lastPlayedBookId],
             audioPreset = AudioPreset.fromName(this[K.audioPreset]),
+            skipSilence = this[K.skipSilence] ?: d.skipSilence,
+            smartRewind = this[K.smartRewind] ?: d.smartRewind,
+            shakeToExtendTimer = this[K.shakeToExtendTimer] ?: d.shakeToExtendTimer,
+            customTimerMinutes = (this[K.customTimerMinutes] ?: d.customTimerMinutes).coerceIn(5, 180),
+            binauralAzimuthDeg = (this[K.binauralAzimuthDeg] ?: d.binauralAzimuthDeg).coerceIn(-45, 45),
+            binauralRoom = BinauralRoom.fromName(this[K.binauralRoom]),
         )
     }
 
@@ -176,6 +204,12 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p[K.googleBooks] = googleBooksEnrichment
         p.putOrRemove(K.lastPlayedBookId, lastPlayedBookId)
         p[K.audioPreset] = audioPreset.name
+        p[K.skipSilence] = skipSilence
+        p[K.smartRewind] = smartRewind
+        p[K.shakeToExtendTimer] = shakeToExtendTimer
+        p[K.customTimerMinutes] = customTimerMinutes
+        p[K.binauralAzimuthDeg] = binauralAzimuthDeg
+        p[K.binauralRoom] = binauralRoom.name
     }
 
     private fun Preferences.toSyncState() = SyncState(

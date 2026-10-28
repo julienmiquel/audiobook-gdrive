@@ -9,6 +9,7 @@ import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.audio.AudioSink
 import androidx.media3.exoplayer.audio.DefaultAudioSink
 import com.julienmiquel.audiotheque.core.model.AudioPreset
+import com.julienmiquel.audiotheque.core.model.BinauralConfig
 import java.nio.ByteBuffer
 import kotlin.math.roundToInt
 
@@ -24,6 +25,10 @@ class PresetAudioProcessor : BaseAudioProcessor() {
     /** Préréglage demandé (lu sur le fil audio à chaque tampon). */
     @Volatile
     var preset: AudioPreset = AudioPreset.NONE
+
+    /** Réglages fins du moteur binaural (azimut, pièce), lus sur le fil audio. */
+    @Volatile
+    var binauralConfig: BinauralConfig = BinauralConfig()
 
     private var chain: PresetChain? = null
     private var left = FloatArray(0)
@@ -58,9 +63,11 @@ class PresetAudioProcessor : BaseAudioProcessor() {
         }
 
         val wanted = preset
+        val wantedBinaural = binauralConfig
         val current = chain
-        if (current == null || current.preset != wanted) {
-            chain = if (wanted == AudioPreset.NONE) null else PresetChain(inputAudioFormat.sampleRate, wanted)
+        val binauralChanged = wanted == AudioPreset.BINAURAL && current?.binauralConfig != wantedBinaural
+        if (current == null || current.preset != wanted || binauralChanged) {
+            chain = if (wanted == AudioPreset.NONE) null else PresetChain(inputAudioFormat.sampleRate, wanted, wantedBinaural)
             if (current != null || wanted != AudioPreset.NONE) {
                 fadeLength = inputAudioFormat.sampleRate * FADE_MS / 1000
                 fadeRemaining = fadeLength

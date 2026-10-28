@@ -270,6 +270,9 @@ internal class AllPass(sampleRate: Int, delayMs: Double, private val g: Double =
 class Binaural(private val sampleRate: Int, azimuthDeg: Double = 0.0, room: Room = Room.SMALL) {
 
     enum class Room(val rt60: Double, val wetDb: Double, val earlyDb: Double) {
+        /** Studio feutré : voix très proche, réflexions discrètes. */
+        INTIMATE(0.28, -22.0, -10.0),
+
         /** Petite pièce : queue courte, réflexions proches. */
         SMALL(0.45, -18.0, -7.0),
 

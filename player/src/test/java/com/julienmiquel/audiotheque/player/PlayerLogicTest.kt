@@ -8,16 +8,51 @@ import org.junit.Test
 class PlayerLogicTest {
 
     @After
-    fun tearDown() = PlayerRuntime.cancelTimer()
+    fun tearDown() {
+        PlayerRuntime.cancelTimer()
+        PlayerRuntime.clearHistoryForBook("civ")
+        PlayerRuntime.clearHistoryForBook("other")
+    }
 
     @Test
-    fun `identifiants média - livre, piste et position`() {
+    fun `identifiants média - livre, piste, chapitre intégré et position`() {
         val request = MediaIds.bookRequest("civ", "t9", 12_000)
         assertThat(MediaIds.parseBookRequest(request)).isEqualTo(MediaIds.BookRequest("civ", "t9", 12_000))
         assertThat(MediaIds.parseBookRequest(MediaIds.bookRequest("civ"))).isEqualTo(MediaIds.BookRequest("civ", null, null))
         assertThat(MediaIds.parseBookRequest(MediaIds.bookRequest("civ", null, 5_000))).isEqualTo(MediaIds.BookRequest("civ", null, 5_000))
-        assertThat(MediaIds.parseTrack(MediaIds.track("civ", "t1"))).isEqualTo(MediaIds.TrackRef("civ", "t1"))
+        assertThat(MediaIds.parseTrack(MediaIds.track("civ", "t1"))).isEqualTo(MediaIds.TrackRef("civ", "t1", null))
+        assertThat(MediaIds.parseTrack(MediaIds.track("civ", "m4b1", 3))).isEqualTo(MediaIds.TrackRef("civ", "m4b1", 3))
+        assertThat(MediaIds.parseTrack("t:civ:m4b1:notanumber")).isNull()
         assertThat(MediaIds.parseTrack("b:civ")).isNull()
+    }
+
+    @Test
+    fun `recul intelligent selon la durée de pause`() {
+        assertThat(SmartRewind.computeMs(500L, smart = true)).isEqualTo(0L)
+        assertThat(SmartRewind.computeMs(10_000L, smart = true)).isEqualTo(2_000L)
+        assertThat(SmartRewind.computeMs(3 * 60_000L, smart = true)).isEqualTo(5_000L)
+        assertThat(SmartRewind.computeMs(30 * 60_000L, smart = true)).isEqualTo(10_000L)
+        assertThat(SmartRewind.computeMs(5 * 3_600_000L, smart = true)).isEqualTo(20_000L)
+        assertThat(SmartRewind.computeMs(48 * 3_600_000L, smart = true)).isEqualTo(30_000L)
+        assertThat(SmartRewind.computeMs(48 * 3_600_000L, smart = false)).isEqualTo(5_000L)
+        assertThat(SmartRewind.computeMs(1_000L, smart = false)).isEqualTo(0L)
+    }
+
+    @Test
+    fun `historique de sauts - dédoublonnage proche et nettoyage par livre`() {
+        PlayerRuntime.recordJump("civ", "t1", "Chapitre 1", 40_000L, "Avant saut", now = 1_000L)
+        // Moins de 5 s d'écart sur la même piste : ignoré.
+        PlayerRuntime.recordJump("civ", "t1", "Chapitre 1", 42_000L, "Avant saut", now = 2_000L)
+        PlayerRuntime.recordJump("civ", "t2", "Chapitre 2", 120_000L, "Minuterie", now = 3_000L)
+        PlayerRuntime.recordJump("other", "x1", "Piste 1", 10_000L, "Avant saut", now = 4_000L)
+
+        val civEntries = PlayerRuntime.seekHistory.value.filter { it.bookId == "civ" }
+        assertThat(civEntries).hasSize(2)
+        assertThat(civEntries.first().trackId).isEqualTo("t2")
+        assertThat(civEntries.last().positionMs).isEqualTo(40_000L)
+
+        PlayerRuntime.clearHistoryForBook("civ")
+        assertThat(PlayerRuntime.seekHistory.value.map { it.bookId }).containsExactly("other")
     }
 
     @Test

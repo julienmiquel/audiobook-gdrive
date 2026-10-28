@@ -35,5 +35,35 @@ enum class AudioPreset(val label: String, val description: String) {
 
     companion object {
         fun fromName(name: String?): AudioPreset = entries.firstOrNull { it.name == name } ?: NONE
+        fun fromNameOrNull(name: String?): AudioPreset? = entries.firstOrNull { it.name == name }
     }
 }
+
+/** Acoustique simulée pour le moteur binaural. */
+enum class BinauralRoom(val label: String, val description: String) {
+    INTIMATE("Intime", "Voix proche, réflexions très discrètes"),
+    SMALL("Petite pièce", "Équilibre naturel, son aéré"),
+    MEETING("Salon", "Plus de recul et d'espace"),
+    ;
+
+    companion object {
+        fun fromName(name: String?): BinauralRoom = entries.firstOrNull { it.name == name } ?: SMALL
+    }
+}
+
+/** Réglages fins du rendu binaural (angle horizontal de la voix et acoustique de la pièce). */
+data class BinauralConfig(
+    val azimuthDeg: Int = 0,
+    val room: BinauralRoom = BinauralRoom.SMALL,
+) {
+    companion object {
+        val AZIMUTH_CHOICES = listOf(-30, -15, 0, 15, 30)
+
+        fun azimuthLabel(deg: Int): String = when {
+            deg < 0 -> "${-deg}° G"
+            deg > 0 -> "${deg}° D"
+            else -> "Face (0°)"
+        }
+    }
+}
+

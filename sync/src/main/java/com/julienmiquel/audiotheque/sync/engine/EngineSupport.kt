@@ -13,7 +13,9 @@ import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.parse.EmbeddedChapter
 import com.julienmiquel.audiotheque.core.parse.Mp3Probe
+import com.julienmiquel.audiotheque.core.parse.Mp4Probe
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
 import java.io.File
@@ -178,32 +180,68 @@ class AndroidNetworkStatus(context: Context) : NetworkStatus {
     } == true
 }
 
-/** Ce qu'on lit dans un fichier audio téléchargé : durée exacte, voix, pochette. */
-data class AudioFileInfo(val durationMs: Long?, val narrator: String?, val picture: ByteArray?)
+/** Ce qu'on lit dans un fichier audio téléchargé : durée exacte, voix, pochette et chapitres embarqués. */
+data class AudioFileInfo(
+    val durationMs: Long?,
+    val narrator: String?,
+    val picture: ByteArray?,
+    val chapters: List<EmbeddedChapter> = emptyList(),
+)
 
 fun interface AudioFileInspector {
     fun inspect(file: File): AudioFileInfo?
 }
 
-/** Lecture des métadonnées par MediaMetadataRetriever, complétée par les tags ID3 (TXXX). */
+/** Lecture des métadonnées par MediaMetadataRetriever, complétée par Mp4Probe (.m4b/.m4a) et les tags ID3 (TXXX, CHAP). */
 class MediaMetadataInspector : AudioFileInspector {
     override fun inspect(file: File): AudioFileInfo? = runCatching {
+        val mp4 = if (Mp4Probe.isMp4File(file.name)) Mp4Probe.parse(file) else null
         val retriever = MediaMetadataRetriever()
         try {
-            retriever.setDataSource(file.path)
-            val duration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
-            val head = file.inputStream().use { input ->
-                val buffer = ByteArray(Mp3Probe.PROBE_BYTES)
-                val n = input.read(buffer)
-                if (n > 0) buffer.copyOf(n) else ByteArray(0)
-            }
-            val tags = Mp3Probe.parse(head).tags
-            val narrator = tags?.narrator()
-                ?: retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COMPOSER)
+            val loaded = runCatching { retriever.setDataSource(file.path) }.isSuccess
+            val retrieverDuration = if (loaded) retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() else null
+            val duration = retrieverDuration ?: mp4?.durationMs
+            val retrieverPic = if (loaded) retriever.embeddedPicture else null
+            val retrieverComposer = if (loaded) {
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_COMPOSER)
                     ?.takeIf { it.isNotBlank() && !it.equals(retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_ARTIST), true) }
-            AudioFileInfo(duration, narrator, retriever.embeddedPicture ?: tags?.picture)
+            } else {
+                null
+            }
+            if (mp4 != null) {
+                AudioFileInfo(
+                    durationMs = duration,
+                    narrator = mp4.tags?.narrator() ?: retrieverComposer,
+                    picture = retrieverPic ?: mp4.tags?.picture,
+                    chapters = Mp3Probe.normalizeChapters(mp4.chapters, duration),
+                )
+            } else {
+                val head = file.inputStream().use { input ->
+                    val probeBuf = ByteArray(Mp3Probe.PROBE_BYTES)
+                    val n = input.read(probeBuf)
+                    val initial = if (n > 0) probeBuf.copyOf(n) else ByteArray(0)
+                    val tagSize = Mp3Probe.id3TagSize(initial)
+                    if (tagSize > initial.size && tagSize <= Mp3Probe.MAX_TAG_BYTES) {
+                        file.inputStream().use { full ->
+                            val big = ByteArray(minOf(tagSize + 4096, file.length().toInt()))
+                            val m = full.read(big)
+                            if (m > 0) big.copyOf(m) else initial
+                        }
+                    } else {
+                        initial
+                    }
+                }
+                val tags = Mp3Probe.parse(head).tags
+                val narrator = tags?.narrator() ?: retrieverComposer
+                AudioFileInfo(
+                    durationMs = duration,
+                    narrator = narrator,
+                    picture = retrieverPic ?: tags?.picture,
+                    chapters = Mp3Probe.normalizeChapters(tags?.chapters.orEmpty(), duration),
+                )
+            }
         } finally {
-            retriever.release()
+            runCatching { retriever.release() }
         }
     }.getOrNull()
 }
@@ -239,6 +277,7 @@ data class ProgressJson(
     val lastListenedAt: Long? = null,
     val finished: Boolean = false,
     val setAsideAtPercent: Float? = null,
+    val audioPreset: String? = null,
     /** Date d'enregistrement sur le téléphone : la plus récente l'emporte entre deux appareils. */
     val updatedAt: Long,
     /** Appareil qui a écrit la position (« Google Pixel 9 »). */
