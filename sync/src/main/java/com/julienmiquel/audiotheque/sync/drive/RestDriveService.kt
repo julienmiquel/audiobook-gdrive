@@ -44,6 +44,10 @@ class RestDriveService(
     override suspend fun findByName(name: String): List<DriveFile> =
         listAll("name = '${escape(name)}' and trashed = false")
 
+    override suspend fun findByNamePrefix(prefix: String): List<DriveFile> =
+        listAll("name contains '${escape(prefix)}' and trashed = false")
+            .filter { it.name.startsWith(prefix) }
+
     /** files.list paginé pour une requête q donnée. */
     private suspend fun listAll(q: String): List<DriveFile> {
         val result = mutableListOf<DriveFile>()

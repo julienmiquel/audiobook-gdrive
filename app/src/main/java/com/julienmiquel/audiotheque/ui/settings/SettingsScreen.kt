@@ -29,7 +29,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.BarChart
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PersonAdd
+import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -41,6 +45,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
@@ -53,6 +58,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -68,9 +74,12 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.julienmiquel.audiotheque.AppContainer
 import com.julienmiquel.audiotheque.BuildConfig
+import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.AudioPreset
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.settings.AppSettings
+import com.julienmiquel.audiotheque.core.settings.ListenerProfile
+import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
 import com.julienmiquel.audiotheque.core.settings.ThemeMode
 import com.julienmiquel.audiotheque.ui.common.InfoCard
 import com.julienmiquel.audiotheque.ui.common.Labels
@@ -97,6 +106,9 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
     private val _backupBusy = MutableStateFlow(false)
     val backupBusy: StateFlow<Boolean> = _backupBusy.asStateFlow()
 
+    private val _discoveringProfiles = MutableStateFlow(false)
+    val discoveringProfiles: StateFlow<Boolean> = _discoveringProfiles.asStateFlow()
+
     fun refreshStorage() {
         _storageGranted.value = c.storage.sharedStorageGranted()
         viewModelScope.launch { _storagePath.value = runCatching { c.storage.displayRoot() }.getOrNull() }
@@ -114,6 +126,26 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
         viewModelScope.launch {
             c.settings.update { it.copy(previewNew = enabled) }
             c.requestSync(SyncTrigger.MANUAL)
+        }
+    }
+
+    fun switchProfile(profileKey: String?) = c.switchProfile(profileKey)
+
+    fun addProfile(displayName: String) = c.addOrSelectProfile(displayName)
+
+    fun removeProfile(key: String) = c.removeProfile(key)
+
+    fun setStatusSyncMode(mode: StatusSyncMode) = c.setStatusSyncMode(mode)
+
+    fun discoverProfiles() {
+        if (_discoveringProfiles.value) return
+        _discoveringProfiles.value = true
+        viewModelScope.launch {
+            try {
+                c.discoverProfilesFromDrive()
+            } finally {
+                _discoveringProfiles.value = false
+            }
         }
     }
 
@@ -189,8 +221,11 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
     val path by vm.storagePath.collectAsStateWithLifecycle()
     val signingOut by vm.signingOut.collectAsStateWithLifecycle()
     val backupBusy by vm.backupBusy.collectAsStateWithLifecycle()
+    val discoveringProfiles by vm.discoveringProfiles.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmSignOut by remember { mutableStateOf(false) }
+    var addingProfile by rememberSaveable { mutableStateOf(false) }
+    var profileToRemove by remember { mutableStateOf<ListenerProfile?>(null) }
 
     val exportLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/json"),
@@ -216,6 +251,10 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
         },
     ) { inner ->
         val s = settings ?: return@Scaffold
+        val primaryLabel = s.accountName?.takeIf { it.isNotBlank() }
+            ?: s.accountEmail?.substringBefore('@')?.replaceFirstChar { it.titlecase() }
+            ?: "Principal"
+        val activeSecondaryProfile = s.profiles.firstOrNull { it.key == s.activeProfileKey }
         Column(
             Modifier
                 .padding(inner)
@@ -247,11 +286,87 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
                     }
                 }
                 Text(
-                    "Autorisation : Drive (déplacer les dossiers de livres ; progression et pochette écrites dans le dossier de chaque livre, un fichier de progression par compte).",
+                    "Autorisation : Drive (déplacer les dossiers de livres ; progression, signets et métadonnées écrits dans le dossier de chaque livre).",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 if (signingOut) SigningOut() else OutlinedButton(onClick = { confirmSignOut = true }) { Text("Se déconnecter") }
+            }
+
+            InfoCard(title = "Auditeurs & Partage familial") {
+                Text(
+                    "Chaque auditeur garde sa position d'écoute, ses signets, ses statistiques et ses statuts sur Google Drive, tandis que les corrections de titre, d'auteur et de pochette profitent à toute la famille.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text("Auditeur actif sur cet appareil", style = MaterialTheme.typography.bodyLarge)
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    FilterChip(
+                        selected = s.activeProfileKey == null,
+                        onClick = { vm.switchProfile(null) },
+                        label = { Text(primaryLabel) },
+                        leadingIcon = { Icon(Icons.Filled.Person, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                    s.profiles.forEach { profile ->
+                        FilterChip(
+                            selected = s.activeProfileKey == profile.key,
+                            onClick = { vm.switchProfile(profile.key) },
+                            label = { Text(profile.displayName) },
+                            leadingIcon = { Icon(Icons.Filled.Person, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                        )
+                    }
+                }
+                if (activeSecondaryProfile != null) {
+                    TextButton(
+                        onClick = { profileToRemove = activeSecondaryProfile },
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
+                    ) {
+                        Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Retirer « ${activeSecondaryProfile.displayName} » de cet appareil")
+                    }
+                }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilledTonalButton(onClick = { addingProfile = true }) {
+                        Icon(Icons.Filled.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Ajouter un auditeur")
+                    }
+                    OutlinedButton(
+                        onClick = vm::discoverProfiles,
+                        enabled = !discoveringProfiles && s.isConnected,
+                    ) {
+                        Icon(Icons.Filled.Sync, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Détecter sur Drive")
+                    }
+                }
+                if (discoveringProfiles) {
+                    LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                Text("Gestes de statut", style = MaterialTheme.typography.bodyLarge)
+                val syncModes = listOf(
+                    StatusSyncMode.PERSONAL_FAMILY to "Mode familial",
+                    StatusSyncMode.SHARED_DRIVE to "Dossiers Drive",
+                )
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    syncModes.forEachIndexed { i, (mode, label) ->
+                        SegmentedButton(
+                            selected = s.statusSyncMode == mode,
+                            onClick = { vm.setStatusSyncMode(mode) },
+                            shape = SegmentedButtonDefaults.itemShape(i, syncModes.size),
+                        ) { Text(label) }
+                    }
+                }
+                Text(
+                    if (s.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY) {
+                        "Mode familial actif : vos gestes (Commencer, Plus tard, Marquer écouté…) s'appliquent uniquement à votre profil, sans déplacer les dossiers Drive des autres membres. Pour ranger physiquement un dossier sur Drive, ouvrez la fiche livre › menu ⋮."
+                    } else {
+                        "Mode dossiers Drive : chaque geste déplace physiquement le dossier du livre dans _Nouveaux, _En écoute ou _Ecouté sur Google Drive pour tous les appareils."
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
 
             InfoCard(title = "Sauvegarde et restauration") {
@@ -409,6 +524,67 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
             }
             Spacer(Modifier.height(24.dp))
         }
+    }
+
+    if (addingProfile) {
+        var newName by rememberSaveable { mutableStateOf("") }
+        val previewKey = Accounts.sanitizeProfileKey(newName)
+        AlertDialog(
+            onDismissRequest = { addingProfile = false },
+            title = { Text("Nouvel auditeur") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "Indiquez un prénom (ex. Julie, Clément). Sa progression, ses signets et ses statuts seront synchronisés dans un fichier dédié sur Google Drive sans modifier ceux des autres auditeurs.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedTextField(
+                        value = newName,
+                        onValueChange = { newName = it },
+                        label = { Text("Prénom de l'auditeur") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    if (previewKey.isNotBlank() && previewKey != Accounts.LOCAL) {
+                        Text(
+                            "Fichier Drive : .audiotheque-progress-$previewKey.json",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        vm.addProfile(newName)
+                        addingProfile = false
+                    },
+                    enabled = previewKey.isNotBlank() && previewKey != Accounts.LOCAL,
+                ) { Text("Ajouter") }
+            },
+            dismissButton = { TextButton(onClick = { addingProfile = false }) { Text("Annuler") } },
+        )
+    }
+
+    profileToRemove?.let { target ->
+        AlertDialog(
+            onDismissRequest = { profileToRemove = null },
+            title = { Text("Retirer « ${target.displayName} » ?") },
+            text = {
+                Text(
+                    "Ce profil ne sera plus proposé sur cet appareil. Sa progression et ses signets enregistrés sur Google Drive (.audiotheque-progress-${target.key}.json) restent intacts.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.removeProfile(target.key)
+                    profileToRemove = null
+                }) { Text("Retirer") }
+            },
+            dismissButton = { TextButton(onClick = { profileToRemove = null }) { Text("Annuler") } },
+        )
     }
 
     if (confirmSignOut) {

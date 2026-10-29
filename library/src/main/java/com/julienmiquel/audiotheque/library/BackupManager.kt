@@ -6,13 +6,15 @@ import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.BookmarkEntity
 import com.julienmiquel.audiotheque.core.db.ListeningSessionEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
+import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
+import java.util.UUID
+import kotlin.math.abs
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlin.math.abs
 
 @Serializable
 data class BookmarkBackupEntry(
@@ -21,6 +23,8 @@ data class BookmarkBackupEntry(
     val positionMs: Long,
     val note: String,
     val createdAt: Long,
+    val syncId: String = "",
+    val updatedAt: Long = 0L,
 )
 
 @Serializable
@@ -41,6 +45,7 @@ data class BookBackupEntry(
     val customNarrator: String? = null,
     val titleConfirmed: Boolean = false,
     val hidden: Boolean = false,
+    val pinnedOffline: Boolean = false,
     val speed: Float? = null,
     val audioPreset: String? = null,
     val trackIndex: Int? = null,
@@ -49,6 +54,8 @@ data class BookBackupEntry(
     val finished: Boolean? = null,
     val lastListenedAt: Long? = null,
     val progressUpdatedAt: Long? = null,
+    val personalStatus: String? = null,
+    val personalStatusChangedAt: Long? = null,
     val bookmarks: List<BookmarkBackupEntry> = emptyList(),
     val sessions: List<SessionBackupEntry> = emptyList(),
 )
@@ -61,7 +68,7 @@ data class AudiothequeBackup(
     val books: List<BookBackupEntry>,
 ) {
     companion object {
-        const val CURRENT_VERSION = 1
+        const val CURRENT_VERSION = 2
     }
 }
 
@@ -82,9 +89,9 @@ data class ImportSummary(
 )
 
 /**
- * Sauvegarde et restauration JSON locale non destructive : signets, corrections locales de
- * titre/auteur/voix, livres masqués, préférences audio par livre (vitesse, préréglage) et
- * sessions d'écoute enregistrées. Aucune écriture n'est déclenchée vers Google Drive.
+ * Sauvegarde et restauration JSON locale non destructive : signets du profil actif, corrections
+ * de titre/auteur/voix, livres masqués, livres gardés hors ligne, statut personnel familial,
+ * préférences audio par livre (vitesse, préréglage) et sessions d'écoute enregistrées.
  */
 class BackupManager(
     private val db: AppDatabase,
@@ -102,7 +109,7 @@ class BackupManager(
         val now = clock.now()
         val books = db.bookDao().all().filter { !it.trashPending }
         val progressByBook = db.progressDao().allFor(account).associateBy { it.bookId }
-        val bookmarksByBook = db.bookmarkDao().all().groupBy { it.bookId }
+        val bookmarksByBook = db.bookmarkDao().allFor(account).groupBy { it.bookId }
         val sessionsByBook = db.listeningSessionDao().forAccount(account).groupBy { it.bookId }
 
         val knownBookIds = books.mapTo(HashSet()) { it.driveId }
@@ -119,13 +126,15 @@ class BackupManager(
                 book.customAuthor != null ||
                 book.customNarrator != null ||
                 book.titleConfirmed ||
-                book.hidden
+                book.hidden ||
+                book.pinnedOffline
             val hasProgressOrPrefs = progress != null && (
                 progress.speed != 1.0f ||
                     progress.audioPreset != null ||
                     progress.positionMs > 0L ||
                     progress.trackIndex > 0 ||
-                    progress.finished
+                    progress.finished ||
+                    progress.personalStatus != null
                 )
 
             if (!hasCorrections && !hasProgressOrPrefs && bookmarks.isEmpty() && sessions.isEmpty()) {
@@ -145,6 +154,7 @@ class BackupManager(
                 customNarrator = book.customNarrator,
                 titleConfirmed = book.titleConfirmed,
                 hidden = book.hidden,
+                pinnedOffline = book.pinnedOffline,
                 speed = progress?.speed?.takeIf { it != 1.0f },
                 audioPreset = progress?.audioPreset,
                 trackIndex = progress?.trackIndex,
@@ -153,6 +163,8 @@ class BackupManager(
                 finished = progress?.finished,
                 lastListenedAt = progress?.lastListenedAt,
                 progressUpdatedAt = progress?.updatedAt,
+                personalStatus = progress?.personalStatus?.name,
+                personalStatusChangedAt = progress?.personalStatusChangedAt,
                 bookmarks = bookmarks.map { bm ->
                     BookmarkBackupEntry(
                         trackId = bm.trackId,
@@ -160,6 +172,8 @@ class BackupManager(
                         positionMs = bm.positionMs,
                         note = bm.note,
                         createdAt = bm.createdAt,
+                        syncId = bm.syncId,
+                        updatedAt = bm.updatedAt,
                     )
                 },
                 sessions = sessions.map { s ->
@@ -229,13 +243,22 @@ class BackupManager(
 
                 if (targetBook != null) {
                     matchedBooks++
-                    if (restoreBookMetadata(targetBook, entry)) {
+                    if (restoreBookMetadata(targetBook, entry, now)) {
                         restoredCorrections++
                     }
                     if (restoreProgressAndPrefs(targetBook.driveId, account, entry, now)) {
                         restoredPreferences++
                     }
-                    restoredBookmarks += restoreBookmarks(targetBook.driveId, entry.bookmarks)
+                    val addedBms = restoreBookmarks(targetBook.driveId, account, entry.bookmarks, now)
+                    if (addedBms > 0) {
+                        restoredBookmarks += addedBms
+                        val curProg = db.progressDao().get(targetBook.driveId, account)
+                        if (curProg != null && !curProg.dirty) {
+                            db.progressDao().upsert(curProg.copy(dirty = true))
+                        } else if (curProg == null) {
+                            db.progressDao().upsert(ProgressEntity(bookId = targetBook.driveId, account = account, updatedAt = 0L, dirty = true))
+                        }
+                    }
                 } else {
                     unmatchedBooks++
                 }
@@ -283,7 +306,7 @@ class BackupManager(
         return candidates.first()
     }
 
-    private suspend fun restoreBookMetadata(book: BookEntity, entry: BookBackupEntry): Boolean {
+    private suspend fun restoreBookMetadata(book: BookEntity, entry: BookBackupEntry, now: Long): Boolean {
         var changed = false
         val newTitle = book.customTitle ?: entry.customTitle
         val newAuthor = book.customAuthor ?: entry.customAuthor
@@ -305,12 +328,17 @@ class BackupManager(
                 confirmed = newConfirmed,
                 key = TextNormalizer.key(effectiveTitle),
                 authorKey = TextNormalizer.keyOrNull(effectiveAuthor),
+                updatedAt = now,
             )
             changed = true
         }
 
         if (!book.hidden && entry.hidden) {
-            db.bookDao().setHidden(book.driveId, true)
+            db.bookDao().setHidden(book.driveId, true, updatedAt = now)
+            changed = true
+        }
+        if (!book.pinnedOffline && entry.pinnedOffline) {
+            db.bookDao().setPinnedOffline(book.driveId, true)
             changed = true
         }
         return changed
@@ -322,11 +350,13 @@ class BackupManager(
         entry: BookBackupEntry,
         now: Long,
     ): Boolean {
+        val incomingStatus = entry.personalStatus?.let { name -> BookStatus.entries.firstOrNull { it.name == name } }
         val hasAnyProgressData = entry.speed != null ||
             entry.audioPreset != null ||
             entry.positionMs != null ||
             entry.trackIndex != null ||
-            entry.finished == true
+            entry.finished == true ||
+            incomingStatus != null
         if (!hasAnyProgressData) return false
 
         val dao = db.progressDao()
@@ -347,6 +377,8 @@ class BackupManager(
                     lastListenedAt = entry.lastListenedAt,
                     updatedAt = backupUpdatedAt,
                     dirty = true,
+                    personalStatus = incomingStatus,
+                    personalStatusChangedAt = if (incomingStatus != null) (entry.personalStatusChangedAt ?: now) else null,
                 ),
             )
             return true
@@ -355,6 +387,12 @@ class BackupManager(
         val updatedSpeed = if (existing.speed == 1.0f && entry.speed != null) entry.speed else existing.speed
         val updatedPreset = existing.audioPreset ?: entry.audioPreset
         val backupIsNewer = entry.progressUpdatedAt != null && entry.progressUpdatedAt > existing.updatedAt
+        val statusIsNewer = incomingStatus != null && (
+            existing.personalStatus == null ||
+                (entry.personalStatusChangedAt ?: 0L) > (existing.personalStatusChangedAt ?: 0L)
+            )
+        val mergedStatus = if (statusIsNewer) incomingStatus else existing.personalStatus
+        val mergedStatusAt = if (statusIsNewer) (entry.personalStatusChangedAt ?: now) else existing.personalStatusChangedAt
 
         val merged = if (backupIsNewer) {
             existing.copy(
@@ -366,14 +404,19 @@ class BackupManager(
                 finished = entry.finished ?: existing.finished,
                 lastListenedAt = entry.lastListenedAt ?: existing.lastListenedAt,
                 updatedAt = entry.progressUpdatedAt,
+                personalStatus = mergedStatus,
+                personalStatusChangedAt = mergedStatusAt,
                 dirty = true,
             )
         } else {
+            val prefsChanged = updatedSpeed != existing.speed || updatedPreset != existing.audioPreset
             existing.copy(
                 speed = updatedSpeed,
                 audioPreset = updatedPreset,
-                updatedAt = if (updatedSpeed != existing.speed || updatedPreset != existing.audioPreset) now else existing.updatedAt,
-                dirty = existing.dirty || updatedSpeed != existing.speed || updatedPreset != existing.audioPreset,
+                personalStatus = mergedStatus,
+                personalStatusChangedAt = mergedStatusAt,
+                updatedAt = if (prefsChanged) now else existing.updatedAt,
+                dirty = existing.dirty || prefsChanged || statusIsNewer,
             )
         }
 
@@ -386,28 +429,37 @@ class BackupManager(
 
     private suspend fun restoreBookmarks(
         bookId: String,
+        account: String,
         incoming: List<BookmarkBackupEntry>,
+        now: Long,
     ): Int {
         if (incoming.isEmpty()) return 0
-        val existing = db.bookmarkDao().forBook(bookId)
+        val existing = db.bookmarkDao().forBook(bookId, account)
         val tracksByIndex = db.trackDao().forBook(bookId).associateBy { it.sortIndex }
         var added = 0
         for (bm in incoming) {
             val duplicate = existing.any { cur ->
-                cur.trackIndex == bm.trackIndex &&
-                    abs(cur.positionMs - bm.positionMs) <= 1_000L &&
-                    cur.note.trim() == bm.note.trim()
+                (bm.syncId.isNotBlank() && cur.syncId == bm.syncId) ||
+                    (
+                        cur.trackIndex == bm.trackIndex &&
+                            abs(cur.positionMs - bm.positionMs) <= 1_000L &&
+                            cur.note.trim() == bm.note.trim()
+                        )
             }
             if (!duplicate) {
                 val resolvedTrackId = tracksByIndex[bm.trackIndex]?.driveId ?: bm.trackId
                 db.bookmarkDao().insert(
                     BookmarkEntity(
                         bookId = bookId,
+                        account = account,
+                        syncId = bm.syncId.ifBlank { UUID.randomUUID().toString() },
                         trackId = resolvedTrackId,
                         trackIndex = bm.trackIndex,
                         positionMs = bm.positionMs,
                         note = bm.note.trim().take(LibraryRepository.MAX_NOTE_LENGTH),
                         createdAt = bm.createdAt,
+                        updatedAt = bm.updatedAt.takeIf { it > 0L } ?: now,
+                        deleted = false,
                     ),
                 )
                 added++

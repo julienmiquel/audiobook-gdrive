@@ -178,8 +178,9 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     // Bandeau « Annuler » : 10 s après chaque geste de statut.
     LaunchedEffect(Unit) {
         container.moves.collectLatest { move ->
+            val suffix = if (move.personalOnly) " (pour vous)" else ""
             val result = snackbar.showSnackbar(
-                message = "« ${move.title} » → ${Labels.statusTab(move.to)}",
+                message = "« ${move.title} » → ${Labels.statusTab(move.to)}$suffix",
                 actionLabel = "Annuler",
                 withDismissAction = true,
                 duration = SnackbarDuration.Long,
@@ -219,7 +220,11 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
             when (event) {
                 is PlaybackEvent.BookFinished -> {
                     val book = container.library.book(event.bookId)
-                    if (book != null && book.effectiveStatus != BookStatus.DONE && book.effectiveStatus != BookStatus.ARCHIVED) {
+                    val personal = container.database.progressDao()
+                        .get(event.bookId, container.settings.current().accountKey)
+                        ?.personalStatus
+                    val effective = book?.let { it.pendingStatus ?: personal ?: it.effectiveStatus }
+                    if (book != null && effective != BookStatus.DONE && effective != BookStatus.ARCHIVED) {
                         finishedBook = book.driveId to book.displayTitle
                     }
                 }

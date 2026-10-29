@@ -7,6 +7,21 @@ import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 /** Statut affiché : celui du geste en attente s'il y en a un, sinon celui confirmé par Drive. */
 val BookEntity.effectiveStatus: BookStatus get() = pendingStatus ?: status
 
+/**
+ * Statut effectif pour un auditeur donné : un déplacement Drive en attente l'emporte, puis son
+ * statut personnel (mode familial), sinon le dossier confirmé par Drive.
+ */
+fun BookEntity.userEffectiveStatus(personalStatus: BookStatus?): BookStatus =
+    pendingStatus ?: personalStatus ?: status
+
+/** Date du dernier changement de statut pour cet auditeur (délais de nettoyage et tri). */
+fun BookEntity.userEffectiveStatusChangedAt(personalStatus: BookStatus?, personalStatusChangedAt: Long?): Long =
+    when {
+        pendingSince != null -> pendingSince
+        personalStatus != null && personalStatusChangedAt != null -> personalStatusChangedAt
+        else -> statusChangedAt
+    }
+
 /** Dossier parent attendu une fois la file d'opérations rejouée. */
 val BookEntity.effectiveParentId: String get() = pendingParentId ?: parentId
 
@@ -80,8 +95,29 @@ fun TrackEntity.meaningfulTitle(bookTitle: String? = null, bookAuthor: String? =
     return if (remainingTokens.isEmpty()) null else trimmed
 }
 
-/** Clés de compte pour la progression. */
+/** Clés de compte et de profils d'auditeurs pour la progression et les signets. */
 object Accounts {
     /** Progression locale avant toute connexion Google. */
     const val LOCAL = "local"
+
+    /** Transforme un prénom ou e-mail saisi (« Clément », « Julie ») en clé stable sans accents. */
+    fun sanitizeProfileKey(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.contains('@')) return trimmed.lowercase()
+        return TextNormalizer.key(trimmed)
+            .replace(Regex("""\s+"""), ".")
+            .replace(Regex("""[^a-z0-9._-]"""), "")
+            .trim('.', '-', '_')
+    }
+
+    /** Nom lisible par défaut à partir d'une clé découverte sur Drive (« julie » -> « Julie »). */
+    fun displayNameForKey(key: String): String {
+        val clean = key.trim()
+        if (clean.isEmpty()) return "Auditeur"
+        if (clean.contains('@')) return clean.substringBefore('@').replace('.', ' ').replaceFirstChar { it.uppercase() }
+        val normalized = clean.replace('_', ' ').replace('.', ' ').trim()
+        return normalized.split(' ').filter { it.isNotBlank() }.joinToString(" ") { word ->
+            word.replaceFirstChar { it.uppercase() }
+        }.ifEmpty { clean }
+    }
 }

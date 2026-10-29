@@ -78,6 +78,10 @@ class FakeDriveService(
         nodes.values.filter { it.name == name && !it.trashed }.map { it.toFile() }
     }
 
+    override suspend fun findByNamePrefix(prefix: String): List<DriveFile> = op {
+        nodes.values.filter { it.name.startsWith(prefix) && !it.trashed }.map { it.toFile() }
+    }
+
     override suspend fun getFile(fileId: String): DriveFile = op {
         (nodes[fileId] ?: throw DriveNotFoundException("Fichier introuvable : $fileId")).toFile()
     }

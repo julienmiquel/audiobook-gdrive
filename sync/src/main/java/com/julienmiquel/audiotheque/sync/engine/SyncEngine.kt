@@ -102,10 +102,11 @@ class SyncEngine(
     private val localFiles = LocalFiles(db, storage)
     private val executor = OperationExecutor(db, history, clock, localFiles)
     private val scanner = LibraryScanner(db, settings, history, localFiles, storage, clock, isBookInUse)
-    private val prober = MetadataProber(db, history, localFiles, storage, clock)
+    private val prober = MetadataProber(db, settings, history, localFiles, storage, clock)
     private val downloader = Downloader(db, settings, storage, history, transfers, inspector, clock)
     private val cleaner = Cleaner(db, settings, localFiles, storage, history, clock, isBookInUse)
     private val progressSync = ProgressSync(db, history, clock, deviceName)
+    private val metadataSync = MetadataSync(db, history, clock, deviceName)
     private val covers = CoverUploader(db, history)
 
     private val mutex = Mutex()
@@ -220,8 +221,8 @@ class SyncEngine(
     }
 
     /**
-     * Déconnexion : dernière écriture de la progression dans les dossiers Drive des livres, une
-     * fois la synchro en cours terminée. Retourne faux si elle n'a pas pu être faite.
+     * Déconnexion : dernière écriture de la progression et des corrections de métadonnées dans les
+     * dossiers Drive des livres, une fois la synchro en cours terminée.
      */
     suspend fun pushProgressBeforeSignOut(): Boolean = mutex.withLock {
         val s = settings.current()
@@ -229,6 +230,7 @@ class SyncEngine(
         val drive = driveProvider.get() ?: return@withLock false
         try {
             progressSync.push(drive, s.accountKey, bookId = null)
+            metadataSync.push(drive, s.accountKey, bookId = null)
             true
         } catch (e: CancellationException) {
             throw e
@@ -237,17 +239,30 @@ class SyncEngine(
         }
     }
 
-    // ------------------------------------------------------------------ progression (lecteur, premier plan)
+    // ------------------------------------------------------------------ progression & métadonnées partagées
 
     /**
-     * Lecteur, après une pause ou un déplacement : la position du livre ([bookId], ou tout ce qui
-     * est à envoyer) part dans son dossier Drive, sans attendre une synchro complète ni la fin
-     * d'une synchro en cours. Retourne faux si Drive n'a pas pu être joint.
+     * Lecteur, signet ou geste familial : la progression du livre ([bookId], ou tout ce qui est à
+     * envoyer) part dans son dossier Drive sans attendre une synchro complète.
      */
     suspend fun pushProgress(bookId: String?): Boolean = lightweight { drive, account ->
         progressSync.push(drive, account, bookId)
         true
     } ?: false
+
+    /**
+     * Corrections de métadonnées (titre, auteur, voix, masquage) partagées aussitôt avec la famille
+     * dans « .audiotheque-meta.json ».
+     */
+    suspend fun pushMetadata(bookId: String?): Boolean = lightweight { drive, account ->
+        metadataSync.push(drive, account, bookId)
+        true
+    } ?: false
+
+    /** Découvre les profils d'auditeurs déjà présents dans `/AudioBook` sur Drive. */
+    suspend fun discoverRemoteProfiles(): List<String> = lightweight { drive, _ ->
+        progressSync.discoverProfiles(drive)
+    }.orEmpty()
 
     /**
      * Lecteur, juste avant une lecture : relit la position du livre dans Drive. Retourne la
@@ -258,10 +273,11 @@ class SyncEngine(
     }
 
     /**
-     * Retour de l'app au premier plan : positions à envoyer envoyées, positions changées dans
-     * Drive relues (une requête). Retourne les positions reprises d'un autre appareil.
+     * Retour de l'app au premier plan (ou changement de profil) : positions, statuts personnels,
+     * signets et corrections partagées synchronisés en une passe légère.
      */
     suspend fun syncProgress(): List<RemoteProgress> = lightweight { drive, account ->
+        metadataSync.run(drive, account)
         progressSync.run(drive, account)
     }.orEmpty()
 
@@ -428,8 +444,18 @@ class SyncEngine(
         scanner.scan(drive, ctx, forceFull) { detail(it) }
         flushIfRequested(drive, ctx)
 
-        // _En écoute d'abord : ses pistes sont listées puis téléchargées avant les métadonnées
-        // du reste de la bibliothèque, pour écouter au plus vite.
+        // Métadonnées partagées (.audiotheque-meta.json) et progression / statut personnel / signets
+        // (.audiotheque-progress-<profil>.json) lus avant l'inventaire des téléchargements : un livre
+        // commencé sur un autre appareil ou en mode familial est immédiatement téléchargé à partir de
+        // la bonne piste.
+        if (s.accountKey != Accounts.LOCAL) {
+            phase(SyncPhase.PROGRESS)
+            metadataSync.run(drive, s.accountKey, ctx.runId)
+            progressSync.run(drive, s.accountKey, ctx.runId)
+        }
+
+        // _En écoute et livres épinglés d'abord : leurs pistes sont listées puis téléchargées avant
+        // les métadonnées du reste de la bibliothèque, pour écouter au plus vite.
         phase(SyncPhase.METADATA)
         prober.run(drive, ctx, scope = ProbeScope.DOWNLOADS, allowContent = wifiRuleOk()) { detail(it) }
         flushIfRequested(drive, ctx)
@@ -485,7 +511,8 @@ class SyncEngine(
 
         if (s.accountKey != Accounts.LOCAL) {
             phase(SyncPhase.PROGRESS)
-            progressSync.run(drive, s.accountKey, ctx.runId)
+            metadataSync.push(drive, s.accountKey, null)
+            progressSync.push(drive, s.accountKey, null)
         }
 
         phase(SyncPhase.FINISHING)

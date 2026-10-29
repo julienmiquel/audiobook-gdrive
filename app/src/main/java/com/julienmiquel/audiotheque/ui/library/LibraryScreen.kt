@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Headphones
 import androidx.compose.material.icons.filled.Inbox
 import androidx.compose.material.icons.filled.OfflinePin
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RecordVoiceOver
 import androidx.compose.material.icons.filled.Search
@@ -115,6 +116,7 @@ import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.settings.LibrarySort
+import com.julienmiquel.audiotheque.core.settings.ListenerProfile
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.library.BookRecommendation
 import com.julienmiquel.audiotheque.library.BookRecommender
@@ -168,6 +170,11 @@ data class LibraryUiState(
     val refreshingPairs: Set<Long> = emptySet(),
     val pendingMoves: Int = 0,
     val totalBooks: Int = 0,
+    val hasMultipleListeners: Boolean = false,
+    val activeListenerName: String = "Moi",
+    val primaryListenerName: String = "Principal",
+    val activeProfileKey: String? = null,
+    val profiles: List<ListenerProfile> = emptyList(),
 ) {
     val searching: Boolean get() = query.isNotBlank()
 }
@@ -241,6 +248,9 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
         } else {
             emptyList()
         }
+        val primaryName = settings.accountName?.takeIf { it.isNotBlank() }
+            ?: settings.accountEmail?.substringBefore('@')?.replaceFirstChar { it.titlecase() }
+            ?: "Principal"
         LibraryUiState(
             loaded = true,
             tabs = tabs,
@@ -255,6 +265,11 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
             sort = settings.librarySort,
             gridView = settings.libraryGrid,
             totalBooks = visible.size,
+            hasMultipleListeners = settings.hasMultipleListeners,
+            activeListenerName = settings.activeListenerName,
+            primaryListenerName = primaryName,
+            activeProfileKey = settings.activeProfileKey,
+            profiles = settings.profiles,
         )
     }.flowOn(Dispatchers.Default)
 
@@ -277,6 +292,8 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
     fun setNarrator(name: String?) = narrator.update { name }
 
     fun toggleOfflineOnly() = offlineOnly.update { !it }
+
+    fun switchProfile(profileKey: String?) = c.switchProfile(profileKey)
 
     fun setSort(sort: LibrarySort) {
         viewModelScope.launch {
@@ -370,6 +387,7 @@ fun LibraryScreen(
     var searchOpen by rememberSaveable { mutableStateOf(false) }
     var sortMenu by remember { mutableStateOf(false) }
     var narratorMenu by remember { mutableStateOf(false) }
+    var profileMenu by remember { mutableStateOf(false) }
     var pulling by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.selected?.key) { vm.refreshIfStale(state.selected) }
@@ -464,6 +482,10 @@ fun LibraryScreen(
             ActivityBar(state)
             QuickFilterRow(
                 state = state,
+                profileMenu = profileMenu,
+                onProfileMenuChange = { profileMenu = it },
+                onSwitchProfile = vm::switchProfile,
+                onManageProfiles = onOpenSettings,
                 narratorMenu = narratorMenu,
                 onNarratorMenuChange = { narratorMenu = it },
                 onToggleOffline = vm::toggleOfflineOnly,
@@ -507,6 +529,10 @@ fun LibraryScreen(
 @Composable
 private fun QuickFilterRow(
     state: LibraryUiState,
+    profileMenu: Boolean,
+    onProfileMenuChange: (Boolean) -> Unit,
+    onSwitchProfile: (String?) -> Unit,
+    onManageProfiles: () -> Unit,
     narratorMenu: Boolean,
     onNarratorMenuChange: (Boolean) -> Unit,
     onToggleOffline: () -> Unit,
@@ -519,6 +545,67 @@ private fun QuickFilterRow(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        if (state.hasMultipleListeners) {
+            item(key = "chip-profile") {
+                Box {
+                    FilterChip(
+                        selected = true,
+                        onClick = { onProfileMenuChange(true) },
+                        label = { Text(state.activeListenerName, maxLines = 1) },
+                        leadingIcon = { Icon(Icons.Filled.Person, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                    )
+                    DropdownMenu(expanded = profileMenu, onDismissRequest = { onProfileMenuChange(false) }) {
+                        val primarySelected = state.activeProfileKey == null
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    state.primaryListenerName,
+                                    fontWeight = if (primarySelected) FontWeight.SemiBold else FontWeight.Normal,
+                                )
+                            },
+                            leadingIcon = if (primarySelected) {
+                                { Icon(Icons.Filled.Check, contentDescription = null) }
+                            } else {
+                                { Icon(Icons.Filled.Person, contentDescription = null) }
+                            },
+                            onClick = {
+                                onSwitchProfile(null)
+                                onProfileMenuChange(false)
+                            },
+                        )
+                        state.profiles.forEach { profile ->
+                            val selected = state.activeProfileKey == profile.key
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        profile.displayName,
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
+                                    )
+                                },
+                                leadingIcon = if (selected) {
+                                    { Icon(Icons.Filled.Check, contentDescription = null) }
+                                } else {
+                                    { Icon(Icons.Filled.Person, contentDescription = null) }
+                                },
+                                onClick = {
+                                    onSwitchProfile(profile.key)
+                                    onProfileMenuChange(false)
+                                },
+                            )
+                        }
+                        HorizontalDivider()
+                        DropdownMenuItem(
+                            text = { Text("Gérer les auditeurs…") },
+                            leadingIcon = { Icon(Icons.Filled.Settings, contentDescription = null) },
+                            onClick = {
+                                onProfileMenuChange(false)
+                                onManageProfiles()
+                            },
+                        )
+                    }
+                }
+            }
+        }
         item(key = "chip-offline") {
             FilterChip(
                 selected = state.offlineOnly,
@@ -1067,8 +1154,17 @@ private fun BookBadges(item: LibraryItem) {
     if (item.pendingSync) Tag("en attente", icon = Icons.Filled.CloudUpload)
     if (item.finished) Tag("terminé", icon = Icons.Filled.DoneAll)
     when {
-        item.isDownloaded -> Tag("hors ligne", icon = Icons.Filled.OfflinePin, container = colors.primaryContainer, content = colors.onPrimaryContainer)
-        item.presentTracks > 0 -> Tag("${item.presentTracks}/${item.trackCount}", icon = Icons.Filled.Downloading)
+        item.pinnedOffline && item.isDownloaded ->
+            Tag("gardé hors ligne", icon = Icons.Filled.OfflinePin, container = colors.primaryContainer, content = colors.onPrimaryContainer)
+        item.pinnedOffline ->
+            Tag(
+                if (item.trackCount > 0) "épinglé (${item.presentTracks}/${item.trackCount})" else "épinglé",
+                icon = Icons.Filled.OfflinePin,
+            )
+        item.isDownloaded ->
+            Tag("hors ligne", icon = Icons.Filled.OfflinePin, container = colors.primaryContainer, content = colors.onPrimaryContainer)
+        item.presentTracks > 0 ->
+            Tag("${item.presentTracks}/${item.trackCount}", icon = Icons.Filled.Downloading)
     }
 }
 

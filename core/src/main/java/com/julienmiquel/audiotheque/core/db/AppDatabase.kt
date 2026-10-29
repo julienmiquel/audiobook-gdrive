@@ -23,7 +23,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SyncPairEntity::class,
         ListeningSessionEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true,
     autoMigrations = [
         // v2 : clé d'auteur pour les doublons (colonne facultative, remplie au fil des synchros).
@@ -38,6 +38,8 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AutoMigration(from = 5, to = 6),
         // v7 : sessions d'écoute locales pour les statistiques d'écoute.
         AutoMigration(from = 6, to = 7),
+        // v8 : multi-utilisateurs & partage familial (statuts personnels, signets synchronisés par compte, métadonnées partagées, épinglage hors ligne).
+        AutoMigration(from = 7, to = 8, spec = AppDatabase.MultiUserV8::class),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -60,6 +62,48 @@ abstract class AppDatabase : RoomDatabase() {
     class ProgressInBookFolder : AutoMigrationSpec {
         override fun onPostMigrate(db: SupportSQLiteDatabase) {
             db.execSQL("UPDATE progress SET dirty = 1, remoteFileId = NULL, remoteSyncedAt = NULL")
+        }
+    }
+
+    /**
+     * v8 : rattache les signets existants au compte connecté (s'il est unique), leur attribue un
+     * identifiant de synchro déterministe et marque la progression correspondante à synchroniser.
+     */
+    class MultiUserV8 : AutoMigrationSpec {
+        override fun onPostMigrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                """
+                UPDATE bookmarks
+                SET account = CASE
+                        WHEN account = 'local' AND (SELECT COUNT(DISTINCT account) FROM progress WHERE account != 'local') = 1
+                        THEN (SELECT account FROM progress WHERE account != 'local' LIMIT 1)
+                        ELSE account
+                    END,
+                    syncId = CASE
+                        WHEN syncId = '' THEN CAST(trackIndex AS TEXT) || ':' || CAST(positionMs AS TEXT) || ':' || CAST(createdAt AS TEXT)
+                        ELSE syncId
+                    END,
+                    updatedAt = CASE WHEN updatedAt = 0 THEN createdAt ELSE updatedAt END
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT OR IGNORE INTO progress (bookId, account, trackIndex, positionMs, speed, percent, finished, updatedAt, dirty)
+                SELECT b.bookId, b.account, 0, 0, 1.0, 0.0, 0, MAX(b.updatedAt), 1
+                FROM bookmarks b
+                WHERE b.account != 'local' AND b.deleted = 0
+                GROUP BY b.bookId, b.account
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                UPDATE progress SET dirty = 1
+                WHERE EXISTS (
+                    SELECT 1 FROM bookmarks b
+                    WHERE b.bookId = progress.bookId AND b.account = progress.account AND b.deleted = 0
+                )
+                """.trimIndent(),
+            )
         }
     }
 

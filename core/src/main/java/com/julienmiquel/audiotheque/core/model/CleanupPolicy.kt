@@ -23,9 +23,24 @@ object CleanupPolicy {
      * Moment à partir duquel la piste n° [trackSortIndex] du livre peut être supprimée du
      * téléphone, ou null si elle est conservée.
      */
-    fun deadline(book: BookEntity, trackSortIndex: Int, pairMode: PairMode?, settings: AppSettings): Long? {
+    fun deadline(
+        book: BookEntity,
+        trackSortIndex: Int,
+        pairMode: PairMode?,
+        settings: AppSettings,
+        personalStatus: BookStatus? = null,
+        personalStatusChangedAt: Long? = null,
+    ): Long? {
+        if (book.pinnedOffline) return null
         if (book.pendingStatus != null) return null
-        val retentionMs = when (book.status) {
+        if (book.status == BookStatus.COLLECTION && pairMode == PairMode.FULL) return null
+        val status = personalStatus ?: book.status
+        val changedAt = if (personalStatus != null && personalStatusChangedAt != null) {
+            personalStatusChangedAt
+        } else {
+            book.statusChangedAt
+        }
+        val retentionMs = when (status) {
             BookStatus.IN_PROGRESS -> return null
             BookStatus.NEW -> if (settings.previewNew && trackSortIndex == 0) return null else 0L
             BookStatus.LATER -> settings.laterRetentionDays * DAY_MS
@@ -33,10 +48,22 @@ object CleanupPolicy {
             BookStatus.COLLECTION -> if (pairMode == PairMode.FULL) return null else 0L
             BookStatus.ARCHIVED, BookStatus.UNSORTED -> 0L
         }
-        return book.statusChangedAt + maxOf(retentionMs, GRACE_MS)
+        return changedAt + maxOf(retentionMs, GRACE_MS)
     }
 
     /** Échéance des pistes du livre (hors première piste d'aperçu), pour la fiche livre. */
-    fun bookDeadline(book: BookEntity, pairMode: PairMode?, settings: AppSettings): Long? =
-        deadline(book, trackSortIndex = 1, pairMode = pairMode, settings = settings)
+    fun bookDeadline(
+        book: BookEntity,
+        pairMode: PairMode?,
+        settings: AppSettings,
+        personalStatus: BookStatus? = null,
+        personalStatusChangedAt: Long? = null,
+    ): Long? = deadline(
+        book = book,
+        trackSortIndex = 1,
+        pairMode = pairMode,
+        settings = settings,
+        personalStatus = personalStatus,
+        personalStatusChangedAt = personalStatusChangedAt,
+    )
 }

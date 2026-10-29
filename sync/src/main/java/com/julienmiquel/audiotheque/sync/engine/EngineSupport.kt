@@ -260,11 +260,31 @@ fun File.md5Hex(): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
+/** Fichiers JSON techniques écrits par l'app dans les dossiers Drive (jamais des pistes ni des livres). */
+object SidecarFiles {
+    const val APP_PREFIX = ".audiotheque-"
+
+    fun isSidecarFile(name: String): Boolean = name.startsWith(APP_PREFIX) && name.endsWith(".json")
+}
+
+/** Signet d'un auditeur sérialisé dans le fichier de progression du livre. */
+@Serializable
+data class BookmarkJson(
+    val syncId: String,
+    val trackId: String,
+    val trackIndex: Int,
+    val positionMs: Long,
+    val note: String,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val deleted: Boolean = false,
+)
+
 /**
  * Progression d'un livre telle qu'écrite dans son dossier Drive : un petit fichier JSON par
- * compte (« .audiotheque-progress-<compte>.json »), visible dans Drive à côté des pistes. Le
- * dossier garde son ID quand il change de statut : le fichier suit le livre. Un livre sans
- * dossier (piste isolée) a son fichier dans le dossier de statut, nommé d'après l'ID du livre.
+ * compte ou profil (« .audiotheque-progress-<compte>.json »), visible dans Drive à côté des pistes.
+ * Le dossier garde son ID quand il change de statut : le fichier suit le livre. Un livre sans
+ * dossier (piste isolée, .zip) a son fichier dans le dossier de statut, nommé d'après l'ID du livre.
  */
 @Serializable
 data class ProgressJson(
@@ -278,29 +298,41 @@ data class ProgressJson(
     val finished: Boolean = false,
     val setAsideAtPercent: Float? = null,
     val audioPreset: String? = null,
-    /** Date d'enregistrement sur le téléphone : la plus récente l'emporte entre deux appareils. */
+    /** Statut personnel de l'auditeur en mode familial (nom de BookStatus, ou null). */
+    val personalStatus: String? = null,
+    /** Horodatage du dernier changement de statut personnel (indépendant de updatedAt). */
+    val personalStatusChangedAt: Long? = null,
+    /** Signets de l'auditeur sur ce livre (avec pierres tombales pour propager les suppressions). */
+    val bookmarks: List<BookmarkJson> = emptyList(),
+    /** Date d'enregistrement de la position sur le téléphone : la plus récente l'emporte. */
     val updatedAt: Long,
     /** Appareil qui a écrit la position (« Google Pixel 9 »). */
     val device: String? = null,
-    /** Compte propriétaire de la position (lisibilité dans Drive). */
+    /** Compte ou profil propriétaire de la position (lisibilité dans Drive). */
     val account: String? = null,
     /** Titre affiché (lisibilité dans Drive). */
     val title: String? = null,
-    val version: Int = 2,
+    val version: Int = 3,
 ) {
     companion object {
         const val MIME = "application/json"
         private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-        private const val PREFIX = ".audiotheque-progress-"
-        private const val SUFFIX = ".json"
+        const val PREFIX = ".audiotheque-progress-"
+        const val SUFFIX = ".json"
 
-        /** Nom du fichier dans le dossier du livre : un par compte. */
+        /** Nom du fichier dans le dossier du livre : un par compte ou profil. */
         fun fileName(account: String): String = "$PREFIX${account.lowercase()}$SUFFIX"
 
-        /** Livre sans dossier (piste isolée) : fichier dans le dossier de statut, nommé d'après le livre. */
+        /** Livre sans dossier (piste isolée / .zip) : fichier dans le dossier de statut, nommé d'après le livre. */
         fun fileName(account: String, bookId: String): String = "$PREFIX${account.lowercase()}-$bookId$SUFFIX"
 
-        /** Fichier écrit par l'app (jamais une piste ni une pochette). */
+        /** Extrait la clé d'auditeur d'un fichier de dossier « .audiotheque-progress-<cle>.json ». */
+        fun extractFolderAccount(name: String): String? {
+            if (!isProgressFile(name)) return null
+            return name.removePrefix(PREFIX).removeSuffix(SUFFIX).takeIf { it.isNotBlank() }
+        }
+
+        /** Fichier de progression écrit par l'app (jamais une piste ni une pochette). */
         fun isProgressFile(name: String): Boolean = name.startsWith(PREFIX) && name.endsWith(SUFFIX)
 
         fun encode(progress: ProgressJson): ByteArray = json.encodeToString(serializer(), progress).toByteArray()

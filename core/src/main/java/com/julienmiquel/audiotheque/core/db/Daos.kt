@@ -20,6 +20,8 @@ data class BookListRow(
     val lastListenedAt: Long?,
     val finished: Boolean?,
     val duplicateCount: Int,
+    val personalStatus: BookStatus? = null,
+    val personalStatusChangedAt: Long? = null,
 )
 
 @Dao
@@ -41,6 +43,12 @@ interface BookDao {
 
     @Query("SELECT * FROM books WHERE COALESCE(pendingStatus, status) = :status")
     fun observeByEffectiveStatus(status: BookStatus): Flow<List<BookEntity>>
+
+    @Query("SELECT * FROM books WHERE pinnedOffline = 1")
+    suspend fun pinnedOffline(): List<BookEntity>
+
+    @Query("UPDATE books SET pinnedOffline = :pinned WHERE driveId = :id")
+    suspend fun setPinnedOffline(id: String, pinned: Boolean)
 
     /** Autres exemplaires : même titre, auteurs identiques ou inconnus (cf. [BookEntity.authorKey]), hors suppressions en attente. */
     @Query(
@@ -143,18 +151,77 @@ interface BookDao {
     @Query("UPDATE books SET tracksSyncedAt = NULL WHERE parentId IN (:parentIds)")
     suspend fun invalidateTracksIn(parentIds: List<String>)
 
-    // Titre ou auteur corrigés / confirmés : la recherche de pochette repart (elle cherche autre chose).
+    // Titre ou auteur corrigés / confirmés : la recherche de pochette repart et la correction est partagée sur Drive.
     @Query(
         """
         UPDATE books SET customTitle = :title, customAuthor = :author, customNarrator = :narrator,
-          titleConfirmed = :confirmed, normalizedKey = :key, authorKey = :authorKey, enrichedAt = NULL
+          titleConfirmed = :confirmed, normalizedKey = :key, authorKey = :authorKey, enrichedAt = NULL,
+          metadataUpdatedAt = :updatedAt, metadataDirty = 1
         WHERE driveId = :id
         """,
     )
-    suspend fun updateCorrections(id: String, title: String?, author: String?, narrator: String?, confirmed: Boolean, key: String, authorKey: String?)
+    suspend fun updateCorrectionsAt(
+        id: String,
+        title: String?,
+        author: String?,
+        narrator: String?,
+        confirmed: Boolean,
+        key: String,
+        authorKey: String?,
+        updatedAt: Long,
+    )
 
-    @Query("UPDATE books SET hidden = :hidden WHERE driveId = :id")
-    suspend fun setHidden(id: String, hidden: Boolean)
+    suspend fun updateCorrections(
+        id: String,
+        title: String?,
+        author: String?,
+        narrator: String?,
+        confirmed: Boolean,
+        key: String,
+        authorKey: String?,
+        updatedAt: Long = System.currentTimeMillis(),
+    ) = updateCorrectionsAt(id, title, author, narrator, confirmed, key, authorKey, updatedAt)
+
+    @Query("UPDATE books SET hidden = :hidden, metadataUpdatedAt = :updatedAt, metadataDirty = 1 WHERE driveId = :id")
+    suspend fun setHiddenAt(id: String, hidden: Boolean, updatedAt: Long)
+
+    suspend fun setHidden(id: String, hidden: Boolean, updatedAt: Long = System.currentTimeMillis()) =
+        setHiddenAt(id, hidden, updatedAt)
+
+    @Query("SELECT * FROM books WHERE metadataDirty = 1")
+    suspend fun dirtyMetadata(): List<BookEntity>
+
+    @Query(
+        """
+        UPDATE books SET metadataDirty = 0, metadataRemoteFileId = :remoteFileId
+        WHERE driveId = :id AND metadataUpdatedAt = :updatedAt
+        """,
+    )
+    suspend fun markMetadataSynced(id: String, updatedAt: Long, remoteFileId: String)
+
+    @Query(
+        """
+        UPDATE books SET customTitle = :title, customAuthor = :author, customNarrator = :narrator,
+          titleConfirmed = :confirmed, hidden = :hidden, normalizedKey = :key, authorKey = :authorKey,
+          metadataUpdatedAt = :updatedAt, metadataDirty = :dirty,
+          metadataRemoteFileId = COALESCE(:remoteFileId, metadataRemoteFileId),
+          enrichedAt = CASE WHEN customTitle IS NOT :title OR customAuthor IS NOT :author THEN NULL ELSE enrichedAt END
+        WHERE driveId = :id
+        """,
+    )
+    suspend fun applySyncedMetadata(
+        id: String,
+        title: String?,
+        author: String?,
+        narrator: String?,
+        confirmed: Boolean,
+        hidden: Boolean,
+        key: String,
+        authorKey: String?,
+        updatedAt: Long,
+        dirty: Boolean,
+        remoteFileId: String?,
+    )
 
     @Query("UPDATE books SET trashPending = :pending WHERE driveId = :id")
     suspend fun setTrashPending(id: String, pending: Boolean)
@@ -172,7 +239,9 @@ interface BookDao {
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
           (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey AND d.trashPending = 0
-             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
+             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount,
+          p.personalStatus AS personalStatus,
+          p.personalStatusChangedAt AS personalStatusChangedAt
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account
         """,
@@ -187,7 +256,9 @@ interface BookDao {
           p.lastListenedAt AS lastListenedAt,
           p.finished AS finished,
           (SELECT COUNT(*) FROM books d WHERE d.normalizedKey = b.normalizedKey AND d.trashPending = 0
-             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount
+             AND (d.authorKey IS NULL OR b.authorKey IS NULL OR d.authorKey = b.authorKey)) AS duplicateCount,
+          p.personalStatus AS personalStatus,
+          p.personalStatusChangedAt AS personalStatusChangedAt
         FROM books b
         LEFT JOIN progress p ON p.bookId = b.driveId AND p.account = :account
         WHERE b.driveId = :id
@@ -267,6 +338,13 @@ interface ProgressDao {
     @Query("SELECT * FROM progress WHERE account = :account")
     suspend fun allFor(account: String): List<ProgressEntity>
 
+    @Query("SELECT DISTINCT account FROM progress WHERE account != 'local'")
+    suspend fun distinctAccounts(): List<String>
+
+    /** Livres marqués « En écoute » par au moins un profil présent sur cet appareil (protégés du nettoyage). */
+    @Query("SELECT DISTINCT bookId FROM progress WHERE personalStatus = 'IN_PROGRESS'")
+    suspend fun booksInProgressOnDevice(): List<String>
+
     @Query("SELECT * FROM progress WHERE account = :account AND lastListenedAt IS NOT NULL ORDER BY lastListenedAt DESC LIMIT 1")
     suspend fun lastListened(account: String): ProgressEntity?
 
@@ -289,14 +367,29 @@ interface ProgressDao {
 
 @Dao
 interface BookmarkDao {
-    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY trackIndex, positionMs")
-    fun observeForBook(bookId: String): Flow<List<BookmarkEntity>>
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId AND account = :account AND deleted = 0 ORDER BY trackIndex, positionMs")
+    fun observeForBook(bookId: String, account: String): Flow<List<BookmarkEntity>>
 
-    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY trackIndex, positionMs")
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId AND account = :account AND deleted = 0 ORDER BY trackIndex, positionMs")
+    suspend fun forBook(bookId: String, account: String): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId AND deleted = 0 ORDER BY trackIndex, positionMs")
     suspend fun forBook(bookId: String): List<BookmarkEntity>
 
-    @Query("SELECT * FROM bookmarks ORDER BY bookId, trackIndex, positionMs")
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId AND account = :account ORDER BY trackIndex, positionMs")
+    suspend fun allIncludingDeleted(bookId: String, account: String): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks WHERE account = :account AND deleted = 0 ORDER BY bookId, trackIndex, positionMs")
+    suspend fun allFor(account: String): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks WHERE deleted = 0 ORDER BY bookId, trackIndex, positionMs")
     suspend fun all(): List<BookmarkEntity>
+
+    @Query("SELECT * FROM bookmarks WHERE id = :id")
+    suspend fun get(id: Long): BookmarkEntity?
+
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId AND account = :account AND syncId = :syncId LIMIT 1")
+    suspend fun findBySyncId(bookId: String, account: String, syncId: String): BookmarkEntity?
 
     @Insert
     suspend fun insert(bookmark: BookmarkEntity): Long
@@ -304,8 +397,15 @@ interface BookmarkDao {
     @Update
     suspend fun update(bookmark: BookmarkEntity)
 
+    @Query("UPDATE bookmarks SET deleted = 1, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun softDelete(id: Long, updatedAt: Long)
+
     @Query("DELETE FROM bookmarks WHERE id = :id")
     suspend fun delete(id: Long)
+
+    /** Rattache les signets locaux créés avant connexion au compte Google. */
+    @Query("UPDATE bookmarks SET account = :to WHERE account = :from")
+    suspend fun migrateAccount(from: String, to: String)
 }
 
 @Dao

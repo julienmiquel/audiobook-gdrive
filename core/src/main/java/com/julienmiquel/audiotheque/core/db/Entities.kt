@@ -89,6 +89,17 @@ data class BookEntity(
     val trashPending: Boolean = false,
     /** Renommage Drive en attente dans la file d'opérations (« Titre - AUTEUR »). */
     val pendingName: String? = null,
+    /** Épinglage hors ligne sur ce téléphone : toutes les pistes sont gardées quel que soit le statut. */
+    @ColumnInfo(defaultValue = "0")
+    val pinnedOffline: Boolean = false,
+    /** Horodatage de la dernière correction de métadonnées (titre, auteur, voix, masquage) partagée sur Drive. */
+    @ColumnInfo(defaultValue = "0")
+    val metadataUpdatedAt: Long = 0,
+    /** Corrections locales en attente d'écriture dans « .audiotheque-meta.json » sur Drive. */
+    @ColumnInfo(defaultValue = "0")
+    val metadataDirty: Boolean = false,
+    /** Identifiant Drive du fichier « .audiotheque-meta.json » une fois connu. */
+    val metadataRemoteFileId: String? = null,
 )
 
 /** Piste = un fichier audio du dossier du livre. */
@@ -130,7 +141,8 @@ data class TrackEntity(
 
 /**
  * Progression d'un utilisateur sur un livre. Indexée par l'ID du dossier Drive et par compte :
- * la bibliothèque est partagée, chaque compte a sa propre position.
+ * la bibliothèque est partagée, chaque compte ou profil d'auditeur a sa propre position et son
+ * éventuel statut personnel.
  */
 @Entity(tableName = "progress", primaryKeys = ["bookId", "account"])
 data class ProgressEntity(
@@ -153,6 +165,10 @@ data class ProgressEntity(
     val remoteSyncedAt: Long? = null,
     /** Préréglage audio propre à ce livre (null = suit le réglage commun de l'app). */
     val audioPreset: String? = null,
+    /** Statut propre à cet auditeur en mode familial (null = suit le dossier Drive). */
+    val personalStatus: BookStatus? = null,
+    /** Date du dernier changement de statut personnel (fusion indépendante de la position). */
+    val personalStatusChangedAt: Long? = null,
 )
 
 /**
@@ -181,7 +197,10 @@ data class EmbeddedChapterEntity(
     val endMs: Long,
 )
 
-@Entity(tableName = "bookmarks", indices = [Index("bookId")])
+@Entity(
+    tableName = "bookmarks",
+    indices = [Index("bookId"), Index(value = ["bookId", "account"])],
+)
 data class BookmarkEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val bookId: String,
@@ -190,6 +209,18 @@ data class BookmarkEntity(
     val positionMs: Long,
     val note: String,
     val createdAt: Long,
+    /** Compte ou profil d'auditeur propriétaire du signet. */
+    @ColumnInfo(defaultValue = "'local'")
+    val account: String = "local",
+    /** Identifiant stable de synchronisation inter-appareils (UUID ou clé déterministe). */
+    @ColumnInfo(defaultValue = "''")
+    val syncId: String = "",
+    /** Horodatage de la dernière modification ou suppression du signet. */
+    @ColumnInfo(defaultValue = "0")
+    val updatedAt: Long = 0,
+    /** Pierre tombale : vrai quand le signet a été supprimé (propagé aux autres appareils via Drive). */
+    @ColumnInfo(defaultValue = "0")
+    val deleted: Boolean = false,
 )
 
 /** Événement de l'historique (conservé 30 jours). */

@@ -100,6 +100,7 @@ fun StatsScreen(
     val container = LocalAppContainer.current
     val vm: StatsViewModel = viewModel { StatsViewModel(container) }
     val stats by vm.summary.collectAsStateWithLifecycle()
+    val appSettings by container.settings.settings.collectAsStateWithLifecycle(initialValue = null)
     var rangeIndex by rememberSaveable { mutableIntStateOf(0) } // 0 = 7 jours, 1 = 30 jours
 
     Scaffold(
@@ -107,7 +108,10 @@ fun StatsScreen(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             TopAppBar(
-                title = { Text("Statistiques d'écoute") },
+                title = {
+                    val listenerSuffix = appSettings?.takeIf { it.hasMultipleListeners }?.let { " · ${it.activeListenerName}" }.orEmpty()
+                    Text("Statistiques d'écoute$listenerSuffix", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Retour")

@@ -113,6 +113,9 @@ interface DriveService {
     /** files.list avec q = « name = '<nom>' and trashed = false » : les fichiers de ce nom de tous les dossiers, en une requête. */
     suspend fun findByName(name: String): List<DriveFile>
 
+    /** files.list avec q = « name contains '<prefix>' and trashed = false » (filtré sur startsWith). */
+    suspend fun findByNamePrefix(prefix: String): List<DriveFile> = emptyList()
+
     /** files.get (champs size et md5Checksum compris). */
     suspend fun getFile(fileId: String): DriveFile
 

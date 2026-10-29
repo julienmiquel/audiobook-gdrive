@@ -23,8 +23,38 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 
 enum class ThemeMode { DARK, LIGHT, SYSTEM }
+
+/** Mode de gestion des statuts de lecture sur un dossier Google Drive. */
+enum class StatusSyncMode(val label: String, val subtitle: String) {
+    /** Les gestes déplacent réellement le dossier dans Drive (_Nouveaux, _En écoute, _Ecouté). */
+    SHARED_DRIVE(
+        label = "Déplacer les dossiers Drive",
+        subtitle = "Un changement de statut déplace physiquement le dossier sur Drive pour tout le monde.",
+    ),
+
+    /** Chaque auditeur garde son propre statut dans son fichier de progression sans toucher aux dossiers des autres. */
+    PERSONAL_FAMILY(
+        label = "Mode familial (statut par auditeur)",
+        subtitle = "Chacun gère ses livres « En écoute », « Plus tard » et « Écoutés » sans déplacer les dossiers Drive des autres.",
+    ),
+    ;
+
+    companion object {
+        fun fromName(name: String?): StatusSyncMode = entries.firstOrNull { it.name == name } ?: SHARED_DRIVE
+    }
+}
+
+/** Profil d'auditeur configuré sur cet appareil (ex. Julien, Julie, Clément). */
+@Serializable
+data class ListenerProfile(
+    val key: String,
+    val displayName: String,
+)
 
 /** Ordre de tri choisi par l'utilisateur dans la bibliothèque. */
 enum class LibrarySort(val label: String) {
@@ -86,10 +116,38 @@ data class AppSettings(
     val librarySort: LibrarySort = LibrarySort.DEFAULT,
     /** Affichage de la bibliothèque en grille de pochettes (sinon liste détaillée). */
     val libraryGrid: Boolean = false,
+    /** Profils d'auditeurs supplémentaires configurés sur cet appareil (ex. Julie, Clément). */
+    val profiles: List<ListenerProfile> = emptyList(),
+    /** Clé du profil actif (null = compte Google principal connecté). */
+    val activeProfileKey: String? = null,
+    /** Mode de gestion des statuts : déplacement des dossiers Drive ou statut personnel par auditeur. */
+    val statusSyncMode: StatusSyncMode = StatusSyncMode.SHARED_DRIVE,
 ) {
-    /** Clé de compte de la progression (propre à chaque utilisateur). */
+    /** Clé d'auditeur de la progression et des signets (propre à chaque utilisateur/profil). */
     val accountKey: String
-        get() = if (accountEmail.isNullOrBlank()) Accounts.LOCAL else accountEmail
+        get() = activeProfileKey?.takeIf { it.isNotBlank() }
+            ?: accountEmail?.takeIf { it.isNotBlank() }
+            ?: Accounts.LOCAL
+
+    /** Nom affiché de l'auditeur actif. */
+    val activeListenerName: String
+        get() {
+            val active = activeProfileKey?.takeIf { it.isNotBlank() }
+            if (active != null) {
+                profiles.firstOrNull { it.key == active }?.displayName?.takeIf { it.isNotBlank() }?.let { return it }
+                if (accountEmail != null && active.equals(accountEmail, ignoreCase = true)) {
+                    return accountName?.takeIf { it.isNotBlank() } ?: Accounts.displayNameForKey(accountEmail)
+                }
+                return Accounts.displayNameForKey(active)
+            }
+            return accountName?.takeIf { it.isNotBlank() }
+                ?: accountEmail?.let(Accounts::displayNameForKey)
+                ?: "Local"
+        }
+
+    /** Vrai si le mode multi-profils ou familial est utilisé. */
+    val hasMultipleListeners: Boolean
+        get() = profiles.isNotEmpty() || activeProfileKey != null || statusSyncMode == StatusSyncMode.PERSONAL_FAMILY
 
     val isConnected: Boolean get() = !accountEmail.isNullOrBlank()
 
@@ -167,6 +225,9 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val binauralRoom = stringPreferencesKey("binaural_room")
         val librarySort = stringPreferencesKey("library_sort")
         val libraryGrid = booleanPreferencesKey("library_grid")
+        val profilesJson = stringPreferencesKey("listener_profiles_json")
+        val activeProfileKey = stringPreferencesKey("active_profile_key")
+        val statusSyncMode = stringPreferencesKey("status_sync_mode")
 
         val pageToken = stringPreferencesKey("sync_page_token")
         val pageTokenAccount = stringPreferencesKey("sync_page_token_account")
@@ -177,8 +238,13 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val authRequired = booleanPreferencesKey("drive_auth_required")
     }
 
+    private val profilesCodec = Json { ignoreUnknownKeys = true }
+
     private fun Preferences.toSettings(): AppSettings {
         val d = AppSettings()
+        val parsedProfiles = this[K.profilesJson]?.let { raw ->
+            runCatching { profilesCodec.decodeFromString<List<ListenerProfile>>(raw) }.getOrNull()
+        }.orEmpty()
         return AppSettings(
             accountEmail = this[K.accountEmail],
             accountName = this[K.accountName],
@@ -206,6 +272,9 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             binauralRoom = BinauralRoom.fromName(this[K.binauralRoom]),
             librarySort = LibrarySort.fromName(this[K.librarySort]),
             libraryGrid = this[K.libraryGrid] ?: d.libraryGrid,
+            profiles = parsedProfiles,
+            activeProfileKey = this[K.activeProfileKey],
+            statusSyncMode = StatusSyncMode.fromName(this[K.statusSyncMode]),
         )
     }
 
@@ -236,6 +305,9 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p[K.binauralRoom] = binauralRoom.name
         p[K.librarySort] = librarySort.name
         p[K.libraryGrid] = libraryGrid
+        p.putOrRemove(K.profilesJson, profiles.takeIf { it.isNotEmpty() }?.let { profilesCodec.encodeToString(it) })
+        p.putOrRemove(K.activeProfileKey, activeProfileKey)
+        p[K.statusSyncMode] = statusSyncMode.name
     }
 
     private fun Preferences.toSyncState() = SyncState(

@@ -14,7 +14,9 @@ import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.settings.ListenerProfile
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
+import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
 import com.julienmiquel.audiotheque.core.settings.SyncState
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
@@ -108,9 +110,39 @@ class AppContainer(private val app: Application) {
     val syncNotifications = SyncNotifications(app)
     val syncComponent = SyncComponent(engine, scheduler, syncNotifications)
 
-    val library = LibraryRepository(database, settings)
-    val gestures = StatusGestures(database, settings, scheduler, clock)
-    val editor = BookEditor(database)
+    /**
+     * Progression échangée avec Drive hors synchro complète : envoi après une pause (sans
+     * attendre), relecture avant une lecture (délai borné par le lecteur). Seul le moteur parle à
+     * Drive ; ce pont ne fait que lui transmettre les demandes du lecteur et de la bibliothèque.
+     */
+    val progressBridge: ProgressSyncRequester = object : ProgressSyncRequester {
+        override suspend fun pullProgress(bookId: String, timeoutMs: Long): RemoteProgress? =
+            withTimeoutOrNull(timeoutMs) { engine.pullProgress(bookId) }
+
+        override fun pushProgress(bookId: String?) {
+            appScope.launch { withTimeoutOrNull(PUSH_TIMEOUT_MS) { engine.pushProgress(bookId) } }
+        }
+    }
+
+    val library = LibraryRepository(
+        db = database,
+        settings = settings,
+        onProgressDirty = { id -> progressBridge.pushProgress(id) },
+    )
+    val gestures = StatusGestures(
+        db = database,
+        settings = settings,
+        sync = scheduler,
+        clock = clock,
+        onProgressDirty = { id -> progressBridge.pushProgress(id) },
+    )
+    val editor = BookEditor(
+        db = database,
+        clock = clock,
+        onMetadataDirty = { id ->
+            appScope.launch { withTimeoutOrNull(PUSH_TIMEOUT_MS) { engine.pushMetadata(id) } }
+        },
+    )
     val backup = com.julienmiquel.audiotheque.library.BackupManager(database, settings, clock)
 
     /**
@@ -131,20 +163,6 @@ class AppContainer(private val app: Application) {
     val enricher = Enricher(database, coverSources, http, storage.coversDir(), clock)
     private val coverImporter = CoverImporter(app)
     val player = PlayerConnection(app)
-
-    /**
-     * Progression échangée avec Drive hors synchro complète : envoi après une pause (sans
-     * attendre), relecture avant une lecture (délai borné par le lecteur). Seul le moteur parle à
-     * Drive ; ce pont ne fait que lui transmettre les demandes du lecteur.
-     */
-    val progressBridge: ProgressSyncRequester = object : ProgressSyncRequester {
-        override suspend fun pullProgress(bookId: String, timeoutMs: Long): RemoteProgress? =
-            withTimeoutOrNull(timeoutMs) { engine.pullProgress(bookId) }
-
-        override fun pushProgress(bookId: String?) {
-            appScope.launch { withTimeoutOrNull(PUSH_TIMEOUT_MS) { engine.pushProgress(bookId) } }
-        }
-    }
 
     val playerDependencies = object : PlayerDependencies {
         override val database: AppDatabase get() = this@AppContainer.database
@@ -207,7 +225,7 @@ class AppContainer(private val app: Application) {
         _messages.tryEmit(text)
     }
 
-    /** Geste de statut : file d'opérations, statut affiché aussitôt, bandeau « Annuler ». */
+    /** Geste de statut : file d'opérations ou statut personnel familial, bandeau « Annuler ». */
     fun applyGesture(bookId: String, gesture: Gesture) {
         appScope.launch {
             val result = gestures.apply(bookId, gesture)
@@ -269,16 +287,169 @@ class AppContainer(private val app: Application) {
         }
     }
 
-    /** « Déplacer vers… » : n'importe quel statut, depuis la fiche livre. */
+    /** « Déplacer le dossier dans Drive… » : déplace physiquement le dossier pour tout le monde. */
     fun moveBook(bookId: String, pair: SyncPairEntity) {
         appScope.launch {
-            val result = gestures.moveTo(bookId, pair.status, pair.id)
+            val result = gestures.moveDriveFolder(bookId, pair.id)
             if (result == null) message("Déplacement impossible") else announceMove(result)
         }
     }
 
     fun undoMove(result: MoveResult) {
         appScope.launch { gestures.undo(result) }
+    }
+
+    /** Épingle ou retire l'épinglage hors ligne d'un livre sur cet appareil, sans changer son statut. */
+    fun togglePinnedOffline(bookId: String) {
+        appScope.launch {
+            val book = database.bookDao().get(bookId) ?: return@launch
+            val next = !book.pinnedOffline
+            library.setPinnedOffline(bookId, next, scheduler)
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+            message(
+                if (next) {
+                    "Gardé sur ce téléphone : toutes les pistes seront téléchargées et conservées hors ligne"
+                } else {
+                    "Épinglage hors ligne retiré"
+                },
+            )
+        }
+    }
+
+    /** Bascule vers le profil d'auditeur [profileKey] (`null` = compte Google principal). */
+    fun switchProfile(profileKey: String?) {
+        appScope.launch {
+            val current = settings.current()
+            val normalizedKey = profileKey?.takeIf { key -> current.profiles.any { it.key == key } }
+            val targetAccountKey = normalizedKey ?: current.accountEmail ?: Accounts.LOCAL
+            if (targetAccountKey == current.accountKey && normalizedKey == current.activeProfileKey) return@launch
+            withTimeoutOrNull(PROFILE_SWITCH_PUSH_MS) { engine.pushProgress(null) }
+            val lastPlayed = database.progressDao().lastListened(targetAccountKey)?.bookId
+            settings.update {
+                it.copy(
+                    activeProfileKey = normalizedKey,
+                    lastPlayedBookId = lastPlayed,
+                )
+            }
+            val updated = settings.current()
+            _selectedBookId.value = lastPlayed
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+            message("Auditeur actif : ${updated.activeListenerName}")
+            if (updated.isConnected) {
+                engine.syncProgress()
+                scheduler.requestSync(SyncTrigger.MANUAL)
+            }
+        }
+    }
+
+    /** Crée un profil d'auditeur (ou sélectionne celui qui porte déjà la même clé) et active le mode familial. */
+    fun addOrSelectProfile(displayName: String, explicitKey: String? = null) {
+        val cleanName = displayName.trim()
+        val key = Accounts.sanitizeProfileKey(explicitKey ?: cleanName)
+        if (cleanName.isEmpty() || key.isEmpty() || key == Accounts.LOCAL) {
+            message("Nom de profil invalide")
+            return
+        }
+        appScope.launch {
+            val current = settings.current()
+            if (current.accountEmail?.equals(key, ignoreCase = true) == true) {
+                switchProfile(null)
+                return@launch
+            }
+            val exists = current.profiles.any { it.key == key }
+            val newProfiles = if (exists) {
+                current.profiles.map { if (it.key == key) ListenerProfile(key, cleanName) else it }
+            } else {
+                current.profiles + ListenerProfile(key, cleanName)
+            }
+            settings.update {
+                it.copy(
+                    profiles = newProfiles,
+                    statusSyncMode = StatusSyncMode.PERSONAL_FAMILY,
+                )
+            }
+            switchProfile(key)
+        }
+    }
+
+    /** Retire un profil secondaire de l'appareil (ses données locales et son fichier Drive sont conservés). */
+    fun removeProfile(key: String) {
+        appScope.launch {
+            val current = settings.current()
+            val remaining = current.profiles.filterNot { it.key == key }
+            val wasActive = current.activeProfileKey == key
+            if (wasActive) {
+                val primaryKey = current.accountEmail ?: Accounts.LOCAL
+                val lastPlayed = database.progressDao().lastListened(primaryKey)?.bookId
+                settings.update {
+                    it.copy(
+                        profiles = remaining,
+                        activeProfileKey = null,
+                        lastPlayedBookId = lastPlayed,
+                    )
+                }
+                val updated = settings.current()
+                _selectedBookId.value = lastPlayed
+                com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+                message("Profil retiré · Auditeur actif : ${updated.activeListenerName}")
+                if (updated.isConnected) {
+                    engine.syncProgress()
+                    scheduler.requestSync(SyncTrigger.MANUAL)
+                }
+            } else {
+                settings.update { it.copy(profiles = remaining) }
+                message("Profil retiré de cet appareil")
+            }
+        }
+    }
+
+    /** Modifie le mode de synchronisation des gestes de statut (mode familial vs dossiers Drive partagés). */
+    fun setStatusSyncMode(mode: StatusSyncMode) {
+        appScope.launch {
+            settings.update { it.copy(statusSyncMode = mode) }
+            scheduler.requestSync(SyncTrigger.MANUAL)
+        }
+    }
+
+    /** Recherche sur Google Drive les profils `.audiotheque-progress-<profil>.json` déjà créés par la famille. */
+    suspend fun discoverProfilesFromDrive(): Int {
+        val current = settings.current()
+        if (!current.isConnected) {
+            message("Connectez d'abord votre compte Google Drive")
+            return 0
+        }
+        val remoteKeys = engine.discoverRemoteProfiles()
+        val localKeys = database.progressDao().distinctAccounts()
+        val emailLower = current.accountEmail?.lowercase()
+        val existingKeys = current.profiles.map { it.key }.toSet()
+        val additions = (remoteKeys + localKeys)
+            .map { it.trim().lowercase() }
+            .distinct()
+            .filter { key ->
+                key.isNotBlank() &&
+                    key != Accounts.LOCAL &&
+                    key != emailLower &&
+                    key !in existingKeys
+            }
+            .map { key -> ListenerProfile(key = key, displayName = Accounts.displayNameForKey(key)) }
+        if (additions.isNotEmpty()) {
+            settings.update {
+                it.copy(
+                    profiles = it.profiles + additions,
+                    statusSyncMode = StatusSyncMode.PERSONAL_FAMILY,
+                )
+            }
+            message(
+                if (additions.size == 1) {
+                    "1 profil détecté : ${additions.first().displayName}"
+                } else {
+                    "${additions.size} profils détectés : ${additions.joinToString(", ") { p -> p.displayName }}"
+                },
+            )
+        } else {
+            message("Aucun nouveau profil détecté sur Google Drive")
+        }
+        return additions.size
     }
 
     /** Lecture (fichiers locaux uniquement) ; sans [autoPlay], le livre est seulement positionné. */
@@ -434,6 +605,7 @@ class AppContainer(private val app: Application) {
         settings.update { it.copy(accountEmail = email, accountName = name, onboardingDone = true) }
         database.progressDao().migrateAccount(Accounts.LOCAL, email)
         database.listeningSessionDao().migrateAccount(Accounts.LOCAL, email)
+        database.bookmarkDao().migrateAccount(Accounts.LOCAL, email)
         settings.updateSyncState { it.copy(pageToken = null, lastFullInventoryAt = null, authRequired = false) }
         syncNotifications.dismissAuthRequired()
         scheduler.schedulePeriodic(settings.current())
@@ -453,7 +625,7 @@ class AppContainer(private val app: Application) {
         _selectedBookId.value = null
         withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.pushProgressBeforeSignOut() }
         // Plus de compte : aucune synchro ne peut repartir pendant l'effacement.
-        settings.update { it.copy(accountEmail = null, accountName = null, lastPlayedBookId = null) }
+        settings.update { it.copy(accountEmail = null, accountName = null, activeProfileKey = null, lastPlayedBookId = null) }
         withTimeoutOrNull(SIGN_OUT_WAIT_MS) { engine.awaitIdle() }
         auth.signOut()
         withContext(Dispatchers.IO) {
@@ -484,6 +656,9 @@ class AppContainer(private val app: Application) {
     companion object {
         /** Attente maximale de la fin de la synchro et de l'écriture de la progression. */
         private const val SIGN_OUT_WAIT_MS = 20_000L
+
+        /** Envoi de la position avant bascule de profil. */
+        private const val PROFILE_SWITCH_PUSH_MS = 5_000L
 
         /** Envoi de la position après une pause : abandonné au-delà (il sera refait à la prochaine occasion). */
         private const val PUSH_TIMEOUT_MS = 30_000L

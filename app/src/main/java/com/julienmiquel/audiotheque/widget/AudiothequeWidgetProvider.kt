@@ -232,9 +232,13 @@ class AudiothequeWidgetProvider : AppWidgetProvider() {
         db.progressDao().lastListened(settings.accountKey)?.bookId?.let { id ->
             bookDao.get(id)?.takeIf { !it.trashPending && !it.hidden }?.let { return it }
         }
-        // 3. Premier livre « En écoute » disponible.
-        return bookDao.byEffectiveStatus(BookStatus.IN_PROGRESS)
-            .firstOrNull { !it.trashPending && !it.hidden }
+        // 3. Premier livre « En écoute » disponible pour l'auditeur actif.
+        val progressByBook = db.progressDao().allFor(settings.accountKey).associateBy { it.bookId }
+        return bookDao.all()
+            .firstOrNull { book ->
+                !book.trashPending && !book.hidden &&
+                    (book.pendingStatus ?: progressByBook[book.driveId]?.personalStatus ?: book.status) == BookStatus.IN_PROGRESS
+            }
     }
 
     private fun broadcastPending(context: Context, action: String, reqCode: Int): PendingIntent {

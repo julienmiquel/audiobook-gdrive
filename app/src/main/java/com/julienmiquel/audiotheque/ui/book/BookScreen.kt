@@ -44,6 +44,7 @@ import androidx.compose.material.icons.filled.FolderZip
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.ImageSearch
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.OfflinePin
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -54,6 +55,7 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -91,16 +93,16 @@ import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.CleanupPolicy
 import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
-import com.julienmiquel.audiotheque.core.model.CleanupPolicy
-import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.model.meaningfulTitle
 import com.julienmiquel.audiotheque.core.settings.AppSettings
+import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
 import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.library.Gesture
 import com.julienmiquel.audiotheque.library.LibraryItem
@@ -199,6 +201,8 @@ class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel
 
     fun move(pair: SyncPairEntity) = c.moveBook(bookId, pair)
 
+    fun togglePinnedOffline() = c.togglePinnedOffline(bookId)
+
     fun play(trackId: String? = null, positionMs: Long? = null) = c.playBook(bookId, trackId, positionMs)
 
     fun saveCorrections(title: String, author: String, narrator: String, renameDriveTo: String? = null) {
@@ -275,9 +279,30 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                 },
                 actions = {
                     if (item != null) {
+                        val moveLabel = if (state.settings.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY) {
+                            "Déplacer le dossier dans Drive…"
+                        } else {
+                            "Déplacer vers…"
+                        }
                         Box {
                             IconButton(onClick = { menu = true }) { Icon(Icons.Filled.MoreVert, contentDescription = "Plus d'actions") }
                             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            if (item.pinnedOffline) {
+                                                "Ne plus garder sur ce téléphone"
+                                            } else {
+                                                "Garder sur ce téléphone (hors ligne)"
+                                            },
+                                        )
+                                    },
+                                    leadingIcon = { Icon(Icons.Filled.OfflinePin, null) },
+                                    onClick = {
+                                        menu = false
+                                        vm.togglePinnedOffline()
+                                    },
+                                )
                                 DropdownMenuItem(
                                     text = { Text("Corriger titre, auteur, voix") },
                                     leadingIcon = { Icon(Icons.Filled.Edit, null) },
@@ -295,7 +320,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                                     },
                                 )
                                 DropdownMenuItem(
-                                    text = { Text("Déplacer vers…") },
+                                    text = { Text(moveLabel) },
                                     leadingIcon = { Icon(Icons.AutoMirrored.Filled.DriveFileMove, null) },
                                     onClick = {
                                         menu = false
@@ -377,6 +402,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                 },
                 onGesture = vm::gesture,
                 onMove = { moving = true },
+                onTogglePin = vm::togglePinnedOffline,
                 onEdit = { editing = true },
                 onConfirm = vm::confirmTitle,
                 onOpenBook = onOpenBook,
@@ -410,6 +436,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
         MoveDialog(
             book = item.book,
             pairs = state.pairs,
+            familyMode = state.settings.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY,
             onDismiss = { moving = false },
             onMove = { pair ->
                 vm.move(pair)
@@ -451,6 +478,7 @@ private fun BookContent(
     onPlay: (String?, Long?) -> Unit,
     onGesture: (Gesture) -> Unit,
     onMove: () -> Unit,
+    onTogglePin: () -> Unit,
     onEdit: () -> Unit,
     onConfirm: () -> Unit,
     onOpenBook: (String) -> Unit,
@@ -481,11 +509,11 @@ private fun BookContent(
                 }
             }
         }
-        item(key = "actions") { Actions(state, item, onPlay, onGesture, onMove) }
+        item(key = "actions") { Actions(state, item, onPlay, onGesture, onMove, onTogglePin) }
         if (progress?.finished == true && item.status != BookStatus.DONE && item.status != BookStatus.ARCHIVED) {
             item(key = "finished") {
                 InfoCard(title = "Livre terminé", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-                    Text("Vous êtes arrivé à la fin de la dernière piste. Le ranger dans _Ecouté ?", style = MaterialTheme.typography.bodyMedium)
+                    Text("Vous êtes arrivé à la fin de la dernière piste. Le marquer comme écouté ?", style = MaterialTheme.typography.bodyMedium)
                     Button(onClick = { onGesture(Gesture.MARQUER_ECOUTE) }) { Text("Marquer comme écouté") }
                 }
             }
@@ -697,6 +725,7 @@ private fun BookContent(
 
 @Composable
 private fun Header(item: LibraryItem) {
+    val colors = MaterialTheme.colorScheme
     Row(Modifier.padding(16.dp), verticalAlignment = Alignment.Top) {
         BookCover(item.cover, item.title, size = 112.dp, cornerRadius = 12.dp)
         Spacer(Modifier.width(16.dp))
@@ -706,6 +735,17 @@ private fun Header(item: LibraryItem) {
             item.narrator?.let { Text("Lu par $it", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 StatusTag(item.status)
+                if (item.personalStatus != null && item.status != item.driveStatus) {
+                    Tag("Drive : ${Labels.statusTab(item.driveStatus)}", icon = Icons.AutoMirrored.Filled.DriveFileMove)
+                }
+                if (item.pinnedOffline) {
+                    Tag(
+                        "gardé hors ligne",
+                        icon = Icons.Filled.OfflinePin,
+                        container = colors.primaryContainer,
+                        content = colors.onPrimaryContainer,
+                    )
+                }
                 item.series?.let { Tag(it.displayLabel, icon = Icons.Filled.Bookmarks) }
                 if (item.pendingSync) {
                     val label = when {
@@ -723,8 +763,16 @@ private fun Header(item: LibraryItem) {
 }
 
 @Composable
-private fun Actions(state: BookUiState, item: LibraryItem, onPlay: (String?, Long?) -> Unit, onGesture: (Gesture) -> Unit, onMove: () -> Unit) {
+private fun Actions(
+    state: BookUiState,
+    item: LibraryItem,
+    onPlay: (String?, Long?) -> Unit,
+    onGesture: (Gesture) -> Unit,
+    onMove: () -> Unit,
+    onTogglePin: () -> Unit,
+) {
     val gestures = Gesture.forStatus(item.status)
+    val familyMode = state.settings.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY
     Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             if (item.presentTracks > 0) {
@@ -738,7 +786,15 @@ private fun Actions(state: BookUiState, item: LibraryItem, onPlay: (String?, Lon
             gestures.forEach { g ->
                 FilledTonalButton(onClick = { onGesture(g) }) { Text(g.label) }
             }
-            TextButton(onClick = onMove) { Text("Déplacer vers…") }
+            FilterChip(
+                selected = item.pinnedOffline,
+                onClick = onTogglePin,
+                label = { Text(if (item.pinnedOffline) "Gardé sur ce téléphone" else "Garder hors ligne") },
+                leadingIcon = { Icon(Icons.Filled.OfflinePin, contentDescription = null, modifier = Modifier.size(18.dp)) },
+            )
+            TextButton(onClick = onMove) {
+                Text(if (familyMode) "Déplacer dans Drive…" else "Déplacer vers…")
+            }
         }
     }
 }
@@ -764,7 +820,15 @@ private fun InfoSection(state: BookUiState, item: LibraryItem) {
     val book = item.book
     val pair = state.pairs.firstOrNull { it.driveFolderId == book.effectiveParentId }
     InfoCard(title = "Informations", modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)) {
-        InfoRow("Statut", Labels.status(item.status) + (pair?.let { " (${it.name})" } ?: ""))
+        if (item.personalStatus != null) {
+            InfoRow("Votre statut", Labels.status(item.status))
+            InfoRow(
+                "Emplacement Drive",
+                Labels.status(item.driveStatus) + (pair?.let { " (${it.name})" } ?: ""),
+            )
+        } else {
+            InfoRow("Statut", Labels.status(item.status) + (pair?.let { " (${it.name})" } ?: ""))
+        }
         item.series?.let { InfoRow("Série", it.displayLabel) }
         InfoRow("Durée", Formats.duration(book.durationMs, approximate = book.durationMs != null && !book.durationExact) + if (book.durationMs != null && !book.durationExact) " (estimée)" else "")
         InfoRow("Taille", Formats.size(book.sizeBytes))
@@ -777,23 +841,33 @@ private fun InfoSection(state: BookUiState, item: LibraryItem) {
         InfoRow(if (item.isZip) "Archive Drive" else "Dossier Drive", book.name)
         book.pendingName?.let { pending -> InfoRow("Renommage en attente", pending) }
         InfoRow("Ajouté le", Formats.date(book.addedAt))
-        InfoRow("Statut changé le", Formats.date(book.effectiveStatusChangedAt))
+        InfoRow("Statut changé le", Formats.date(item.statusChangedAt))
         cleanupInfo(state, item)?.let { (label, value) -> InfoRow(label, value) }
     }
 }
 
 /**
  * Nettoyage des pistes locales, avec la règle du moteur ([CleanupPolicy]) : rien tant que Drive
- * n'a pas confirmé le déplacement, puis 7 jours pour Plus tard, 24 h pour Écouté (par défaut).
+ * n'a pas confirmé le déplacement, jamais si « Gardé sur ce téléphone », puis 7 jours pour Plus tard,
+ * 24 h pour Écouté (par défaut).
  */
 private fun cleanupInfo(state: BookUiState, item: LibraryItem): Pair<String, String>? {
     if (item.presentTracks == 0) return null
     val book = item.book
+    if (book.pinnedOffline) {
+        return "Pistes gardées" to "toujours (gardé sur ce téléphone)"
+    }
     if (book.pendingStatus != null) {
         return if (book.pendingStatus == BookStatus.IN_PROGRESS) null else "Pistes gardées" to "jusqu'à la confirmation du déplacement par Drive"
     }
     val mode = state.pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-    val deadline = CleanupPolicy.bookDeadline(book, mode, state.settings) ?: return null
+    val deadline = CleanupPolicy.bookDeadline(
+        book = book,
+        pairMode = mode,
+        settings = state.settings,
+        personalStatus = state.progress?.personalStatus,
+        personalStatusChangedAt = state.progress?.personalStatusChangedAt,
+    ) ?: return null
     return "Pistes gardées jusqu'au" to Formats.dateTime(deadline)
 }
 
@@ -860,7 +934,7 @@ private fun EditDialog(item: LibraryItem, onDismiss: () -> Unit, onSave: (String
         text = {
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Nom actuel sur Drive : « $currentDriveName ».",
+                    "Nom actuel sur Drive : « $currentDriveName ». Ces corrections sont partagées avec tous les auditeurs de la famille.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -960,16 +1034,26 @@ private fun RenameDriveDialog(item: LibraryItem, onDismiss: () -> Unit, onRename
 }
 
 @Composable
-private fun MoveDialog(book: BookEntity, pairs: List<SyncPairEntity>, onDismiss: () -> Unit, onMove: (SyncPairEntity) -> Unit) {
+private fun MoveDialog(
+    book: BookEntity,
+    pairs: List<SyncPairEntity>,
+    familyMode: Boolean,
+    onDismiss: () -> Unit,
+    onMove: (SyncPairEntity) -> Unit,
+) {
     val choices = pairs.filter { it.enabled || it.driveFolderId == book.effectiveParentId }
     var selected by remember { mutableStateOf(choices.firstOrNull { it.driveFolderId == book.effectiveParentId }) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Déplacer « ${book.displayTitle} »") },
+        title = { Text("Déplacer « ${book.displayTitle} » sur Drive") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 Text(
-                    "Le dossier change de parent dans Drive, aussitôt ou dès le retour du réseau.",
+                    if (familyMode) {
+                        "Ce déplacement modifie physiquement le dossier parent dans Google Drive pour tous les membres de la famille."
+                    } else {
+                        "Le dossier change de parent dans Drive, aussitôt ou dès le retour du réseau."
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

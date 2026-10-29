@@ -16,7 +16,6 @@ import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.model.effectiveParentId
-import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
 import com.julienmiquel.audiotheque.core.parse.FolderNameParser
 import com.julienmiquel.audiotheque.core.parse.Mp3Probe
@@ -151,9 +150,9 @@ class LibraryScanner(
                 }
                 continue
             }
-            // Fichier de progression écrit par l'app (ce téléphone ou un autre) : relu par la
-            // synchro de progression, pas un changement de la bibliothèque.
-            if (ProgressJson.isProgressFile(file.name)) continue
+            // Fichier technique écrit par l'app (progression par auditeur ou métadonnées partagées) :
+            // relu par sa propre passe de synchro, pas un changement de la bibliothèque.
+            if (SidecarFiles.isSidecarFile(file.name)) continue
             val pair = file.parents.firstNotNullOfOrNull { pairByFolder[it] }
             if (isStatusFolder(file, pair, pairs)) continue
             if (pair != null) {
@@ -399,6 +398,7 @@ enum class ProbeScope {
  */
 class MetadataProber(
     private val db: AppDatabase,
+    private val settings: SettingsRepository,
     private val history: HistoryLogger,
     private val localFiles: LocalFiles,
     private val storage: LocalStorage,
@@ -420,15 +420,34 @@ class MetadataProber(
         allowContent: Boolean = true,
         progress: (String) -> Unit = {},
     ): Boolean {
+        val s = settings.current()
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
         val pairs = db.syncPairDao().all()
         val eligible: Set<String> = if (onlyPair != null) {
             setOf(onlyPair.driveFolderId)
         } else {
             pairs.filter { it.enabled && it.mode != PairMode.ON_OPEN }.map { it.driveFolderId }.toSet()
         }
-        val fullFolders = pairs.filter { it.enabled && it.mode == PairMode.FULL }.map { it.driveFolderId }.toSet()
-        fun isEligible(b: BookEntity) = b.parentId in eligible || b.effectiveParentId in eligible
-        fun isDownloaded(b: BookEntity) = b.effectiveParentId in fullFolders
+        val inProgressPair = pairs.firstOrNull { it.status == BookStatus.IN_PROGRESS }
+        val inProgressFullEnabled = inProgressPair == null || (inProgressPair.enabled && inProgressPair.mode == PairMode.FULL)
+        val fullCollectionFolders = pairs
+            .filter { it.enabled && it.mode == PairMode.FULL && it.status == BookStatus.COLLECTION }
+            .map { it.driveFolderId }
+            .toSet()
+
+        fun isDownloaded(b: BookEntity): Boolean {
+            if (b.pinnedOffline || b.effectiveParentId in fullCollectionFolders) return true
+            if (!inProgressFullEnabled) return false
+            val effective = b.pendingStatus ?: progressByBook[b.driveId]?.personalStatus ?: b.status
+            return effective == BookStatus.IN_PROGRESS
+        }
+
+        fun isEligible(b: BookEntity) = if (onlyPair != null) {
+            b.parentId in eligible || b.effectiveParentId in eligible
+        } else {
+            isDownloaded(b) || b.parentId in eligible || b.effectiveParentId in eligible
+        }
+
         fun inScope(b: BookEntity) = when (scope) {
             ProbeScope.DOWNLOADS -> isDownloaded(b)
             ProbeScope.LIBRARY -> !isDownloaded(b)
@@ -437,7 +456,7 @@ class MetadataProber(
 
         val toList = books.all().filter { b ->
             b.kind == BookKind.FOLDER && isEligible(b) && inScope(b) &&
-                (b.tracksSyncedAt == null || b.effectiveStatus == BookStatus.IN_PROGRESS)
+                (b.tracksSyncedAt == null || isDownloaded(b))
         }
         toList.forEachIndexed { i, book ->
             progress("Pistes ${i + 1}/${toList.size} : ${book.displayTitle}")
@@ -544,6 +563,7 @@ class MetadataProber(
     private suspend fun listRecursive(drive: DriveService, folderId: String, prefix: String, depth: Int): List<Pair<String, DriveFile>> {
         val result = mutableListOf<Pair<String, DriveFile>>()
         for (child in drive.listChildren(folderId)) {
+            if (SidecarFiles.isSidecarFile(child.name)) continue
             if (child.isFolder) {
                 if (depth < 2) result += listRecursive(drive, child.id, "$prefix${child.name}/", depth + 1)
             } else {

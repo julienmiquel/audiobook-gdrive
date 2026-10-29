@@ -14,7 +14,6 @@ import com.julienmiquel.audiotheque.core.model.PairMode
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.TrackState
 import com.julienmiquel.audiotheque.core.model.displayTitle
-import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.util.Formats
@@ -94,16 +93,27 @@ class Downloader(
         }
     }
 
-    private suspend fun fullModeCandidates(): List<BookEntity> {
+    private suspend fun fullModeCandidates(s: com.julienmiquel.audiotheque.core.settings.AppSettings): List<BookEntity> {
         val pairs = db.syncPairDao().all()
         val inProgressPair = pairs.firstOrNull { it.status == BookStatus.IN_PROGRESS }
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
+        val allBooks = books.all().filter { !it.trashPending }
         val candidates = mutableListOf<BookEntity>()
+
+        // 1. Livres épinglés hors ligne sur ce téléphone (« Garder sur ce téléphone »).
+        candidates += allBooks.filter { it.pinnedOffline }
+
+        // 2. Livres « En écoute » pour l'auditeur actif (statut personnel familial ou dossier Drive).
         if (inProgressPair == null || (inProgressPair.enabled && inProgressPair.mode == PairMode.FULL)) {
-            candidates += books.byEffectiveStatus(BookStatus.IN_PROGRESS)
+            candidates += allBooks.filter { book ->
+                val p = progressByBook[book.driveId]
+                (book.pendingStatus ?: p?.personalStatus ?: book.status) == BookStatus.IN_PROGRESS
+            }
         }
-        // Collections ajoutées en réception complète (paires sans limite).
+
+        // 3. Collections ajoutées en réception complète (paires sans limite).
         pairs.filter { it.enabled && it.mode == PairMode.FULL && it.status == BookStatus.COLLECTION }.forEach { pair ->
-            candidates += books.byParent(pair.driveFolderId)
+            candidates += allBooks.filter { it.parentId == pair.driveFolderId }
         }
         return candidates.distinctBy { it.driveId }
     }
@@ -112,7 +122,7 @@ class Downloader(
     suspend fun zipPlan(): List<BookEntity> {
         val s = settings.current()
         val progressDao = db.progressDao()
-        return fullModeCandidates()
+        return fullModeCandidates(s)
             .filter { it.kind == BookKind.ZIP }
             .filter { book ->
                 val bookTracks = tracks.forBook(book.driveId)
@@ -123,7 +133,9 @@ class Downloader(
             .map { it to progressDao.get(it.driveId, s.accountKey) }
             .sortedWith(
                 compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
-                    .thenByDescending { it.first.effectiveStatusChangedAt },
+                    .thenByDescending { (book, p) ->
+                        book.pendingSince ?: p?.personalStatusChangedAt ?: book.statusChangedAt
+                    },
             )
             .map { it.first }
     }
@@ -131,12 +143,14 @@ class Downloader(
     /** Pistes à télécharger, dans l'ordre de priorité. */
     suspend fun plan(): List<Task> {
         val s = settings.current()
-        val progressDao = db.progressDao()
-        val withProgress = fullModeCandidates().filter { it.kind != BookKind.ZIP }
-            .map { it to progressDao.get(it.driveId, s.accountKey) }
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
+        val withProgress = fullModeCandidates(s).filter { it.kind != BookKind.ZIP }
+            .map { it to progressByBook[it.driveId] }
             .sortedWith(
                 compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
-                    .thenByDescending { it.first.effectiveStatusChangedAt },
+                    .thenByDescending { (book, p) ->
+                        book.pendingSince ?: p?.personalStatusChangedAt ?: book.statusChangedAt
+                    },
             )
         val result = mutableListOf<Task>()
         for ((book, progress) in withProgress) {
@@ -147,7 +161,11 @@ class Downloader(
                 .forEach { result += Task(book, it) }
         }
         if (s.previewNew) {
-            for (book in books.byEffectiveStatus(BookStatus.NEW).filter { it.kind != BookKind.ZIP }) {
+            val newBooks = books.all().filter { book ->
+                !book.trashPending && book.kind != BookKind.ZIP &&
+                    (book.pendingStatus ?: progressByBook[book.driveId]?.personalStatus ?: book.status) == BookStatus.NEW
+            }
+            for (book in newBooks) {
                 tracks.forBook(book.driveId).firstOrNull()?.takeIf { it.state != TrackState.PRESENT }?.let { result += Task(book, it) }
             }
         }
@@ -702,12 +720,22 @@ class Cleaner(
         val s = settings.current()
         val now = clock.now()
         val pairs = db.syncPairDao().all()
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
+        val inProgressOnDevice = db.progressDao().booksInProgressOnDevice().toSet()
         for (track in db.trackDao().withLocalData()) {
             val book = db.bookDao().get(track.bookId) ?: continue
-            if (isBookInUse(book.driveId)) continue
+            if (isBookInUse(book.driveId) || book.driveId in inProgressOnDevice) continue
             if (track.state == TrackState.DOWNLOADING) continue
             val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-            val deadline = CleanupPolicy.deadline(book, track.sortIndex, pairMode, s) ?: continue
+            val prog = progressByBook[book.driveId]
+            val deadline = CleanupPolicy.deadline(
+                book = book,
+                trackSortIndex = track.sortIndex,
+                pairMode = pairMode,
+                settings = s,
+                personalStatus = prog?.personalStatus,
+                personalStatusChangedAt = prog?.personalStatusChangedAt,
+            ) ?: continue
             if (now < deadline) continue
             val path = track.localPath
             val freed = localFiles.deleteTrackFiles(track)
@@ -735,12 +763,22 @@ class Cleaner(
         val s = settings.current()
         val now = clock.now()
         val pairs = db.syncPairDao().all()
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
+        val inProgressOnDevice = db.progressDao().booksInProgressOnDevice().toSet()
         val booksById = HashMap<String, BookEntity?>()
         return db.trackDao().withLocalData().mapNotNull { track ->
             val book = booksById.getOrPut(track.bookId) { db.bookDao().get(track.bookId) } ?: return@mapNotNull null
-            if (isBookInUse(book.driveId)) return@mapNotNull null
+            if (isBookInUse(book.driveId) || book.driveId in inProgressOnDevice) return@mapNotNull null
             val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-            CleanupPolicy.deadline(book, track.sortIndex, pairMode, s)?.takeIf { it > now }
+            val prog = progressByBook[book.driveId]
+            CleanupPolicy.deadline(
+                book = book,
+                trackSortIndex = track.sortIndex,
+                pairMode = pairMode,
+                settings = s,
+                personalStatus = prog?.personalStatus,
+                personalStatusChangedAt = prog?.personalStatusChangedAt,
+            )?.takeIf { it > now }
         }.minOrNull()
     }
 }

@@ -46,9 +46,11 @@ import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.model.displayAuthor
 import com.julienmiquel.audiotheque.core.model.displayNarrator
 import com.julienmiquel.audiotheque.core.model.displayTitle
-import com.julienmiquel.audiotheque.core.model.effectiveStatus
+import com.julienmiquel.audiotheque.core.model.Accounts
 import com.julienmiquel.audiotheque.core.model.isPlayableKind
 import com.julienmiquel.audiotheque.core.model.partLabel
+import com.julienmiquel.audiotheque.core.model.userEffectiveStatus
+import com.julienmiquel.audiotheque.core.model.userEffectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.RemoteProgress
 import com.julienmiquel.audiotheque.core.util.Formats
@@ -119,6 +121,7 @@ class PlaybackService : MediaLibraryService() {
     private var session: MediaLibrarySession? = null
 
     private var currentBook: BookEntity? = null
+    private var boundAccountKey: String? = null
     private val currentBookIdFlow = MutableStateFlow<String?>(null)
     private var currentTracks: List<TrackEntity> = emptyList()
     private var currentEmbedded: Map<String, List<EmbeddedChapterEntity>> = emptyMap()
@@ -269,6 +272,34 @@ class PlaybackService : MediaLibraryService() {
                     dsp.binauralConfig = binauralCfg
                     dsp.preset = preset
                 }
+        }
+        scope.launch {
+            deps.settings.settings.map { it.accountKey }.distinctUntilChanged().collect { newKey ->
+                val bound = boundAccountKey ?: return@collect
+                if (bound == newKey) return@collect
+                if (bound == Accounts.LOCAL && newKey != Accounts.LOCAL) {
+                    boundAccountKey = newKey
+                    return@collect
+                }
+                // Changement d'auditeur actif : on enregistre la position du précédent, puis on libère le lecteur.
+                recordListeningSlice(resetIfPlaying = false, closeSession = true)
+                persistNow(push = true)
+                PlayerRuntime.cancelTimer()
+                exo.pause()
+                exo.stop()
+                exo.clearMediaItems()
+                tracksJob?.cancel()
+                currentBook = null
+                boundAccountKey = null
+                currentBookIdFlow.value = null
+                currentTracks = emptyList()
+                currentEmbedded = emptyMap()
+                persistEnabled = false
+                listenedSinceSave = false
+                BookInUse.set(null)
+                notifyWidgetState()
+                deps.onPlaybackStateChanged?.invoke()
+            }
         }
         scope.launch { observeSleepTimer() }
         scope.launch { observeCatalogChanges() }
@@ -564,11 +595,12 @@ class PlaybackService : MediaLibraryService() {
         } else {
             0L
         }
+        val capturedAccount = boundAccountKey
         if (deltaMs < 500L && !closeSession) return
         persistScope.launch(start = CoroutineStart.UNDISPATCHED) {
             persistMutex.withLock {
                 if (deltaMs >= 500L && bookId != null && started != null) {
-                    val account = deps.settings.current().accountKey
+                    val account = capturedAccount ?: deps.settings.current().accountKey
                     val dao = deps.database.listeningSessionDao()
                     val existingId = openSessionId
                     val zone = java.time.ZoneId.systemDefault()
@@ -671,6 +703,7 @@ class PlaybackService : MediaLibraryService() {
     // ------------------------------------------------------------------ progression
 
     private data class Snapshot(
+        val accountKey: String?,
         val book: BookEntity,
         val tracks: List<TrackEntity>,
         val trackId: String,
@@ -690,7 +723,7 @@ class PlaybackService : MediaLibraryService() {
         if (ref.bookId != book.driveId) return null
         val chapterStart = item.mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
         val unclippedPos = chapterStart + exo.currentPosition.coerceAtLeast(0L)
-        return Snapshot(book, currentTracks, ref.trackId, unclippedPos, exo.playbackParameters.speed, markFinished, listened, push)
+        return Snapshot(boundAccountKey, book, currentTracks, ref.trackId, unclippedPos, exo.playbackParameters.speed, markFinished, listened, push)
     }
 
     /**
@@ -712,7 +745,7 @@ class PlaybackService : MediaLibraryService() {
     private suspend fun persist(s: Snapshot) {
         val track = s.tracks.firstOrNull { it.driveId == s.trackId } ?: return
         val settings = deps.settings.current()
-        val account = settings.accountKey
+        val account = s.accountKey ?: settings.accountKey
         val dao = deps.database.progressDao()
         val now = System.currentTimeMillis()
         val durations = ProgressMath.durations(s.tracks, s.book.durationMs)
@@ -731,17 +764,17 @@ class PlaybackService : MediaLibraryService() {
                 dirty = true,
             ),
         )
-        if (s.listened && settings.lastPlayedBookId != s.book.driveId) {
+        if (s.listened && settings.accountKey == account && settings.lastPlayedBookId != s.book.driveId) {
             deps.settings.update { it.copy(lastPlayedBookId = s.book.driveId) }
         }
         deps.onPlaybackStateChanged?.invoke()
         // Après l'écriture locale : l'envoi relit la base, la position est à jour.
-        if (s.push) deps.progressSync?.pushProgress(s.book.driveId)
+        if (s.push && settings.accountKey == account) deps.progressSync?.pushProgress(s.book.driveId)
     }
 
     /** Vitesse mémorisée par livre : écrite seule, et seulement si elle change. */
     private suspend fun persistSpeed(bookId: String, speed: Float) {
-        val account = deps.settings.current().accountKey
+        val account = boundAccountKey ?: deps.settings.current().accountKey
         val dao = deps.database.progressDao()
         val existing = dao.get(bookId, account)
         if (existing?.speed == speed || (existing == null && speed == 1f)) return
@@ -818,7 +851,7 @@ class PlaybackService : MediaLibraryService() {
             startIndex = chosen
             startPosition = (unclippedStartPos - chosenStart).coerceAtLeast(0L)
         }
-        bind(book, tracks, embeddedByTrack)
+        bind(book, settings.accountKey, tracks, embeddedByTrack)
         exo.setPlaybackSpeed(progress?.speed?.coerceIn(MIN_SPEED, MAX_SPEED) ?: 1f)
         pausedAt = null
         if (restored != null) PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
@@ -864,11 +897,12 @@ class PlaybackService : MediaLibraryService() {
     }
 
     /** Livre chargé : protégé du nettoyage, et complété au fil des téléchargements. */
-    private fun bind(book: BookEntity, tracks: List<TrackEntity>, embeddedByTrack: Map<String, List<EmbeddedChapterEntity>>) {
-        if (currentBook?.driveId != book.driveId) {
+    private fun bind(book: BookEntity, accountKey: String, tracks: List<TrackEntity>, embeddedByTrack: Map<String, List<EmbeddedChapterEntity>>) {
+        if (currentBook?.driveId != book.driveId || boundAccountKey != accountKey) {
             recordListeningSlice(resetIfPlaying = false, closeSession = true)
         }
         currentBook = book
+        boundAccountKey = accountKey
         currentBookIdFlow.value = book.driveId
         if (exo.isPlaying) {
             playStartedWallMs = System.currentTimeMillis()
@@ -1221,7 +1255,7 @@ class PlaybackService : MediaLibraryService() {
 
     /** Livres d'un statut ayant des pistes téléchargées, le dernier écouté en premier. */
     private suspend fun playableBooks(status: BookStatus): List<BookCard> =
-        cards(deps.database.bookDao().byEffectiveStatus(status))
+        allPlayableBooks().filter { it.book.userEffectiveStatus(it.progress?.personalStatus) == status }
 
     /** Tous les livres écoutables hors ligne, quel que soit leur statut (recherche, reprise). */
     private suspend fun allPlayableBooks(): List<BookCard> = cards(deps.database.bookDao().all())
@@ -1235,7 +1269,10 @@ class PlaybackService : MediaLibraryService() {
                 val present = db.trackDao().presentCount(book.driveId)
                 if (present == 0) null else BookCard(book, db.progressDao().get(book.driveId, account), present)
             }
-            .sortedWith(compareByDescending<BookCard> { it.lastListenedAt }.thenByDescending { it.book.statusChangedAt })
+            .sortedWith(
+                compareByDescending<BookCard> { it.lastListenedAt }
+                    .thenByDescending { it.book.userEffectiveStatusChangedAt(it.progress?.personalStatus, it.progress?.personalStatusChangedAt) },
+            )
     }
 
     /** Onglets proposés : « En écoute » toujours, « Plus tard » seulement s'il a de quoi écouter. */
@@ -1318,19 +1355,31 @@ class PlaybackService : MediaLibraryService() {
             .map { it.first }
 
     /** Signature du catalogue : ce qui, en changeant, modifie les listes proposées aux navigateurs. */
-    private data class CatalogEntry(val bookId: String, val status: BookStatus, val presentTracks: Int, val percent: Int?, val finished: Boolean)
+    private data class CatalogEntry(val bookId: String, val accountKey: String, val status: BookStatus, val presentTracks: Int, val percent: Int?, val finished: Boolean)
 
     /**
-     * Téléchargement terminé, geste de statut, écoute : les navigateurs abonnés (Android Auto)
-     * sont prévenus que la racine, les onglets et les chapitres du livre concerné ont changé.
+     * Téléchargement terminé, geste de statut, écoute, changement d'auditeur : les navigateurs
+     * abonnés (Android Auto) sont prévenus que la racine, les onglets et les chapitres du livre
+     * concerné ont changé.
      */
     private suspend fun observeCatalogChanges() {
         var previous: Map<String, CatalogEntry>? = null
         deps.settings.settings.map { it.accountKey }.distinctUntilChanged()
-            .flatMapLatest { deps.database.bookDao().observeLibrary(it) }
-            .map { rows ->
+            .flatMapLatest { accountKey ->
+                deps.database.bookDao().observeLibrary(accountKey).map { rows -> accountKey to rows }
+            }
+            .map { (accountKey, rows) ->
                 rows.filter { it.presentTracks > 0 && !it.book.hidden && !it.book.trashPending }
-                    .associate { it.book.driveId to CatalogEntry(it.book.driveId, it.book.effectiveStatus, it.presentTracks, it.percent?.toInt(), it.finished == true) }
+                    .associate {
+                        it.book.driveId to CatalogEntry(
+                            bookId = it.book.driveId,
+                            accountKey = accountKey,
+                            status = it.book.userEffectiveStatus(it.personalStatus),
+                            presentTracks = it.presentTracks,
+                            percent = it.percent?.toInt(),
+                            finished = it.finished == true,
+                        )
+                    }
             }
             .distinctUntilChanged()
             .debounce(CATALOG_NOTIFY_DEBOUNCE_MS)

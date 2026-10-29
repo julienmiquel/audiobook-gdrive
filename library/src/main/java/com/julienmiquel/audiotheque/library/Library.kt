@@ -25,13 +25,17 @@ import com.julienmiquel.audiotheque.core.model.effectiveParentId
 import com.julienmiquel.audiotheque.core.model.effectiveStatus
 import com.julienmiquel.audiotheque.core.model.effectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.model.expectedAuthorKey
+import com.julienmiquel.audiotheque.core.model.userEffectiveStatus
+import com.julienmiquel.audiotheque.core.model.userEffectiveStatusChangedAt
 import com.julienmiquel.audiotheque.core.parse.FolderNameParser
 import com.julienmiquel.audiotheque.core.parse.SeriesInfo
 import com.julienmiquel.audiotheque.core.parse.TextNormalizer
 import com.julienmiquel.audiotheque.core.settings.LibrarySort
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
+import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.sync.SyncRequester
+import java.util.UUID
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -41,7 +45,7 @@ import kotlinx.coroutines.flow.map
 /** Un livre tel qu'affiché dans la bibliothèque. */
 data class LibraryItem(
     val book: BookEntity,
-    /** Statut effectif (geste en attente compris). */
+    /** Statut effectif pour l'auditeur actif (geste en attente ou statut personnel compris). */
     val status: BookStatus,
     val title: String,
     val author: String?,
@@ -63,6 +67,14 @@ data class LibraryItem(
     val sortKey: String = TextNormalizer.key(title),
     /** Série et numéro de tome détectés automatiquement, le cas échéant. */
     val series: SeriesInfo? = FolderNameParser.extractSeries(title, book.effectiveDriveName),
+    /** Statut du dossier Drive (hors statut personnel). */
+    val driveStatus: BookStatus = book.effectiveStatus,
+    /** Statut personnel de l'auditeur actif (mode familial), le cas échéant. */
+    val personalStatus: BookStatus? = null,
+    /** Heure du dernier changement de statut effectif (personnel ou Drive), pour le tri. */
+    val statusChangedAt: Long = book.effectiveStatusChangedAt,
+    /** Livre gardé intégralement hors ligne sur ce téléphone. */
+    val pinnedOffline: Boolean = book.pinnedOffline,
 ) {
     val id: String get() = book.driveId
     val isZip: Boolean get() = book.kind == BookKind.ZIP
@@ -71,7 +83,11 @@ data class LibraryItem(
 
 /** Lecture de la bibliothèque (base locale) : listes par statut, recherche, filtre « Lu par ». */
 @OptIn(ExperimentalCoroutinesApi::class)
-class LibraryRepository(private val db: AppDatabase, private val settings: SettingsRepository) {
+class LibraryRepository(
+    private val db: AppDatabase,
+    private val settings: SettingsRepository,
+    private val onProgressDirty: (String) -> Unit = {},
+) {
 
     private val account: Flow<String> = settings.settings.map { it.accountKey }.distinctUntilChanged()
 
@@ -89,7 +105,8 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
     fun observeProgress(bookId: String): Flow<ProgressEntity?> =
         account.flatMapLatest { db.progressDao().observe(bookId, it) }
 
-    fun observeBookmarks(bookId: String): Flow<List<BookmarkEntity>> = db.bookmarkDao().observeForBook(bookId)
+    fun observeBookmarks(bookId: String): Flow<List<BookmarkEntity>> =
+        account.flatMapLatest { db.bookmarkDao().observeForBook(bookId, it) }
 
     fun observeListeningSessions(): Flow<List<ListeningSessionEntity>> =
         account.flatMapLatest { db.listeningSessionDao().observeForAccount(it) }
@@ -107,21 +124,69 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
     /** Autres exemplaires du même livre (doublons). */
     suspend fun duplicatesOf(book: BookEntity): List<BookEntity> = db.bookDao().duplicatesOf(book.normalizedKey, book.authorKey, book.driveId)
 
-    suspend fun addBookmark(bookId: String, track: TrackEntity, positionMs: Long, note: String, clock: Clock = Clock.SYSTEM): Long =
-        db.bookmarkDao().insert(
+    private suspend fun markProgressDirtyForBook(bookId: String) {
+        val accountKey = settings.current().accountKey
+        val progressDao = db.progressDao()
+        val existing = progressDao.get(bookId, accountKey)
+        if (existing != null) {
+            if (!existing.dirty) progressDao.upsert(existing.copy(dirty = true))
+        } else {
+            // updatedAt = 0L pour qu'un ajout de signet sans écoute n'écrase jamais une position distante.
+            progressDao.upsert(ProgressEntity(bookId = bookId, account = accountKey, updatedAt = 0L, dirty = true))
+        }
+        onProgressDirty(bookId)
+    }
+
+    suspend fun addBookmark(bookId: String, track: TrackEntity, positionMs: Long, note: String, clock: Clock = Clock.SYSTEM): Long {
+        val accountKey = settings.current().accountKey
+        val now = clock.now()
+        val id = db.bookmarkDao().insert(
             BookmarkEntity(
                 bookId = bookId,
+                account = accountKey,
+                syncId = UUID.randomUUID().toString(),
                 trackId = track.driveId,
                 trackIndex = track.sortIndex,
                 positionMs = positionMs,
                 note = note.trim().take(MAX_NOTE_LENGTH),
-                createdAt = clock.now(),
+                createdAt = now,
+                updatedAt = now,
+                deleted = false,
             ),
         )
+        markProgressDirtyForBook(bookId)
+        return id
+    }
 
-    suspend fun updateBookmark(bookmark: BookmarkEntity) = db.bookmarkDao().update(bookmark.copy(note = bookmark.note.take(MAX_NOTE_LENGTH)))
+    suspend fun updateBookmark(bookmark: BookmarkEntity, clock: Clock = Clock.SYSTEM) {
+        val now = clock.now()
+        val syncId = bookmark.syncId.ifBlank { UUID.randomUUID().toString() }
+        db.bookmarkDao().update(
+            bookmark.copy(
+                syncId = syncId,
+                note = bookmark.note.take(MAX_NOTE_LENGTH),
+                updatedAt = now,
+            ),
+        )
+        markProgressDirtyForBook(bookmark.bookId)
+    }
 
-    suspend fun deleteBookmark(id: Long) = db.bookmarkDao().delete(id)
+    suspend fun deleteBookmark(id: Long, clock: Clock = Clock.SYSTEM) {
+        val existing = db.bookmarkDao().get(id) ?: return
+        val now = clock.now()
+        if (existing.syncId.isBlank()) {
+            db.bookmarkDao().update(existing.copy(syncId = UUID.randomUUID().toString(), updatedAt = now, deleted = true))
+        } else {
+            db.bookmarkDao().softDelete(id, now)
+        }
+        markProgressDirtyForBook(existing.bookId)
+    }
+
+    /** Garde toutes les pistes du livre hors ligne sur ce téléphone (sans changer son statut ni son dossier Drive). */
+    suspend fun setPinnedOffline(bookId: String, pinned: Boolean, sync: SyncRequester? = null) {
+        db.bookDao().setPinnedOffline(bookId, pinned)
+        sync?.requestSync(SyncTrigger.STATUS_CHANGE)
+    }
 
     /** Vitesse mémorisée par livre, quand le livre n'est pas chargé dans le lecteur. */
     suspend fun setSpeed(bookId: String, speed: Float, clock: Clock = Clock.SYSTEM) {
@@ -130,6 +195,7 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
         val dao = db.progressDao()
         val existing = dao.get(bookId, account)
         dao.upsert((existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now)).copy(speed = speed, updatedAt = now, dirty = true))
+        onProgressDirty(bookId)
     }
 
     /** Préréglage audio propre au livre (null = revient au préréglage commun de l'app). */
@@ -144,13 +210,14 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
             (existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
                 .copy(audioPreset = newValue, updatedAt = now, dirty = true),
         )
+        onProgressDirty(bookId)
     }
 
     private fun toItem(row: BookListRow): LibraryItem {
         val b = row.book
         return LibraryItem(
             book = b,
-            status = b.effectiveStatus,
+            status = b.userEffectiveStatus(row.personalStatus),
             title = b.displayTitle,
             author = b.displayAuthor,
             narrator = b.displayNarrator,
@@ -165,6 +232,10 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
             isDuplicate = row.duplicateCount > 1,
             pendingSync = b.pendingStatus != null || b.pendingName != null,
             cover = b.coverPath ?: b.coverUrl,
+            driveStatus = b.effectiveStatus,
+            personalStatus = row.personalStatus,
+            statusChangedAt = b.userEffectiveStatusChangedAt(row.personalStatus, row.personalStatusChangedAt),
+            pinnedOffline = b.pinnedOffline,
         )
     }
 
@@ -208,15 +279,15 @@ class LibraryRepository(private val db: AppDatabase, private val settings: Setti
         private fun comparatorFor(status: BookStatus?, sort: LibrarySort): Comparator<LibraryItem> = when (sort) {
             LibrarySort.DEFAULT -> when (status) {
                 BookStatus.IN_PROGRESS -> compareByDescending<LibraryItem> { it.lastListenedAt ?: 0L }
-                    .thenByDescending { it.book.effectiveStatusChangedAt }
+                    .thenByDescending { it.statusChangedAt }
                 BookStatus.NEW -> compareByDescending { it.book.addedAt }
-                BookStatus.LATER, BookStatus.DONE -> compareByDescending { it.book.effectiveStatusChangedAt }
+                BookStatus.LATER, BookStatus.DONE -> compareByDescending { it.statusChangedAt }
                 else -> compareBy<LibraryItem> { it.series?.let { s -> TextNormalizer.key(s.name) } ?: it.sortKey }
                     .thenBy { it.series?.volume ?: Int.MAX_VALUE }
                     .thenBy { it.sortKey }
             }
             LibrarySort.RECENTLY_LISTENED -> compareByDescending<LibraryItem> { it.lastListenedAt ?: 0L }
-                .thenByDescending { it.book.effectiveStatusChangedAt }
+                .thenByDescending { it.statusChangedAt }
                 .thenBy { it.sortKey }
             LibrarySort.ADDED_DESC -> compareByDescending<LibraryItem> { it.book.addedAt }
                 .thenBy { it.sortKey }
@@ -263,7 +334,7 @@ enum class Gesture(val label: String, val target: BookStatus) {
 
 /**
  * Résultat d'un geste : de quoi proposer « Annuler » pendant 10 s, c'est-à-dire remettre le livre
- * dans son dossier de départ et rétablir la progression modifiée par le geste.
+ * dans son état ou dossier de départ et rétablir la progression modifiée par le geste.
  */
 data class MoveResult(
     val bookId: String,
@@ -279,20 +350,26 @@ data class MoveResult(
     val previousProgress: ProgressEntity? = null,
     /** Heure du geste : une position n'est rétablie que si rien ne l'a modifiée depuis. */
     val appliedAt: Long = 0,
+    /** Vrai si seul le statut personnel de l'auditeur a changé (mode familial, aucun déplacement Drive). */
+    val personalOnly: Boolean = false,
 ) {
-    val changed: Boolean get() = fromParentId != toParentId
+    val changed: Boolean get() = if (personalOnly) from != to else fromParentId != toParentId
 }
 
 /**
- * Gestes de statut : chaque geste s'inscrit dans la file d'opérations en base (déplacement du
- * dossier dans Drive), le statut affiché change aussitôt, et le moteur est sollicité. Fonctionne
- * hors ligne : le déplacement sera rejoué au retour du réseau.
+ * Gestes de statut :
+ * - En mode [StatusSyncMode.SHARED_DRIVE], chaque geste s'inscrit dans la file d'opérations en base
+ *   (déplacement du dossier dans Drive).
+ * - En mode [StatusSyncMode.PERSONAL_FAMILY], le geste met uniquement à jour le statut personnel de
+ *   l'auditeur actif dans [ProgressEntity] (synchronisé via `.audiotheque-progress-<profil>.json`),
+ *   sans déplacer les dossiers Drive des autres membres de la famille.
  */
 class StatusGestures(
     private val db: AppDatabase,
     private val settings: SettingsRepository,
     private val sync: SyncRequester,
     private val clock: Clock = Clock.SYSTEM,
+    private val onProgressDirty: (String) -> Unit = {},
 ) {
     private val books = db.bookDao()
     private val ops = db.pendingOperationDao()
@@ -303,16 +380,22 @@ class StatusGestures(
         val previous = progressDao.get(bookId, account)
         val moved = moveTo(bookId, gesture.target) ?: return null
         val now = clock.now()
+        val base = progressDao.get(bookId, account)
+        var progressTouched = moved.personalOnly
         when (gesture) {
-            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> previous?.let {
+            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> base?.let {
                 progressDao.upsert(it.copy(setAsideAtPercent = it.percent, updatedAt = now, dirty = true))
+                progressTouched = true
             }
-            Gesture.MARQUER_ECOUTE -> progressDao.upsert(
-                (previous ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
-                    .copy(finished = true, updatedAt = now, dirty = true),
-            )
+            Gesture.MARQUER_ECOUTE -> {
+                progressDao.upsert(
+                    (base ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now))
+                        .copy(finished = true, updatedAt = now, dirty = true),
+                )
+                progressTouched = true
+            }
             // Réécouter repart du début d'un livre fini ; un livre pas fini garde sa position.
-            Gesture.REECOUTER -> previous?.takeIf { it.finished || it.percent >= FINISHED_PERCENT }?.let {
+            Gesture.REECOUTER -> base?.takeIf { it.finished || it.percent >= FINISHED_PERCENT }?.let {
                 progressDao.upsert(
                     it.copy(
                         trackId = null,
@@ -325,24 +408,97 @@ class StatusGestures(
                         dirty = true,
                     ),
                 )
+                progressTouched = true
             }
             else -> Unit
         }
+        if (progressTouched) onProgressDirty(bookId)
         return moved.copy(gesture = gesture, previousProgress = previous, appliedAt = now)
     }
 
-    /** Déplacement vers n'importe quel statut (fiche livre, « Annuler »). */
+    /**
+     * Changement de statut selon le mode actif :
+     * - si [targetPairId] est fourni, déplace physiquement le dossier dans Drive ([moveDriveFolder]) ;
+     * - sinon, suit [StatusSyncMode.PERSONAL_FAMILY] ou [StatusSyncMode.SHARED_DRIVE].
+     */
     suspend fun moveTo(bookId: String, target: BookStatus, targetPairId: Long? = null): MoveResult? {
-        val pairs = db.syncPairDao()
-        val targetPair = targetPairId?.let { pairs.get(it) } ?: pairs.forStatus(target) ?: return null
+        val s = settings.current()
+        if (targetPairId == null && s.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY) {
+            return movePersonal(bookId, target, s.accountKey)
+        }
+        return moveDriveFolderInternal(bookId, target, targetPairId, clearPersonalStatus = s.statusSyncMode == StatusSyncMode.SHARED_DRIVE)
+    }
+
+    /**
+     * Déplacement explicite du dossier dans Google Drive (menu « Déplacer le dossier dans Drive… »),
+     * même lorsque le mode familial est activé.
+     */
+    suspend fun moveDriveFolder(bookId: String, targetPairId: Long): MoveResult? {
+        val s = settings.current()
+        val pair = db.syncPairDao().get(targetPairId) ?: return null
+        return moveDriveFolderInternal(
+            bookId = bookId,
+            target = pair.status,
+            targetPairId = targetPairId,
+            clearPersonalStatus = s.statusSyncMode == StatusSyncMode.SHARED_DRIVE,
+        )
+    }
+
+    private suspend fun movePersonal(bookId: String, target: BookStatus, account: String): MoveResult? {
+        val progressDao = db.progressDao()
         val result = db.withTransaction {
             val book = books.get(bookId) ?: return@withTransaction null
-            val from = book.effectiveStatus
+            if (book.trashPending || ops.latestOfType(bookId, OperationType.TRASH_BOOK) != null) return@withTransaction null
+            val existing = progressDao.get(bookId, account)
+            val from = book.userEffectiveStatus(existing?.personalStatus)
+            val now = maxOf(clock.now(), (existing?.personalStatusChangedAt ?: 0L) + 1L)
+            val updated = (existing ?: ProgressEntity(bookId = bookId, account = account, updatedAt = 0L)).copy(
+                personalStatus = target,
+                personalStatusChangedAt = now,
+                dirty = true,
+            )
+            progressDao.upsert(updated)
+            MoveResult(
+                bookId = bookId,
+                title = book.displayTitle,
+                from = from,
+                to = target,
+                fromParentId = book.effectiveParentId,
+                toParentId = book.effectiveParentId,
+                previousProgress = existing,
+                appliedAt = now,
+                personalOnly = true,
+            )
+        } ?: return null
+        onProgressDirty(bookId)
+        if (result.changed) sync.requestSync(SyncTrigger.STATUS_CHANGE)
+        return result
+    }
+
+    private suspend fun moveDriveFolderInternal(
+        bookId: String,
+        target: BookStatus,
+        targetPairId: Long?,
+        clearPersonalStatus: Boolean,
+    ): MoveResult? {
+        val pairs = db.syncPairDao()
+        val targetPair = targetPairId?.let { pairs.get(it) } ?: pairs.forStatus(target) ?: return null
+        val account = settings.current().accountKey
+        var personalCleared = false
+        val result = db.withTransaction {
+            val book = books.get(bookId) ?: return@withTransaction null
+            val existingProgress = db.progressDao().get(bookId, account)
+            val from = if (clearPersonalStatus) book.userEffectiveStatus(existingProgress?.personalStatus) else book.effectiveStatus
             val fromParentId = book.effectiveParentId
             // Suppression en file : plus de geste de statut sur ce livre.
             if (book.trashPending || ops.latestOfType(bookId, OperationType.TRASH_BOOK) != null) return@withTransaction null
             val existing = ops.latestOfType(bookId, OperationType.MOVE_BOOK)
             val now = clock.now()
+            if (clearPersonalStatus && existingProgress?.personalStatus != null) {
+                val statusNow = maxOf(now, (existingProgress.personalStatusChangedAt ?: 0L) + 1L)
+                db.progressDao().upsert(existingProgress.copy(personalStatus = null, personalStatusChangedAt = statusNow, dirty = true))
+                personalCleared = true
+            }
             if (existing != null) {
                 // Un déplacement est déjà en file : on change sa cible (ou on revient au départ).
                 ops.update(
@@ -375,47 +531,118 @@ class StatusGestures(
                 )
                 books.setPending(bookId, targetPair.status, targetPair.driveFolderId, now)
             }
-            MoveResult(bookId, book.displayTitle, from, targetPair.status, fromParentId, targetPair.driveFolderId)
+            MoveResult(bookId, book.displayTitle, from, targetPair.status, fromParentId, targetPair.driveFolderId, previousProgress = existingProgress, appliedAt = now)
         } ?: return null
-        if (result.changed) sync.requestSync(SyncTrigger.STATUS_CHANGE)
+        if (personalCleared) onProgressDirty(bookId)
+        if (result.changed || personalCleared) sync.requestSync(SyncTrigger.STATUS_CHANGE)
         return result
     }
 
     /**
-     * « Annuler » (bandeau affiché 10 s après un geste) : le livre retourne dans son dossier de
-     * départ (pas seulement le premier dossier du même statut) et la progression modifiée par le
-     * geste est rétablie.
+     * « Annuler » (bandeau affiché 10 s après un geste) : le livre retourne dans son état ou son
+     * dossier de départ et la progression modifiée par le geste est rétablie.
      */
     suspend fun undo(result: MoveResult): MoveResult? {
+        if (result.personalOnly) {
+            return undoPersonal(result)
+        }
         val back = db.syncPairDao().forFolder(result.fromParentId)
-        val undone = if (back != null) moveTo(result.bookId, back.status, back.id) else moveTo(result.bookId, result.from)
+        val undone = if (back != null) {
+            moveDriveFolderInternal(result.bookId, back.status, back.id, clearPersonalStatus = false)
+        } else {
+            moveDriveFolderInternal(result.bookId, result.from, null, clearPersonalStatus = false)
+        }
         restoreProgress(result)
         return undone
     }
 
-    private suspend fun restoreProgress(result: MoveResult) {
-        val gesture = result.gesture ?: return
-        val dao = db.progressDao()
-        val current = dao.get(result.bookId, settings.current().accountKey) ?: return
-        val previous = result.previousProgress
-        val restored = when (gesture) {
-            Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> current.copy(setAsideAtPercent = previous?.setAsideAtPercent)
-            Gesture.MARQUER_ECOUTE -> current.copy(finished = previous?.finished ?: false)
-            Gesture.REECOUTER -> {
-                // Position remise seulement si rien ne l'a changée depuis (lecture lancée entre-temps).
-                if (previous == null || current.updatedAt != result.appliedAt) return
-                current.copy(
-                    trackId = previous.trackId,
-                    trackIndex = previous.trackIndex,
-                    positionMs = previous.positionMs,
-                    percent = previous.percent,
-                    finished = previous.finished,
-                    setAsideAtPercent = previous.setAsideAtPercent,
-                )
+    private suspend fun undoPersonal(result: MoveResult): MoveResult? {
+        val account = settings.current().accountKey
+        val progressDao = db.progressDao()
+        val undone = db.withTransaction {
+            val book = books.get(result.bookId) ?: return@withTransaction null
+            val current = progressDao.get(result.bookId, account) ?: return@withTransaction null
+            val previous = result.previousProgress
+            val statusNow = maxOf(clock.now(), (current.personalStatusChangedAt ?: 0L) + 1L)
+            var restored = current.copy(
+                personalStatus = previous?.personalStatus,
+                personalStatusChangedAt = statusNow,
+                dirty = true,
+            )
+            when (result.gesture) {
+                Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> {
+                    restored = restored.copy(setAsideAtPercent = previous?.setAsideAtPercent, updatedAt = clock.now())
+                }
+                Gesture.MARQUER_ECOUTE -> {
+                    restored = restored.copy(finished = previous?.finished ?: false, updatedAt = clock.now())
+                }
+                Gesture.REECOUTER -> {
+                    if (previous != null && current.updatedAt == result.appliedAt) {
+                        restored = restored.copy(
+                            trackId = previous.trackId,
+                            trackIndex = previous.trackIndex,
+                            positionMs = previous.positionMs,
+                            percent = previous.percent,
+                            finished = previous.finished,
+                            setAsideAtPercent = previous.setAsideAtPercent,
+                            updatedAt = clock.now(),
+                        )
+                    }
+                }
+                else -> Unit
             }
-            else -> return
+            progressDao.upsert(restored)
+            val toStatus = book.userEffectiveStatus(restored.personalStatus)
+            MoveResult(
+                bookId = result.bookId,
+                title = book.displayTitle,
+                from = result.to,
+                to = toStatus,
+                fromParentId = book.effectiveParentId,
+                toParentId = book.effectiveParentId,
+                personalOnly = true,
+            )
+        } ?: return null
+        onProgressDirty(result.bookId)
+        sync.requestSync(SyncTrigger.STATUS_CHANGE)
+        return undone
+    }
+
+    private suspend fun restoreProgress(result: MoveResult) {
+        val account = settings.current().accountKey
+        val dao = db.progressDao()
+        val current = dao.get(result.bookId, account) ?: return
+        val previous = result.previousProgress
+        var restored = if (previous?.personalStatus != null && current.personalStatus == null) {
+            val statusNow = maxOf(clock.now(), (current.personalStatusChangedAt ?: 0L) + 1L)
+            current.copy(personalStatus = previous.personalStatus, personalStatusChangedAt = statusNow)
+        } else {
+            current
         }
-        if (restored != current) dao.upsert(restored.copy(updatedAt = clock.now(), dirty = true))
+        val gesture = result.gesture
+        if (gesture != null) {
+            restored = when (gesture) {
+                Gesture.METTRE_DE_COTE, Gesture.PLUS_TARD -> restored.copy(setAsideAtPercent = previous?.setAsideAtPercent)
+                Gesture.MARQUER_ECOUTE -> restored.copy(finished = previous?.finished ?: false)
+                Gesture.REECOUTER -> {
+                    // Position remise seulement si rien ne l'a changée depuis (lecture lancée entre-temps).
+                    if (previous == null || current.updatedAt != result.appliedAt) restored
+                    else restored.copy(
+                        trackId = previous.trackId,
+                        trackIndex = previous.trackIndex,
+                        positionMs = previous.positionMs,
+                        percent = previous.percent,
+                        finished = previous.finished,
+                        setAsideAtPercent = previous.setAsideAtPercent,
+                    )
+                }
+                else -> restored
+            }
+        }
+        if (restored != current) {
+            dao.upsert(restored.copy(updatedAt = clock.now(), dirty = true))
+            onProgressDirty(result.bookId)
+        }
     }
 
     // ------------------------------------------------------------------ renommage normalisé Drive
@@ -536,8 +763,12 @@ data class RenameResult(
 /** Suppression d'un doublon demandée : de quoi afficher « Annuler » pendant 10 s. */
 data class TrashResult(val bookId: String, val title: String, val folderName: String)
 
-/** Corrections de titre, d'auteur et de voix, stockées par l'app (le dossier n'est pas renommé). */
-class BookEditor(private val db: AppDatabase) {
+/** Corrections de titre, d'auteur et de voix, partagées avec la famille via `.audiotheque-meta.json`. */
+class BookEditor(
+    private val db: AppDatabase,
+    private val clock: Clock = Clock.SYSTEM,
+    private val onMetadataDirty: (String) -> Unit = {},
+) {
 
     suspend fun save(bookId: String, title: String, author: String, narrator: String) {
         val book = db.bookDao().get(bookId) ?: return
@@ -552,24 +783,39 @@ class BookEditor(private val db: AppDatabase) {
         val automaticNarrator = book.tagNarrator ?: book.parsedNarrator ?: ""
         val customNarrator = if (n == automaticNarrator) null else n
         val shownAuthor = customAuthor ?: book.parsedAuthor
-        db.bookDao().updateCorrections(bookId, customTitle, customAuthor, customNarrator, true, TextNormalizer.key(t), TextNormalizer.keyOrNull(shownAuthor))
+        db.bookDao().updateCorrections(
+            id = bookId,
+            title = customTitle,
+            author = customAuthor,
+            narrator = customNarrator,
+            confirmed = true,
+            key = TextNormalizer.key(t),
+            authorKey = TextNormalizer.keyOrNull(shownAuthor),
+            updatedAt = clock.now(),
+        )
+        onMetadataDirty(bookId)
     }
 
     /** Accepte le découpage proposé tel quel. */
     suspend fun confirm(bookId: String) {
         val book = db.bookDao().get(bookId) ?: return
         db.bookDao().updateCorrections(
-            bookId,
-            book.customTitle,
-            book.customAuthor,
-            book.customNarrator,
-            true,
-            TextNormalizer.key(book.displayTitle),
-            book.expectedAuthorKey,
+            id = bookId,
+            title = book.customTitle,
+            author = book.customAuthor,
+            narrator = book.customNarrator,
+            confirmed = true,
+            key = TextNormalizer.key(book.displayTitle),
+            authorKey = book.expectedAuthorKey,
+            updatedAt = clock.now(),
         )
+        onMetadataDirty(bookId)
     }
 
-    suspend fun setHidden(bookId: String, hidden: Boolean) = db.bookDao().setHidden(bookId, hidden)
+    suspend fun setHidden(bookId: String, hidden: Boolean) {
+        db.bookDao().setHidden(bookId, hidden, updatedAt = clock.now())
+        onMetadataDirty(bookId)
+    }
 }
 
 /** Durée totale et position globale d'un livre, pour l'affichage de l'avancement. */
