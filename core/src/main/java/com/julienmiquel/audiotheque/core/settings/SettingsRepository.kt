@@ -82,6 +82,8 @@ data class AppSettings(
     val wifiOnly: Boolean = true,
     val syncIntervalHours: Int = 6,
     val requireBatteryNotLow: Boolean = true,
+    /** Mode streaming activé par défaut : seules les pistes N-1, N et N+1 du livre en écoute sont chargées sur le disque ; désactivé : tout le reste à écouter est téléchargé et chaque piste écoutée est supprimée. */
+    val streamingMode: Boolean = true,
     /** Délais de nettoyage : pistes de _A écouter plus tard gardées 7 jours, de _Ecouté 24 h. */
     val laterRetentionDays: Int = 7,
     val doneRetentionHours: Int = 24,
@@ -206,6 +208,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         val wifiOnly = booleanPreferencesKey("wifi_only")
         val syncIntervalHours = intPreferencesKey("sync_interval_hours")
         val requireBatteryNotLow = booleanPreferencesKey("battery_not_low")
+        val streamingMode = booleanPreferencesKey("streaming_mode")
         val laterRetentionDays = intPreferencesKey("later_retention_days")
         val doneRetentionHours = intPreferencesKey("done_retention_hours")
         val skipSeconds = intPreferencesKey("skip_seconds")
@@ -253,6 +256,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
             wifiOnly = this[K.wifiOnly] ?: d.wifiOnly,
             syncIntervalHours = this[K.syncIntervalHours] ?: d.syncIntervalHours,
             requireBatteryNotLow = this[K.requireBatteryNotLow] ?: d.requireBatteryNotLow,
+            streamingMode = this[K.streamingMode] ?: d.streamingMode,
             laterRetentionDays = this[K.laterRetentionDays] ?: d.laterRetentionDays,
             doneRetentionHours = this[K.doneRetentionHours] ?: d.doneRetentionHours,
             skipSeconds = this[K.skipSeconds] ?: d.skipSeconds,
@@ -286,6 +290,7 @@ class SettingsRepository(private val dataStore: DataStore<Preferences>) {
         p[K.wifiOnly] = wifiOnly
         p[K.syncIntervalHours] = syncIntervalHours
         p[K.requireBatteryNotLow] = requireBatteryNotLow
+        p[K.streamingMode] = streamingMode
         p[K.laterRetentionDays] = laterRetentionDays
         p[K.doneRetentionHours] = doneRetentionHours
         p[K.skipSeconds] = skipSeconds

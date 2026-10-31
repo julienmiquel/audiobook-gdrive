@@ -81,6 +81,7 @@ import com.julienmiquel.audiotheque.core.settings.AppSettings
 import com.julienmiquel.audiotheque.core.settings.ListenerProfile
 import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
 import com.julienmiquel.audiotheque.core.settings.ThemeMode
+import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.ui.common.InfoCard
 import com.julienmiquel.audiotheque.ui.common.Labels
 import com.julienmiquel.audiotheque.ui.common.LocalAppContainer
@@ -96,6 +97,7 @@ import kotlinx.coroutines.withContext
 
 class SettingsViewModel(private val c: AppContainer) : ViewModel() {
     val settings: StateFlow<AppSettings?> = c.settings.settings.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
+    val localBytes: StateFlow<Long> = c.database.trackDao().observeLocalBytes().stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), 0L)
 
     private val _storageGranted = MutableStateFlow(c.storage.sharedStorageGranted())
     val storageGranted: StateFlow<Boolean> = _storageGranted.asStateFlow()
@@ -128,6 +130,10 @@ class SettingsViewModel(private val c: AppContainer) : ViewModel() {
             c.requestSync(SyncTrigger.MANUAL)
         }
     }
+
+    fun setStreamingMode(enabled: Boolean) = c.setStreamingMode(enabled)
+
+    fun deleteAllLocalFiles() = c.deleteAllLocalFiles()
 
     fun switchProfile(profileKey: String?) = c.switchProfile(profileKey)
 
@@ -217,6 +223,7 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
     val container = LocalAppContainer.current
     val vm: SettingsViewModel = viewModel { SettingsViewModel(container) }
     val settings by vm.settings.collectAsStateWithLifecycle()
+    val localBytes by vm.localBytes.collectAsStateWithLifecycle()
     val granted by vm.storageGranted.collectAsStateWithLifecycle()
     val path by vm.storagePath.collectAsStateWithLifecycle()
     val signingOut by vm.signingOut.collectAsStateWithLifecycle()
@@ -224,6 +231,7 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
     val discoveringProfiles by vm.discoveringProfiles.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var confirmSignOut by remember { mutableStateOf(false) }
+    var confirmDeleteAllLocal by remember { mutableStateOf(false) }
     var addingProfile by rememberSaveable { mutableStateOf(false) }
     var profileToRemove by remember { mutableStateOf<ListenerProfile?>(null) }
 
@@ -399,6 +407,12 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
             }
 
             InfoCard(title = "Nettoyage du téléphone") {
+                ToggleRow(
+                    "Mode streaming (pistes N-1, N et N+1)",
+                    "Par défaut : seules la piste précédente, la piste en cours et la suivante sont chargées sur le téléphone. Désactivé : toutes les pistes à écouter sont téléchargées et chaque piste écoutée est supprimée.",
+                    s.streamingMode,
+                    vm::setStreamingMode,
+                )
                 Text("Pistes de _A écouter plus tard gardées", style = MaterialTheme.typography.bodyLarge)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     AppSettings.LATER_RETENTION_CHOICES.forEach { d ->
@@ -412,10 +426,24 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
                     }
                 }
                 Text(
-                    "Seul _En écoute garde toutes ses pistes. Rien n'est supprimé avant que Drive ait confirmé le déplacement, ni dans les 10 minutes qui suivent ; le livre en cours de lecture n'est jamais nettoyé.",
+                    "Les livres épinglés (« Garder hors ligne ») conservent toujours toutes leurs pistes. Rien n'est supprimé lors d'un changement de statut avant que Drive ait confirmé le déplacement, ni dans les 10 minutes qui suivent ; la piste en cours de lecture n'est jamais supprimée.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                OutlinedButton(
+                    onClick = { confirmDeleteAllLocal = true },
+                    enabled = localBytes > 0L,
+                ) {
+                    Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        if (localBytes > 0L) {
+                            "Supprimer tous les fichiers locaux (${Formats.size(localBytes)})…"
+                        } else {
+                            "Aucun fichier audio sur le téléphone"
+                        },
+                    )
+                }
             }
 
             InfoCard(title = "Lecture") {
@@ -584,6 +612,27 @@ fun SettingsScreen(onBack: () -> Unit, onOpenStats: () -> Unit = {}, contentPadd
                 }) { Text("Retirer") }
             },
             dismissButton = { TextButton(onClick = { profileToRemove = null }) { Text("Annuler") } },
+        )
+    }
+
+    if (confirmDeleteAllLocal) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteAllLocal = false },
+            icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+            title = { Text("Supprimer tous les fichiers locaux ?") },
+            text = {
+                Text(
+                    "Toutes les pistes audio téléchargées (${Formats.size(localBytes)}) seront effacées du téléphone pour libérer de la place. " +
+                        "Vos fichiers sur Google Drive, vos progressions, vos pochettes et vos signets sont conservés.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeleteAllLocal = false
+                    vm.deleteAllLocalFiles()
+                }) { Text("Supprimer du téléphone") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteAllLocal = false }) { Text("Annuler") } },
         )
     }
 

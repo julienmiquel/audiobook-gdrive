@@ -281,10 +281,11 @@ class MultiUserSyncTest {
         val children = fake.listChildren(police.driveId).map { it.name }
         assertThat(children).contains(ProgressJson.fileName("julie"))
 
-        // Sur le téléphone : toutes les pistes sont inventoriées et téléchargées pour l'écoute hors ligne de Julie.
+        // Sur le téléphone : en mode streaming par défaut (N=0), les pistes 0 et 1 sont téléchargées pour Julie.
         val tracks = db1.trackDao().forBook(police.driveId)
         assertThat(tracks).hasSize(3)
-        assertThat(tracks.all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+        assertThat(tracks.take(2).all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+        assertThat(tracks[2].state).isEqualTo(TrackState.ABSENT)
 
         // Clément pose aussi une progression sur un autre livre -> discoverRemoteProfiles détecte julie & clement.
         val yoga = bookIn(db1, "Yoga - Emmanuel Carrère")
@@ -306,7 +307,9 @@ class MultiUserSyncTest {
         val julienBook = db1.bookDao().get(police.driveId)!!
         val julienProgress = db1.progressDao().get(police.driveId, FakeDriveService.ACCOUNT)
         assertThat(julienBook.userEffectiveStatus(julienProgress?.personalStatus)).isEqualTo(BookStatus.NEW)
-        assertThat(db1.trackDao().forBook(police.driveId).all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+        val afterReturn = db1.trackDao().forBook(police.driveId)
+        assertThat(afterReturn.take(2).all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+        assertThat(afterReturn[2].state).isEqualTo(TrackState.ABSENT)
     }
 
     @Test

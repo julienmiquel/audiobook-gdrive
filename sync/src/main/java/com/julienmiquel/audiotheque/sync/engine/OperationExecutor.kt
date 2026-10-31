@@ -398,6 +398,31 @@ class LocalFiles(private val db: AppDatabase, private val storage: LocalStorage)
         freed
     }
 
+    /**
+     * Supprime tous les fichiers audio locaux d'un livre (pistes et « .part »), remet l'état des
+     * pistes à [TrackState.ABSENT] et nettoie les sous-dossiers vides, tout en conservant le livre
+     * dans la bibliothèque et sa pochette locale. Retourne le nombre d'octets libérés.
+     */
+    suspend fun deleteBookAudioFiles(book: BookEntity): Long = withContext(Dispatchers.IO) {
+        var freed = 0L
+        for (track in db.trackDao().forBook(book.driveId)) {
+            freed += deleteTrackFiles(track, updateDb = true)
+        }
+        book.localDirName?.let { dirName ->
+            val dir = File(storage.root(), dirName)
+            if (dir.isDirectory) {
+                dir.walkBottomUp().forEach { f ->
+                    if (f.isFile && (f.name.endsWith(".part", ignoreCase = true) || f.name.endsWith(".zip", ignoreCase = true))) {
+                        freed += f.length()
+                        f.delete()
+                    }
+                }
+                deleteEmptyDirs(dir)
+            }
+        }
+        freed
+    }
+
     /** Toutes les pistes d'un livre et sa pochette locale ; retourne les octets libérés (pistes). */
     suspend fun deleteBookFiles(book: BookEntity): Long {
         var freed = 0L

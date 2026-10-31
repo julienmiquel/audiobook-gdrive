@@ -50,16 +50,25 @@ fun interface Clock {
 }
 
 /**
- * Livre chargé dans le lecteur : le nettoyage ne supprime jamais ses pistes, même s'il n'est
- * plus dans _En écoute (aperçu, réécoute sans changement de statut).
+ * Livre et piste chargés dans le lecteur : le nettoyage ne supprime jamais la piste en cours de
+ * lecture, ni un livre hors _En écoute tant qu'il est ouvert dans le lecteur (aperçu, réécoute).
  */
 object BookInUse {
     private val current = MutableStateFlow<String?>(null)
+    private val currentTrack = MutableStateFlow<String?>(null)
     val bookId: StateFlow<String?> = current.asStateFlow()
+    val trackId: StateFlow<String?> = currentTrack.asStateFlow()
 
-    fun set(bookId: String?) {
+    fun set(bookId: String?, trackId: String? = null) {
         current.value = bookId
+        currentTrack.value = if (bookId != null) trackId else null
+    }
+
+    fun setTrack(trackId: String?) {
+        if (current.value != null) currentTrack.value = trackId
     }
 
     fun isInUse(bookId: String): Boolean = current.value == bookId
+
+    fun isTrackInUse(trackId: String): Boolean = currentTrack.value == trackId
 }

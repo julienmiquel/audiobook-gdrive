@@ -13,6 +13,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -53,6 +54,7 @@ fun MiniPlayerBar(
     onTogglePlay: () -> Unit,
     onSeekBack: () -> Unit,
     modifier: Modifier = Modifier,
+    waitingForDownload: Boolean = false,
 ) {
     val isLoadedBook = playerState.bookId == item.id
     val livePercent = remember(isLoadedBook, tracks, item.book.durationMs, playerState.trackId, playerState.trackPositionMs, item.percent) {
@@ -75,15 +77,17 @@ fun MiniPlayerBar(
     }
 
     val subtitle = buildList {
-        if (currentChapterText != null) {
+        if (waitingForDownload) {
+            add("Téléchargement…")
+        } else if (currentChapterText != null) {
             add(currentChapterText)
         } else if (!item.author.isNullOrBlank()) {
             add(item.author)
         }
         if (livePercent > 0f) {
             add(Formats.percent(livePercent))
-        } else if (!isLoadedBook) {
-            add("Prêt à écouter")
+        } else if (!isLoadedBook && !waitingForDownload) {
+            add(if (item.presentTracks > 0) "Prêt à écouter" else "À télécharger")
         }
     }.joinToString(" · ")
 
@@ -151,10 +155,19 @@ fun MiniPlayerBar(
                     onClick = onTogglePlay,
                     modifier = Modifier.size(40.dp),
                 ) {
-                    Icon(
-                        imageVector = if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        contentDescription = if (playing) "Mettre en pause" else "Lire ${item.title}",
-                    )
+                    if (waitingForDownload) {
+                        CircularProgressIndicator(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .semantics { contentDescription = "Annuler le lancement automatique" },
+                            strokeWidth = 2.dp,
+                        )
+                    } else {
+                        Icon(
+                            imageVector = if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (playing) "Mettre en pause" else "Lire ${item.title}",
+                        )
+                    }
                 }
             }
             HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))

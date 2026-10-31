@@ -45,6 +45,7 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.Downloading
 import androidx.compose.material.icons.filled.FolderZip
@@ -60,6 +61,7 @@ import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.WatchLater
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -79,6 +81,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TopAppBar
@@ -335,8 +338,10 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
 
     fun gesture(item: LibraryItem, gesture: Gesture) = c.applyGesture(item.id, gesture)
 
+    fun deleteLocalFiles(item: LibraryItem) = c.deleteLocalBookFiles(item.id)
+
     fun play(item: LibraryItem) {
-        viewModelScope.launch { c.playBook(item.id) }
+        c.playOrDownloadBook(item.id)
     }
 
     companion object {
@@ -360,6 +365,11 @@ class LibraryViewModel(private val c: AppContainer) : ViewModel() {
             }
             return statusTabs + collections
         }
+
+        /** Lecture directe ou reprise avec téléchargement à la demande depuis la liste/grille. */
+        fun canPlayInline(item: LibraryItem): Boolean =
+            (item.presentTracks > 0 && (item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION)) ||
+                (item.status == BookStatus.IN_PROGRESS && item.trackCount > 0)
 
         /** Geste proposé directement dans la liste. */
         fun inlineGesture(item: LibraryItem): Gesture? = when (item.status) {
@@ -389,6 +399,7 @@ fun LibraryScreen(
     var narratorMenu by remember { mutableStateOf(false) }
     var profileMenu by remember { mutableStateOf(false) }
     var pulling by remember { mutableStateOf(false) }
+    var itemToDeleteLocal by remember { mutableStateOf<LibraryItem?>(null) }
 
     LaunchedEffect(state.selected?.key) { vm.refreshIfStale(state.selected) }
     LaunchedEffect(pulling, state.engine.running) {
@@ -512,6 +523,7 @@ fun LibraryScreen(
                         onOpenBook = onOpenBook,
                         onGesture = vm::gesture,
                         onPlay = onPlayBook,
+                        onDeleteLocal = { itemToDeleteLocal = it },
                     )
                 } else {
                     BookList(
@@ -519,10 +531,32 @@ fun LibraryScreen(
                         onOpenBook = onOpenBook,
                         onGesture = vm::gesture,
                         onPlay = onPlayBook,
+                        onDeleteLocal = { itemToDeleteLocal = it },
                     )
                 }
             }
         }
+    }
+
+    itemToDeleteLocal?.let { target ->
+        AlertDialog(
+            onDismissRequest = { itemToDeleteLocal = null },
+            icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+            title = { Text("Supprimer les fichiers locaux ?") },
+            text = {
+                Text(
+                    "Les ${Labels.tracks(target.presentTracks)} téléchargées de « ${target.title} » seront effacées du téléphone pour libérer de la place. " +
+                        "Vos fichiers Google Drive, votre progression, la pochette et vos signets sont conservés.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteLocalFiles(target)
+                    itemToDeleteLocal = null
+                }) { Text("Supprimer du téléphone") }
+            },
+            dismissButton = { TextButton(onClick = { itemToDeleteLocal = null }) { Text("Annuler") } },
+        )
     }
 }
 
@@ -752,6 +786,7 @@ private fun BookList(
     onOpenBook: (String) -> Unit,
     onGesture: (LibraryItem, Gesture) -> Unit,
     onPlay: (LibraryItem) -> Unit,
+    onDeleteLocal: (LibraryItem) -> Unit,
 ) {
     val listState = rememberLazyListState()
     LazyColumn(state = listState, modifier = Modifier.fillMaxSize(), contentPadding = PaddingValues(bottom = 24.dp)) {
@@ -783,6 +818,7 @@ private fun BookList(
                 onClick = { onOpenBook(item.id) },
                 onGesture = { onGesture(item, it) },
                 onPlay = { onPlay(item) },
+                onDeleteLocal = { onDeleteLocal(item) },
             )
             HorizontalDivider(Modifier.padding(start = 88.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f))
         }
@@ -795,6 +831,7 @@ private fun BookGrid(
     onOpenBook: (String) -> Unit,
     onGesture: (LibraryItem, Gesture) -> Unit,
     onPlay: (LibraryItem) -> Unit,
+    onDeleteLocal: (LibraryItem) -> Unit,
 ) {
     val gridState = rememberLazyGridState()
     LazyVerticalGrid(
@@ -830,6 +867,7 @@ private fun BookGrid(
                 onClick = { onOpenBook(item.id) },
                 onGesture = { onGesture(item, it) },
                 onPlay = { onPlay(item) },
+                onDeleteLocal = { onDeleteLocal(item) },
             )
         }
     }
@@ -842,9 +880,11 @@ private fun BookGridCard(
     onClick: () -> Unit,
     onGesture: (Gesture) -> Unit,
     onPlay: () -> Unit,
+    onDeleteLocal: () -> Unit = {},
 ) {
     var menu by remember { mutableStateOf(false) }
     val gestures = Gesture.forStatus(item.status)
+    val hasMenu = gestures.isNotEmpty() || item.presentTracks > 0
     Box {
         OutlinedCard(
             modifier = Modifier
@@ -852,8 +892,8 @@ private fun BookGridCard(
                 .clip(CardDefaults.outlinedShape)
                 .combinedClickable(
                     onClickLabel = "Ouvrir la fiche",
-                    onLongClickLabel = "Changer de statut",
-                    onLongClick = { if (gestures.isNotEmpty()) menu = true },
+                    onLongClickLabel = "Actions sur le livre",
+                    onLongClick = { if (hasMenu) menu = true },
                     onClick = onClick,
                 ),
             border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
@@ -943,7 +983,7 @@ private fun BookGridCard(
                         )
                         val gesture = LibraryViewModel.inlineGesture(item)
                         when {
-                            item.presentTracks > 0 && (item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION) ->
+                            LibraryViewModel.canPlayInline(item) ->
                                 FilledTonalIconButton(
                                     onClick = onPlay,
                                     modifier = Modifier.size(32.dp),
@@ -974,6 +1014,17 @@ private fun BookGridCard(
                     onClick = {
                         menu = false
                         onGesture(g)
+                    },
+                )
+            }
+            if (item.presentTracks > 0) {
+                if (gestures.isNotEmpty()) HorizontalDivider()
+                DropdownMenuItem(
+                    text = { Text("Supprimer les fichiers locaux…") },
+                    leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+                    onClick = {
+                        menu = false
+                        onDeleteLocal()
                     },
                 )
             }
@@ -1071,7 +1122,7 @@ private fun EmptyLibrary(state: LibraryUiState) {
         state.totalBooks == 0 && state.engine.running -> EmptyState(Icons.Filled.Sync, "Première synchro en cours", "Inventaire de /AudioBook et de ses dossiers de statut…")
         state.offlineOnly -> EmptyState(Icons.Filled.OfflinePin, "Aucun livre hors ligne", "Aucun livre de cet onglet n'a encore de piste téléchargée sur le téléphone.")
         state.narrator != null -> EmptyState(Icons.Filled.RecordVoiceOver, "Aucun livre lu par ${state.narrator}", "dans cet onglet.")
-        status == BookStatus.IN_PROGRESS -> EmptyState(Icons.Filled.Headphones, "Aucun livre en écoute", "Commencez un livre depuis l'onglet Nouveaux : il sera téléchargé en entier pour l'écoute hors ligne.")
+        status == BookStatus.IN_PROGRESS -> EmptyState(Icons.Filled.Headphones, "Aucun livre en écoute", "Commencez un livre depuis l'onglet Nouveaux : ses pistes seront téléchargées automatiquement au fil de l'écoute.")
         status == BookStatus.NEW -> EmptyState(Icons.Filled.Inbox, "Aucun nouveau livre", "Les livres déposés dans _Nouveaux sur Drive apparaissent ici.")
         status == BookStatus.LATER -> EmptyState(Icons.Filled.WatchLater, "Rien à écouter plus tard", "Un livre mis de côté garde sa position et reprend là où il s'était arrêté.")
         status == BookStatus.DONE -> EmptyState(Icons.Filled.DoneAll, "Aucun livre écouté", "Les livres terminés sont rangés dans _Ecouté.")
@@ -1088,17 +1139,19 @@ fun BookRow(
     onClick: () -> Unit,
     onGesture: (Gesture) -> Unit,
     onPlay: () -> Unit,
+    onDeleteLocal: () -> Unit = {},
 ) {
     var menu by remember { mutableStateOf(false) }
     val gestures = Gesture.forStatus(item.status)
+    val hasMenu = gestures.isNotEmpty() || item.presentTracks > 0
     Box {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .combinedClickable(
                     onClickLabel = "Ouvrir la fiche",
-                    onLongClickLabel = "Changer de statut",
-                    onLongClick = { if (gestures.isNotEmpty()) menu = true },
+                    onLongClickLabel = "Actions sur le livre",
+                    onLongClick = { if (hasMenu) menu = true },
                     onClick = onClick,
                 )
                 .padding(horizontal = 16.dp, vertical = 10.dp),
@@ -1141,6 +1194,17 @@ fun BookRow(
                     },
                 )
             }
+            if (item.presentTracks > 0) {
+                if (gestures.isNotEmpty()) HorizontalDivider()
+                DropdownMenuItem(
+                    text = { Text("Supprimer les fichiers locaux…") },
+                    leadingIcon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+                    onClick = {
+                        menu = false
+                        onDeleteLocal()
+                    },
+                )
+            }
         }
     }
 }
@@ -1172,7 +1236,7 @@ private fun BookBadges(item: LibraryItem) {
 private fun InlineAction(item: LibraryItem, onGesture: (Gesture) -> Unit, onPlay: () -> Unit) {
     val gesture = LibraryViewModel.inlineGesture(item)
     when {
-        item.presentTracks > 0 && (item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION) ->
+        LibraryViewModel.canPlayInline(item) ->
             FilledTonalIconButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, contentDescription = "Écouter ${item.title}") }
         gesture != null ->
             FilledTonalButton(onClick = { onGesture(gesture) }, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)) {

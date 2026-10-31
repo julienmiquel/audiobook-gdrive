@@ -8,6 +8,7 @@ import com.julienmiquel.audiotheque.core.model.EventResult
 import com.julienmiquel.audiotheque.core.model.SyncEventType
 import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
+import com.julienmiquel.audiotheque.core.model.displayTitle
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
@@ -16,6 +17,7 @@ import com.julienmiquel.audiotheque.sync.drive.DriveAbout
 import com.julienmiquel.audiotheque.sync.drive.DriveAuthException
 import com.julienmiquel.audiotheque.sync.drive.DriveFile
 import com.julienmiquel.audiotheque.sync.drive.DriveService
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -88,6 +90,7 @@ class SyncEngine(
     private val clock: Clock = Clock.SYSTEM,
     deviceName: String = "Android",
     isBookInUse: (String) -> Boolean = { BookInUse.isInUse(it) },
+    isTrackInUse: (String) -> Boolean = { BookInUse.isTrackInUse(it) },
 ) {
     val transfers = TransferTracker()
     private val _status = MutableStateFlow(EngineStatus())
@@ -104,7 +107,7 @@ class SyncEngine(
     private val scanner = LibraryScanner(db, settings, history, localFiles, storage, clock, isBookInUse)
     private val prober = MetadataProber(db, settings, history, localFiles, storage, clock)
     private val downloader = Downloader(db, settings, storage, history, transfers, inspector, clock)
-    private val cleaner = Cleaner(db, settings, localFiles, storage, history, clock, isBookInUse)
+    private val cleaner = Cleaner(db, settings, localFiles, storage, history, clock, isBookInUse, isTrackInUse)
     private val progressSync = ProgressSync(db, history, clock, deviceName)
     private val metadataSync = MetadataSync(db, history, clock, deviceName)
     private val covers = CoverUploader(db, history)
@@ -212,6 +215,73 @@ class SyncEngine(
             cleaner.nextDeadline()
         } finally {
             mutex.unlock()
+        }
+    }
+
+    /**
+     * Nettoyage immédiat des pistes devenues inutiles d'un livre « En écoute » après un changement
+     * de piste ou la fin du livre (hors fenêtre N-1..N+1 en mode streaming, ou pistes écoutées hors
+     * mode streaming).
+     */
+    suspend fun onPlaybackTrackChanged(bookId: String): Long = cleaner.cleanBookInProgress(bookId, null)
+
+    /**
+     * Supprime manuellement tous les fichiers audio locaux d'un livre pour libérer de l'espace.
+     * Retire l'épingle « Garder sur ce téléphone » le cas échéant, mais conserve le livre, sa
+     * pochette, sa progression et ses signets (ainsi que tous les fichiers sur Google Drive).
+     */
+    suspend fun deleteLocalBookFiles(bookId: String): Long {
+        db.bookDao().setPinnedOffline(bookId, false)
+        if (transfers.transfers.value.values.any { it.bookId == bookId }) {
+            cancelCurrent()
+            awaitIdle()
+        }
+        val book = db.bookDao().get(bookId) ?: return 0L
+        val freed = localFiles.deleteBookAudioFiles(book)
+        if (freed > 0L) {
+            val dirPath = book.localDirName?.let { storage.displayPath(File(storage.root(), it)) } ?: book.displayTitle
+            history.log(
+                type = SyncEventType.LOCAL_DELETE,
+                path = dirPath,
+                book = book,
+                sizeBytes = freed,
+                message = "Suppression manuelle des fichiers locaux",
+            )
+        }
+        return freed
+    }
+
+    /**
+     * Supprime manuellement tous les fichiers audio présents sur le téléphone pour faire de la place.
+     * Annule toute synchro en cours, retire les épingles hors ligne et conserve la bibliothèque,
+     * les pochettes, la progression et les fichiers Google Drive.
+     */
+    suspend fun deleteAllLocalAudioFiles(): Long {
+        cancelCurrent()
+        return mutex.withLock {
+            var totalFreed = 0L
+            val allBooks = db.bookDao().all()
+            val bookIdsWithLocal = db.trackDao().withLocalData().map { it.bookId }.toSet()
+            for (book in allBooks) {
+                if (book.pinnedOffline) {
+                    db.bookDao().setPinnedOffline(book.driveId, false)
+                }
+                if (book.driveId in bookIdsWithLocal || book.localDirName != null) {
+                    val freed = localFiles.deleteBookAudioFiles(book)
+                    if (freed > 0L) {
+                        totalFreed += freed
+                        val dirPath = book.localDirName?.let { storage.displayPath(File(storage.root(), it)) } ?: book.displayTitle
+                        history.log(
+                            type = SyncEventType.LOCAL_DELETE,
+                            path = dirPath,
+                            book = book,
+                            sizeBytes = freed,
+                            message = "Suppression manuelle de tous les fichiers locaux",
+                        )
+                    }
+                }
+            }
+            totalFreed
         }
     }
 

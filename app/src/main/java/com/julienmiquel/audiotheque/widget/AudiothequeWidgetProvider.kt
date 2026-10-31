@@ -80,6 +80,9 @@ class AudiothequeWidgetProvider : AppWidgetProvider() {
         val targetBook = resolveTargetBook(app) ?: return
         val presentCount = app.container.database.trackDao().presentCount(targetBook.driveId)
         if (presentCount <= 0) {
+            if (action == ACTION_TOGGLE) {
+                app.container.playOrDownloadBook(targetBook.driveId)
+            }
             // Pas de piste locale : ouvre le lecteur pour afficher l'état.
             val open = Intent(context, MainActivity::class.java).apply {
                 flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP

@@ -71,6 +71,7 @@ class SyncEngineTest {
     private var free = Long.MAX_VALUE
     private var unmetered = true
     private var inUse: String? = null
+    private var trackInUse: String? = null
     private val clock = Clock { now }
 
     /** Enregistre les plages demandées (reprise de transfert par en-tête Range). */
@@ -119,7 +120,18 @@ class SyncEngineTest {
             override fun isConnected() = true
             override fun isUnmetered() = unmetered
         }
-        engine = SyncEngine(db, settings, { drive }, storage, network, inspector, clock, "test", isBookInUse = { it == inUse })
+        engine = SyncEngine(
+            db,
+            settings,
+            { drive },
+            storage,
+            network,
+            inspector,
+            clock,
+            "test",
+            isBookInUse = { it == inUse },
+            isTrackInUse = { it == trackInUse },
+        )
     }
 
     @After
@@ -147,7 +159,7 @@ class SyncEngineTest {
     private suspend fun events() = db.syncEventDao().observeRecent().first()
 
     @Test
-    fun `première synchro - inventaire complet, seul En écoute descend en entier`() = runBlocking<Unit> {
+    fun `première synchro - inventaire complet, mode streaming par défaut sur En écoute`() = runBlocking<Unit> {
         val outcome = engine.sync(SyncTrigger.LAUNCH)
         assertThat(outcome.result).isEqualTo(SyncResult.SUCCESS)
 
@@ -162,9 +174,11 @@ class SyncEngineTest {
         assertThat(civ.status).isEqualTo(BookStatus.IN_PROGRESS)
         val tracks = db.trackDao().forBook(civ.driveId)
         assertThat(tracks).hasSize(10)
-        assertThat(tracks.map { it.state }.toSet()).containsExactly(TrackState.PRESENT)
-        // Intégrité : plus de « .part », taille et checksum de Drive.
-        tracks.forEach { t ->
+        // Mode streaming par défaut (N=0) : seules les pistes 0 et 1 (N et N+1) sont téléchargées.
+        assertThat(tracks.take(2).map { it.state }.toSet()).containsExactly(TrackState.PRESENT)
+        assertThat(tracks.drop(2).map { it.state }.toSet()).containsExactly(TrackState.ABSENT)
+        // Intégrité : plus de « .part », taille et checksum de Drive sur les pistes téléchargées.
+        tracks.take(2).forEach { t ->
             val f = File(t.localPath!!)
             assertThat(f.exists()).isTrue()
             assertThat(File(f.path + ".part").exists()).isFalse()
@@ -175,7 +189,8 @@ class SyncEngineTest {
         assertThat(File(tracks.first().localPath!!).parentFile!!.name).isEqualTo("CIVILISATIONS - Laurent BINET")
         assertThat(tracks.map { it.part }).containsExactly(1, 1, 2, 2, 3, 3, 3, 4, 4, 4).inOrder()
         val fresh = db.bookDao().get(civ.driveId)!!
-        assertThat(fresh.durationExact).isTrue()
+        assertThat(fresh.durationMs).isNotNull()
+        assertThat(fresh.durationExact).isFalse()
         assertThat(fresh.tagNarrator).isEqualTo("Audrey (voix de synthèse)")
         assertThat(fresh.coverPath).isNotNull()
 
@@ -191,9 +206,9 @@ class SyncEngineTest {
         val archived = all.first { it.status == BookStatus.ARCHIVED && it.kind == BookKind.FOLDER }
         assertThat(archived.tracksSyncedAt).isNull()
 
-        assertThat(events().count { it.type == SyncEventType.RECEIVED }).isEqualTo(10)
+        assertThat(events().count { it.type == SyncEventType.RECEIVED }).isEqualTo(2)
         val run = db.syncRunDao().observeLastFinished().first()!!
-        assertThat(run.filesReceived).isEqualTo(10)
+        assertThat(run.filesReceived).isEqualTo(2)
         assertThat(run.fullInventory).isTrue()
     }
 
@@ -211,18 +226,18 @@ class SyncEngineTest {
         assertThat(moved.pendingStatus).isNull()
         assertThat(db.pendingOperationDao().all()).isEmpty()
         assertThat(events().any { it.type == SyncEventType.DRIVE_MOVE && it.bookId == civ.driveId }).isTrue()
-        // Pistes gardées 24 h dans _Ecouté.
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        // Pistes déjà présentes gardées 24 h dans _Ecouté.
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
 
         now += 25 * 3_600_000L
         engine.sync(SyncTrigger.PERIODIC)
         assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
         assertThat(db.trackDao().forBook(civ.driveId).none { it.localPath?.let(::File)?.exists() == true }).isTrue()
-        assertThat(events().count { it.type == SyncEventType.LOCAL_DELETE }).isEqualTo(10)
+        assertThat(events().count { it.type == SyncEventType.LOCAL_DELETE }).isEqualTo(2)
     }
 
     @Test
-    fun `Commencer - le livre descend en entier, en commençant à la position d'écoute`() = runBlocking<Unit> {
+    fun `Commencer - la fenêtre streaming descend en commençant à la position d'écoute`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
         val police = book("Police - Hugo Boris")
         db.progressDao().upsert(ProgressEntity(bookId = police.driveId, account = FakeDriveService.ACCOUNT, trackIndex = 2, updatedAt = now))
@@ -231,7 +246,8 @@ class SyncEngineTest {
         queueMove(police, BookStatus.IN_PROGRESS, D.IN_PROGRESS_ID)
         engine.sync(SyncTrigger.STATUS_CHANGE)
 
-        assertThat(db.trackDao().presentCount(police.driveId)).isEqualTo(3)
+        // Piste N=2 (dernière des 3 pistes) -> fenêtre N-1..N = pistes 1 et 2, avec priorité sur N=2.
+        assertThat(db.trackDao().presentCount(police.driveId)).isEqualTo(2)
         val order = db.trackDao().forBook(police.driveId).associate { it.driveId to it.sortIndex }
         val firstDownloaded = drive.opened.first { it.first in order.keys && it.second == 0L }.first
         assertThat(order[firstDownloaded]).isEqualTo(2)
@@ -471,14 +487,14 @@ class SyncEngineTest {
     fun `nettoyage - rien n'est supprimé avant que Drive confirme le déplacement, puis 10 min de grâce`() = runBlocking<Unit> {
         engine.sync(SyncTrigger.LAUNCH)
         val civ = book(LibraryFixture.civilisations.name)
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
 
         // Archiver, mais Drive refuse passagèrement le déplacement : rien ne bouge sur le téléphone.
         fake.busyMoves += civ.driveId
         queueMove(civ, BookStatus.ARCHIVED, D.ARCHIVES_ID)
         val busy = engine.sync(SyncTrigger.STATUS_CHANGE)
         assertThat(db.bookDao().get(civ.driveId)!!.status).isEqualTo(BookStatus.IN_PROGRESS)
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
         assertThat(busy.retryAtMs).isAtLeast(now + SyncEngine.MIN_RETRY_DELAY_MS)
 
         // Déplacement fait : les pistes restent pendant le délai de grâce…
@@ -486,7 +502,7 @@ class SyncEngineTest {
         now += 31_000
         engine.sync(SyncTrigger.STATUS_CHANGE)
         assertThat(db.bookDao().get(civ.driveId)!!.status).isEqualTo(BookStatus.ARCHIVED)
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
 
         // … puis sont supprimées.
         now += CleanupPolicy.GRACE_MS
@@ -610,7 +626,7 @@ class SyncEngineTest {
         unmetered = true
         val wifi = engine.sync(SyncTrigger.WIFI)
         assertThat(wifi.waitingForWifi).isFalse()
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
         assertThat(book("Police - Hugo Boris").durationMs).isNotNull()
         assertThat(book("Police - Hugo Boris").coverPath).isNotNull()
     }
@@ -624,7 +640,7 @@ class SyncEngineTest {
 
         engine.sync(SyncTrigger.PERIODIC)
         assertThat(db.bookDao().get(civ.driveId)).isNotNull()
-        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
 
         inUse = null
         engine.sync(SyncTrigger.PERIODIC)
@@ -843,4 +859,229 @@ class SyncEngineTest {
         assertThat(refreshed.pendingName).isNull()
         assertThat(db.pendingOperationDao().all()).isEmpty()
     }
+
+    // ------------------------------------------------------------------ mode streaming & nettoyage local
+
+    @Test
+    fun `mode streaming par défaut - seules les pistes N-1, N et N+1 sont gardées au fil de l'écoute`() = runBlocking<Unit> {
+        assertThat(settings.current().streamingMode).isTrue()
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+
+        suspend fun presentIndices(): List<Int> {
+            val all = db.trackDao().forBook(civ.driveId)
+            all.forEach { t ->
+                if (t.state == TrackState.PRESENT) {
+                    assertThat(File(t.localPath!!).exists()).isTrue()
+                } else {
+                    assertThat(t.localPath).isNull()
+                }
+            }
+            return all.filter { it.state == TrackState.PRESENT }.map { it.sortIndex }
+        }
+
+        // Début du livre (N = 0) : pistes 0 et 1 sur le disque.
+        assertThat(presentIndices()).containsExactly(0, 1).inOrder()
+
+        // Passage à la piste N = 1 : la piste 0 (N-1) est gardée et la piste 2 (N+1) est téléchargée.
+        val allTracks = db.trackDao().forBook(civ.driveId)
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[1].driveId,
+                trackIndex = 1,
+                updatedAt = now,
+            ),
+        )
+        engine.onPlaybackTrackChanged(civ.driveId)
+        engine.sync(SyncTrigger.PLAYBACK)
+        assertThat(presentIndices()).containsExactly(0, 1, 2).inOrder()
+
+        // Passage à la piste N = 2 : si la piste 0 était encore verrouillée par le lecteur, elle est protégée…
+        trackInUse = allTracks[0].driveId
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[2].driveId,
+                trackIndex = 2,
+                updatedAt = now,
+            ),
+        )
+        assertThat(engine.onPlaybackTrackChanged(civ.driveId)).isEqualTo(0L)
+        assertThat(presentIndices()).containsExactly(0, 1, 2).inOrder()
+
+        // …dès que la piste active devient la 2, la piste 0 (N-2) est supprimée aussitôt et la piste 3 (N+1) descend.
+        trackInUse = allTracks[2].driveId
+        assertThat(engine.onPlaybackTrackChanged(civ.driveId)).isGreaterThan(0L)
+        assertThat(presentIndices()).containsExactly(1, 2).inOrder()
+        engine.sync(SyncTrigger.PLAYBACK)
+        assertThat(presentIndices()).containsExactly(1, 2, 3).inOrder()
+        trackInUse = null
+
+        // Saut direct vers la dernière piste (N = 9) : seules les pistes 8 et 9 restent sur le disque.
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[9].driveId,
+                trackIndex = 9,
+                updatedAt = now,
+            ),
+        )
+        engine.onPlaybackTrackChanged(civ.driveId)
+        engine.sync(SyncTrigger.PLAYBACK)
+        assertThat(presentIndices()).containsExactly(8, 9).inOrder()
+    }
+
+    @Test
+    fun `hors mode streaming - les pistes non écoutées descendent et chaque piste écoutée est supprimée`() = runBlocking<Unit> {
+        settings.update { it.copy(streamingMode = false) }
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+        val allTracks = db.trackDao().forBook(civ.driveId)
+
+        // Hors streaming, le livre en écoute descend en entier (0..9) et sa durée devient exacte.
+        assertThat(db.trackDao().forBook(civ.driveId).filter { it.state == TrackState.PRESENT }.map { it.sortIndex })
+            .containsExactlyElementsIn(0..9)
+            .inOrder()
+        assertThat(db.bookDao().get(civ.driveId)!!.durationExact).isTrue()
+
+        // Les pistes 0 et 1 viennent d'être écoutées (passage à N = 2) -> supprimées immédiatement du disque.
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[2].driveId,
+                trackIndex = 2,
+                updatedAt = now,
+            ),
+        )
+        val freed = engine.onPlaybackTrackChanged(civ.driveId)
+        assertThat(freed).isGreaterThan(0L)
+        val remaining = db.trackDao().forBook(civ.driveId)
+        assertThat(remaining.take(2).all { it.state == TrackState.ABSENT && it.localPath == null }).isTrue()
+        assertThat(remaining.drop(2).all { it.state == TrackState.PRESENT && File(it.localPath!!).exists() }).isTrue()
+
+        // Une synchro ultérieure ne re-télécharge PAS les pistes déjà écoutées (< N).
+        engine.sync(SyncTrigger.PERIODIC)
+        assertThat(db.trackDao().forBook(civ.driveId).filter { it.state == TrackState.PRESENT }.map { it.sortIndex })
+            .containsExactlyElementsIn(2..9)
+            .inOrder()
+
+        // Si le livre est épinglé (« Garder sur ce téléphone »), toutes les pistes descendent et aucune n'est supprimée.
+        db.bookDao().setPinnedOffline(civ.driveId, true)
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+        assertThat(engine.onPlaybackTrackChanged(civ.driveId)).isEqualTo(0L)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+
+        // On retire l'épinglage et on termine la dernière piste : toutes les pistes locales sont nettoyées.
+        db.bookDao().setPinnedOffline(civ.driveId, false)
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[9].driveId,
+                trackIndex = 9,
+                percent = 100f,
+                finished = true,
+                updatedAt = now,
+            ),
+        )
+        assertThat(engine.onPlaybackTrackChanged(civ.driveId)).isGreaterThan(0L)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
+        assertThat(root.walkTopDown().none { it.isFile && it.extension == "mp3" }).isTrue()
+    }
+
+    @Test
+    fun `nettoyage manuel - supprimer les fichiers locaux d'un livre ou de tout le téléphone sans toucher à Drive`() = runBlocking<Unit> {
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+        val police = book("Police - Hugo Boris")
+
+        // On épingle « Police » pour avoir un second livre présent localement.
+        db.bookDao().setPinnedOffline(police.driveId, true)
+        engine.sync(SyncTrigger.STATUS_CHANGE)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
+        assertThat(db.trackDao().presentCount(police.driveId)).isEqualTo(3)
+
+        val policeProgressAt = now + 5_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = police.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackIndex = 1,
+                positionMs = 15_000L,
+                updatedAt = policeProgressAt,
+            ),
+        )
+
+        // 1. Suppression manuelle d'un seul livre (« Police ») : fichiers audio supprimés, épinglage levé,
+        //    mais Drive, pochette et progression sont intacts.
+        val freedBook = engine.deleteLocalBookFiles(police.driveId)
+        assertThat(freedBook).isGreaterThan(0L)
+        assertThat(db.trackDao().presentCount(police.driveId)).isEqualTo(0)
+        assertThat(db.bookDao().get(police.driveId)!!.pinnedOffline).isFalse()
+        assertThat(db.bookDao().get(police.driveId)!!.coverPath?.let(::File)?.exists()).isTrue()
+        assertThat(db.progressDao().get(police.driveId, FakeDriveService.ACCOUNT)!!.positionMs).isEqualTo(15_000L)
+        assertThat(fake.getFile(police.driveId).trashed).isFalse()
+        assertThat(fake.listChildren(police.driveId).count { it.name.endsWith(".mp3") }).isEqualTo(3)
+        // « Civilisations » n'a pas été touché.
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(2)
+
+        // 2. Suppression globale de tous les fichiers audio locaux du téléphone.
+        val freedAll = engine.deleteAllLocalAudioFiles()
+        assertThat(freedAll).isGreaterThan(0L)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(0)
+        assertThat(root.walkTopDown().none { it.isFile && it.extension == "mp3" }).isTrue()
+        assertThat(db.bookDao().get(civ.driveId)!!.coverPath?.let(::File)?.exists()).isTrue()
+        assertThat(fake.getFile(civ.driveId).trashed).isFalse()
+    }
+
+    @Test
+    fun `bascule vers le mode streaming - cleanupNow nettoie aussitôt hors fenêtre tout en protégeant la piste en lecture`() = runBlocking<Unit> {
+        settings.update { it.copy(streamingMode = false) }
+        engine.sync(SyncTrigger.LAUNCH)
+        val civ = book(LibraryFixture.civilisations.name)
+        val allTracks = db.trackDao().forBook(civ.driveId)
+        assertThat(db.trackDao().presentCount(civ.driveId)).isEqualTo(10)
+
+        // L'auditeur est sur la piste 5, mais ExoPlayer finit encore de relâcher la piste 0.
+        now += 10_000L
+        db.progressDao().upsert(
+            ProgressEntity(
+                bookId = civ.driveId,
+                account = FakeDriveService.ACCOUNT,
+                trackId = allTracks[5].driveId,
+                trackIndex = 5,
+                positionMs = 12_000L,
+                updatedAt = now,
+            ),
+        )
+        trackInUse = allTracks[0].driveId
+
+        // Activation du mode streaming dans les réglages -> cleanupNow immédiat sans réseau.
+        settings.update { it.copy(streamingMode = true) }
+        engine.cleanupNow()
+
+        // Seules la fenêtre 4..6 et la piste 0 verrouillée restent présentes.
+        assertThat(db.trackDao().forBook(civ.driveId).filter { it.state == TrackState.PRESENT }.map { it.sortIndex })
+            .containsExactly(0, 4, 5, 6)
+            .inOrder()
+
+        // Dès que la piste 0 n'est plus utilisée, elle est purgée à son tour.
+        trackInUse = null
+        engine.cleanupNow()
+        assertThat(db.trackDao().forBook(civ.driveId).filter { it.state == TrackState.PRESENT }.map { it.sortIndex })
+            .containsExactly(4, 5, 6)
+            .inOrder()
+    }
 }
+

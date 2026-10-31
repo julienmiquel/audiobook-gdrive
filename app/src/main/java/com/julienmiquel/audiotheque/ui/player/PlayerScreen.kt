@@ -47,6 +47,7 @@ import androidx.compose.material3.Badge
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -156,6 +157,8 @@ data class PlayerScreenState(
     val isCurrent: Boolean = false,
     val isPlaying: Boolean = false,
     val buffering: Boolean = false,
+    /** Lancement automatique en attente du téléchargement de la piste courante. */
+    val waitingForDownload: Boolean = false,
     val currentTrack: TrackEntity? = null,
     /** Début du chapitre en cours dans la piste physique (0 si un fichier par chapitre). */
     val chapterStartMs: Long = 0,
@@ -238,14 +241,20 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         )
     }.distinctUntilChanged()
 
+    private val runtimeFlow = combine(
+        PlayerRuntime.sleepTimer,
+        PlayerRuntime.seekHistory,
+        c.pendingPlaybackBookId,
+    ) { sleep, history, pendingBookId -> Triple(sleep, history, pendingBookId) }
+
     val state: StateFlow<PlayerScreenState> = combine(
         data,
         c.player.state,
-        PlayerRuntime.sleepTimer,
-        PlayerRuntime.seekHistory,
+        runtimeFlow,
         prefsFlow,
-    ) { (id, book), player, sleep, history, prefs -> build(id, book, player, sleep, history, prefs) }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlayerScreenState())
+    ) { (id, book), player, (sleep, history, pendingBookId), prefs ->
+        build(id, book, player, sleep, history, pendingBookId, prefs)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), PlayerScreenState())
 
     private fun build(
         id: String?,
@@ -253,6 +262,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         player: PlayerUiState,
         sleep: SleepTimerState,
         history: List<JumpEntry>,
+        pendingBookId: String?,
         prefs: PlayerPrefs,
     ): PlayerScreenState {
         if (id == null || book == null) {
@@ -318,6 +328,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
             isCurrent = isCurrent,
             isPlaying = isCurrent && player.isPlaying,
             buffering = isCurrent && player.buffering,
+            waitingForDownload = pendingBookId == id && !isCurrent,
             currentTrack = current,
             chapterStartMs = chapterStart,
             positionMs = chapterPosition,
@@ -345,11 +356,17 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         )
     }
 
-    /** Positionne le livre affiché dans le service (sans lancer la lecture) dès qu'une piste est là. */
+    /** Positionne le livre affiché dans le service (sans lancer la lecture) si sa piste cible est présente. */
     fun ensureLoaded() {
         val s = state.value
         val id = s.bookId ?: return
-        if (!s.isCurrent && s.presentCount > 0 && !s.anotherBookPlaying) {
+        if (s.isCurrent || s.waitingForDownload || s.anotherBookPlaying) return
+        val targetPlayable = if (s.progress?.finished == true) {
+            s.tracks.firstOrNull()?.state == TrackState.PRESENT
+        } else {
+            s.currentTrack?.state == TrackState.PRESENT
+        }
+        if (targetPlayable) {
             c.playBook(id, autoPlay = false)
         }
     }
@@ -358,9 +375,12 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         val s = state.value
         val id = s.bookId ?: return
         when {
+            s.waitingForDownload -> {
+                c.cancelPendingPlayback()
+                c.message("Lecture automatique annulée")
+            }
             s.isCurrent -> c.player.togglePlayPause()
-            s.presentCount > 0 -> c.playBook(id)
-            else -> c.message("Aucune piste sur le téléphone pour l'instant : la lecture se fait hors ligne, après téléchargement.")
+            else -> c.playOrDownloadBook(id)
         }
     }
 
@@ -368,9 +388,53 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
 
     fun skipForward() = ifCurrent { c.player.seekForward() }
 
-    fun previousChapter() = ifCurrent { c.player.previousChapter() }
+    fun previousChapter() {
+        val s = state.value
+        val cur = s.currentTrack ?: return
+        val emb = s.embeddedChapters.filter { it.trackId == cur.driveId }
+        val onFirstEmbedded = emb.size <= 1 || s.currentEmbeddedChapter?.chapterIndex == emb.first().chapterIndex
+        val prevTrack = s.tracks.lastOrNull { it.sortIndex < cur.sortIndex }
+        if (!s.isCurrent) {
+            if (s.positionMs > 3_000L) {
+                jumpTo(cur, s.chapterStartMs)
+            } else if (!onFirstEmbedded && s.currentEmbeddedChapter != null) {
+                val prevEmb = emb.lastOrNull { it.chapterIndex < s.currentEmbeddedChapter.chapterIndex } ?: emb.first()
+                jumpTo(cur, prevEmb.startMs)
+            } else if (prevTrack != null) {
+                jumpTo(prevTrack, 0L)
+            } else {
+                jumpTo(cur, 0L)
+            }
+            return
+        }
+        if (onFirstEmbedded && s.positionMs <= 3_000L && prevTrack != null && prevTrack.state != TrackState.PRESENT) {
+            jumpTo(prevTrack, 0L)
+        } else {
+            c.player.previousChapter()
+        }
+    }
 
-    fun nextChapter() = ifCurrent { c.player.nextChapter() }
+    fun nextChapter() {
+        val s = state.value
+        val cur = s.currentTrack ?: return
+        val emb = s.embeddedChapters.filter { it.trackId == cur.driveId }
+        val onLastEmbedded = emb.size <= 1 || s.currentEmbeddedChapter?.chapterIndex == emb.last().chapterIndex
+        val nextTrack = s.tracks.firstOrNull { it.sortIndex > cur.sortIndex }
+        if (!s.isCurrent) {
+            if (!onLastEmbedded && s.currentEmbeddedChapter != null) {
+                val nextEmb = emb.firstOrNull { it.chapterIndex > s.currentEmbeddedChapter.chapterIndex } ?: emb.last()
+                jumpTo(cur, nextEmb.startMs)
+            } else if (nextTrack != null) {
+                jumpTo(nextTrack, 0L)
+            }
+            return
+        }
+        if (onLastEmbedded && nextTrack != null && nextTrack.state != TrackState.PRESENT) {
+            jumpTo(nextTrack, 0L)
+        } else {
+            c.player.nextChapter()
+        }
+    }
 
     private inline fun ifCurrent(action: () -> Unit) {
         if (state.value.isCurrent) action() else ensureLoaded()
@@ -388,7 +452,7 @@ class PlayerViewModel(private val c: AppContainer) : ViewModel() {
         val s = state.value
         val id = s.bookId ?: return
         when {
-            track.state != TrackState.PRESENT -> c.message("Ce chapitre n'est pas encore sur le téléphone.")
+            track.state != TrackState.PRESENT -> c.jumpToTrackAndSync(id, track.driveId, positionMs)
             s.isCurrent && c.player.seekToTrack(track.driveId, positionMs) -> Unit
             else -> c.playBook(id, track.driveId, positionMs, autoPlay = s.isPlaying)
         }
@@ -483,7 +547,9 @@ fun PlayerScreen(onOpenBook: (String) -> Unit, onOpenLibrary: () -> Unit, conten
     val state by vm.state.collectAsStateWithLifecycle()
     var sheet by rememberSaveable { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(state.bookId, state.presentCount, state.isCurrent) { vm.ensureLoaded() }
+    LaunchedEffect(state.bookId, state.presentCount, state.currentTrack?.state, state.isCurrent, state.waitingForDownload) {
+        vm.ensureLoaded()
+    }
 
     Scaffold(
         modifier = Modifier.padding(contentPadding),
@@ -515,7 +581,7 @@ fun PlayerScreen(onOpenBook: (String) -> Unit, onOpenLibrary: () -> Unit, conten
                 EmptyState(
                     Icons.Filled.Headphones,
                     "Aucun livre en cours",
-                    "Choisissez un livre dans la Bibliothèque. Seul _En écoute est téléchargé en entier, pour une écoute hors ligne.",
+                    "Choisissez un livre dans la Bibliothèque. Les pistes du livre en écoute sont téléchargées automatiquement au fil de votre progression.",
                     action = { Button(onClick = onOpenLibrary) { Text("Ouvrir la bibliothèque") } },
                 )
             }
@@ -549,7 +615,8 @@ private const val SHEET_HISTORY = "history"
 
 @Composable
 private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: PlayerViewModel, modifier: Modifier, onOpenSheet: (String) -> Unit) {
-    val canPlay = state.presentCount > 0
+    val canPlay = state.presentCount > 0 || state.tracks.isNotEmpty()
+    val canSeekLoaded = state.presentCount > 0
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -606,7 +673,7 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
             }
             TextButton(
                 onClick = vm::skipBack,
-                enabled = canPlay,
+                enabled = canSeekLoaded,
                 modifier = Modifier.semantics { contentDescription = "Reculer de ${state.skipSeconds} secondes" },
             ) { Text("−${state.skipSeconds}\u00A0s", style = MaterialTheme.typography.titleMedium) }
             FilledIconButton(
@@ -615,15 +682,25 @@ private fun PlayerContent(state: PlayerScreenState, item: LibraryItem, vm: Playe
                 modifier = Modifier.size(72.dp),
                 colors = IconButtonDefaults.filledIconButtonColors(),
             ) {
-                Icon(
-                    if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                    contentDescription = if (state.isPlaying) "Pause" else "Lecture",
-                    modifier = Modifier.size(40.dp),
-                )
+                if (state.waitingForDownload) {
+                    CircularProgressIndicator(
+                        modifier = Modifier
+                            .size(30.dp)
+                            .semantics { contentDescription = "Téléchargement en cours, toucher pour annuler la lecture automatique" },
+                        strokeWidth = 3.dp,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                    )
+                } else {
+                    Icon(
+                        if (state.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = if (state.isPlaying) "Pause" else "Lecture",
+                        modifier = Modifier.size(40.dp),
+                    )
+                }
             }
             TextButton(
                 onClick = vm::skipForward,
-                enabled = canPlay,
+                enabled = canSeekLoaded,
                 modifier = Modifier.semantics { contentDescription = "Avancer de ${state.skipSeconds} secondes" },
             ) { Text("+${state.skipSeconds}\u00A0s", style = MaterialTheme.typography.titleMedium) }
             IconButton(onClick = vm::nextChapter, enabled = canPlay) {
@@ -793,8 +870,8 @@ private fun StatusAction(item: LibraryItem, vm: PlayerViewModel) {
     } ?: return
     OutlinedButton(onClick = { vm.gesture(gesture) }) { Text(gesture.label) }
     val hint = when (gesture) {
-        Gesture.REPRENDRE -> "Le dossier revient dans « En écoute » : ses pistes sont (re)téléchargées et la lecture reprend à la position gardée."
-        Gesture.COMMENCER -> "Le livre passe dans « En écoute » : toutes ses pistes sont téléchargées pour une écoute hors ligne."
+        Gesture.REPRENDRE -> "Le dossier revient dans « En écoute » : les pistes autour de votre position sont téléchargées pour reprendre la lecture."
+        Gesture.COMMENCER -> "Le livre passe dans « En écoute » : les prochaines pistes sont téléchargées automatiquement sur le téléphone."
         else -> null
     }
     hint?.let {
@@ -816,12 +893,15 @@ private fun DownloadStatus(state: PlayerScreenState, item: LibraryItem) {
             item.isZip && item.trackCount == 0 ->
                 "Archive .zip sur Drive : touchez « Commencer » pour la télécharger et la décompresser."
             item.trackCount == 0 -> "Pistes en cours d'inventaire…"
-            state.presentCount == 0 && item.status == BookStatus.IN_PROGRESS -> "Téléchargement en attente : la lecture démarre dès la première piste reçue."
-            state.presentCount == 0 -> "Ce livre n'est pas sur le téléphone. Commencez-le pour le télécharger en entier."
+            state.waitingForDownload -> "Téléchargement en cours : la lecture démarre dès la piste courante reçue."
+            state.presentCount == 0 && item.status == BookStatus.IN_PROGRESS -> "Aucune piste sur le téléphone : touchez ▶ pour télécharger et lancer la lecture."
+            state.presentCount == 0 -> "Ce livre n'est pas sur le téléphone. Touchez ▶ ou « Commencer » pour lancer le téléchargement."
             else -> "Sur le téléphone : ${state.presentCount}/${item.trackCount} pistes"
         }
         Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
-        if (item.trackCount > 0) {
+        if (state.waitingForDownload) {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        } else if (item.trackCount > 0) {
             LinearProgressIndicator(progress = { state.presentCount.toFloat() / item.trackCount }, modifier = Modifier.fillMaxWidth())
         }
     }
@@ -1144,7 +1224,7 @@ private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity, Long) 
                             Row(
                                 Modifier
                                     .fillMaxWidth()
-                                    .clickable(enabled = present, onClickLabel = "Aller à ce chapitre") { onJump(track, ch.startMs) }
+                                    .clickable(onClickLabel = if (present) "Aller à ce chapitre" else "Télécharger ce chapitre") { onJump(track, ch.startMs) }
                                     .padding(horizontal = 24.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
@@ -1177,7 +1257,7 @@ private fun ChaptersSheet(state: PlayerScreenState, onJump: (TrackEntity, Long) 
                             Row(
                                 Modifier
                                     .fillMaxWidth()
-                                    .clickable(enabled = present, onClickLabel = "Aller à ce chapitre") { onJump(track, 0L) }
+                                    .clickable(onClickLabel = if (present) "Aller à ce chapitre" else "Télécharger ce chapitre") { onJump(track, 0L) }
                                     .padding(horizontal = 24.dp, vertical = 10.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {

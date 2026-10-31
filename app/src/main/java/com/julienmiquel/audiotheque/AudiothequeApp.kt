@@ -9,11 +9,21 @@ import com.julienmiquel.audiotheque.auth.GoogleAuthManager
 import com.julienmiquel.audiotheque.auth.authErrorMessage
 import com.julienmiquel.audiotheque.auth.consentFailureMessage
 import com.julienmiquel.audiotheque.core.db.AppDatabase
+import com.julienmiquel.audiotheque.core.db.BookEntity
+import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.SyncPairEntity
+import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.Accounts
+import com.julienmiquel.audiotheque.core.model.BookStatus
+import com.julienmiquel.audiotheque.core.model.PairMode
+import com.julienmiquel.audiotheque.core.model.ProgressMath
 import com.julienmiquel.audiotheque.core.model.SyncResult
 import com.julienmiquel.audiotheque.core.model.SyncTrigger
+import com.julienmiquel.audiotheque.core.model.TrackState
+import com.julienmiquel.audiotheque.core.model.chapterLabel
 import com.julienmiquel.audiotheque.core.model.displayTitle
+import com.julienmiquel.audiotheque.core.model.effectiveParentId
+import com.julienmiquel.audiotheque.core.model.userEffectiveStatus
 import com.julienmiquel.audiotheque.core.settings.ListenerProfile
 import com.julienmiquel.audiotheque.core.settings.SettingsRepository
 import com.julienmiquel.audiotheque.core.settings.StatusSyncMode
@@ -22,6 +32,7 @@ import com.julienmiquel.audiotheque.core.sync.BookInUse
 import com.julienmiquel.audiotheque.core.sync.Clock
 import com.julienmiquel.audiotheque.core.sync.ProgressSyncRequester
 import com.julienmiquel.audiotheque.core.sync.RemoteProgress
+import com.julienmiquel.audiotheque.core.util.Formats
 import com.julienmiquel.audiotheque.covers.CoverImporter
 import com.julienmiquel.audiotheque.library.AppleBooksClient
 import com.julienmiquel.audiotheque.library.BookEditor
@@ -36,6 +47,7 @@ import com.julienmiquel.audiotheque.library.MoveResult
 import com.julienmiquel.audiotheque.library.OpenLibraryClient
 import com.julienmiquel.audiotheque.library.StatusGestures
 import com.julienmiquel.audiotheque.library.TrashResult
+import com.julienmiquel.audiotheque.player.PlaybackService
 import com.julienmiquel.audiotheque.player.PlayerConnection
 import com.julienmiquel.audiotheque.player.PlayerDependencies
 import com.julienmiquel.audiotheque.player.PlayerDependenciesProvider
@@ -55,6 +67,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
@@ -67,6 +80,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.filter
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -171,6 +185,29 @@ class AppContainer(private val app: Application) {
         override val onPlaybackStateChanged: () -> Unit = {
             com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
         }
+        override val onTrackTransition: (String, Int, Boolean) -> Unit = { bookId, _, finished ->
+            appScope.launch {
+                withContext(Dispatchers.IO) { engine.onPlaybackTrackChanged(bookId) }
+                if (!finished) scheduler.requestSync(SyncTrigger.PLAYBACK)
+            }
+        }
+        override val onMissingTargetTrack: (String, String, Long, Boolean) -> Unit = { bookId, trackId, positionMs, autoPlay ->
+            appScope.launch {
+                val book = database.bookDao().get(bookId) ?: return@launch
+                val tracks = database.trackDao().forBook(bookId)
+                val track = tracks.firstOrNull { it.driveId == trackId } ?: return@launch
+                val existing = database.progressDao().get(bookId, settings.current().accountKey)
+                val needsProgressReset = existing == null || existing.finished || existing.trackId != track.driveId
+                prepareMissingTrackDownload(
+                    book = book,
+                    tracks = tracks,
+                    track = track,
+                    positionMs = positionMs,
+                    autoPlay = autoPlay,
+                    updateProgress = needsProgressReset,
+                )
+            }
+        }
     }
 
     private val _moves = MutableSharedFlow<MoveResult>(extraBufferCapacity = 4)
@@ -197,6 +234,13 @@ class AppContainer(private val app: Application) {
 
     /** Livre de l'onglet Lecteur : le dernier demandé, ou celui que lit le service. */
     val selectedBookId: StateFlow<String?> = _selectedBookId.asStateFlow()
+
+    private val _pendingPlaybackBookId = MutableStateFlow<String?>(null)
+
+    /** Livre dont le lancement automatique attend la réception de la piste courante. */
+    val pendingPlaybackBookId: StateFlow<String?> = _pendingPlaybackBookId.asStateFlow()
+
+    private var pendingAutoPlayJob: Job? = null
 
     /** Dernier passage au premier plan traité (progression relue au plus une fois par minute). */
     @Volatile
@@ -323,6 +367,7 @@ class AppContainer(private val app: Application) {
             val normalizedKey = profileKey?.takeIf { key -> current.profiles.any { it.key == key } }
             val targetAccountKey = normalizedKey ?: current.accountEmail ?: Accounts.LOCAL
             if (targetAccountKey == current.accountKey && normalizedKey == current.activeProfileKey) return@launch
+            cancelPendingPlayback()
             withTimeoutOrNull(PROFILE_SWITCH_PUSH_MS) { engine.pushProgress(null) }
             val lastPlayed = database.progressDao().lastListened(targetAccountKey)?.bookId
             settings.update {
@@ -379,6 +424,7 @@ class AppContainer(private val app: Application) {
             val remaining = current.profiles.filterNot { it.key == key }
             val wasActive = current.activeProfileKey == key
             if (wasActive) {
+                cancelPendingPlayback()
                 val primaryKey = current.accountEmail ?: Accounts.LOCAL
                 val lastPlayed = database.progressDao().lastListened(primaryKey)?.bookId
                 settings.update {
@@ -452,10 +498,238 @@ class AppContainer(private val app: Application) {
         return additions.size
     }
 
+    /** Active ou désactive le mode streaming (fenêtre glissante N-1, N et N+1 sur le téléphone). */
+    fun setStreamingMode(enabled: Boolean) {
+        appScope.launch {
+            settings.update { it.copy(streamingMode = enabled) }
+            withContext(Dispatchers.IO) { engine.cleanupNow() }
+            scheduler.requestSync(SyncTrigger.MANUAL)
+            message(
+                if (enabled) {
+                    "Mode streaming activé : seules les pistes N-1, N et N+1 sont gardées sur le téléphone"
+                } else {
+                    "Mode streaming désactivé : les pistes à écouter sont téléchargées et chaque piste écoutée est supprimée"
+                },
+            )
+        }
+    }
+
+    /** Annule un lancement automatique en attente de téléchargement. */
+    fun cancelPendingPlayback() {
+        pendingAutoPlayJob?.cancel()
+        pendingAutoPlayJob = null
+        _pendingPlaybackBookId.value = null
+    }
+
+    private fun scheduleAutoPlayWhenDownloaded(
+        bookId: String,
+        trackId: String,
+        positionMs: Long,
+        resumeMode: Boolean,
+    ) {
+        cancelPendingPlayback()
+        _pendingPlaybackBookId.value = bookId
+        pendingAutoPlayJob = appScope.launch {
+            database.trackDao().observeForBook(bookId)
+                .map { tracks ->
+                    tracks.firstOrNull {
+                        it.driveId == trackId &&
+                            it.state == TrackState.PRESENT &&
+                            it.localPath?.let(::File)?.exists() == true
+                    }
+                }
+                .filter { it != null }
+                .first()
+            pendingAutoPlayJob = null
+            _pendingPlaybackBookId.value = null
+            if (_selectedBookId.value == bookId) {
+                if (resumeMode) {
+                    player.playBook(bookId, null, null, autoPlay = true)
+                } else {
+                    player.playBook(bookId, trackId, positionMs, autoPlay = true)
+                }
+            }
+        }
+    }
+
+    /** Supprime manuellement tous les fichiers audio locaux d'un livre pour libérer de la place (rien n'est supprimé sur Drive). */
+    fun deleteLocalBookFiles(bookId: String) {
+        appScope.launch {
+            if (_pendingPlaybackBookId.value == bookId) cancelPendingPlayback()
+            if (BookInUse.isInUse(bookId) || player.state.value.bookId == bookId) {
+                player.stopAndClear()
+                BookInUse.set(null)
+            }
+            val freed = withContext(Dispatchers.IO) { engine.deleteLocalBookFiles(bookId) }
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+            message("Fichiers locaux supprimés (${Formats.size(freed)} libérés)")
+        }
+    }
+
+    /** Supprime manuellement tous les fichiers audio téléchargés sur le téléphone (rien n'est supprimé sur Drive). */
+    fun deleteAllLocalFiles() {
+        appScope.launch {
+            cancelPendingPlayback()
+            player.stopAndClear()
+            BookInUse.set(null)
+            val freed = withContext(Dispatchers.IO) { engine.deleteAllLocalAudioFiles() }
+            com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+            message("Espace libéré : ${Formats.size(freed)} supprimés du téléphone")
+        }
+    }
+
     /** Lecture (fichiers locaux uniquement) ; sans [autoPlay], le livre est seulement positionné. */
     fun playBook(bookId: String, trackId: String? = null, positionMs: Long? = null, autoPlay: Boolean = true) {
+        cancelPendingPlayback()
         _selectedBookId.value = bookId
         player.playBook(bookId, trackId, positionMs, autoPlay)
+    }
+
+    /**
+     * Reprend ou lance [bookId] : joue immédiatement si la piste cible (locale ou après relecture
+     * Drive) est déjà sur le téléphone, sinon programme son téléchargement prioritaire et lance
+     * automatiquement la lecture dès réception.
+     */
+    fun playOrDownloadBook(bookId: String, positionMs: Long? = null, autoPlay: Boolean = true) {
+        appScope.launch {
+            _selectedBookId.value = bookId
+            val book = database.bookDao().get(bookId) ?: return@launch
+            val tracks = database.trackDao().forBook(bookId)
+            if (tracks.isEmpty()) {
+                cancelPendingPlayback()
+                scheduler.requestSync(SyncTrigger.PLAYBACK)
+                message("Aucune piste inventoriée pour l'instant : synchronisation lancée…")
+                return@launch
+            }
+            if (positionMs == null) {
+                val restored = progressBridge.pullProgress(bookId, PlaybackService.PULL_TIMEOUT_MS)
+                if (restored != null) {
+                    message("« ${book.displayTitle} » : position reprise depuis ${restored.device ?: "un autre appareil"} (${restored.percent.roundToInt()} %)")
+                }
+            }
+            val account = settings.current().accountKey
+            val progress = database.progressDao().get(bookId, account)
+            val restart = positionMs == null && progress?.finished == true
+            val targetTrack = if (restart) {
+                tracks.first()
+            } else {
+                tracks.firstOrNull { it.driveId == progress?.trackId }
+                    ?: tracks.getOrNull(progress?.trackIndex ?: 0)
+                    ?: tracks.first()
+            }
+            val matchesSavedTrack = progress != null &&
+                (progress.trackId == targetTrack.driveId || (progress.trackId == null && progress.trackIndex == targetTrack.sortIndex))
+            val targetPosMs = when {
+                positionMs != null -> positionMs.coerceAtLeast(0L)
+                restart -> 0L
+                matchesSavedTrack -> progress.positionMs.coerceAtLeast(0L)
+                else -> 0L
+            }
+            val localExists = targetTrack.state == TrackState.PRESENT && targetTrack.localPath?.let(::File)?.exists() == true
+            if (localExists) {
+                if (positionMs == null) {
+                    playBook(bookId, null, null, autoPlay)
+                } else {
+                    playBook(bookId, targetTrack.driveId, targetPosMs, autoPlay)
+                }
+            } else {
+                val needsProgressUpdate = positionMs != null || progress == null || restart || progress.trackId != targetTrack.driveId
+                prepareMissingTrackDownload(
+                    book = book,
+                    tracks = tracks,
+                    track = targetTrack,
+                    positionMs = targetPosMs,
+                    autoPlay = autoPlay,
+                    updateProgress = needsProgressUpdate,
+                )
+            }
+        }
+    }
+
+    /**
+     * Se place sur [trackId] (à [positionMs]) : lance la lecture immédiatement si le fichier est
+     * présent sur le téléphone, ou déplace la fenêtre de téléchargement sur cette piste et lance
+     * sa synchronisation (avec démarrage automatique si [autoPlay] est vrai).
+     */
+    fun jumpToTrackAndSync(bookId: String, trackId: String, positionMs: Long = 0L, autoPlay: Boolean = true) {
+        appScope.launch {
+            val book = database.bookDao().get(bookId) ?: return@launch
+            val tracks = database.trackDao().forBook(bookId)
+            val track = tracks.firstOrNull { it.driveId == trackId } ?: return@launch
+            val localExists = track.state == TrackState.PRESENT && track.localPath?.let(::File)?.exists() == true
+            if (localExists) {
+                playBook(bookId, track.driveId, positionMs, autoPlay)
+                return@launch
+            }
+            prepareMissingTrackDownload(
+                book = book,
+                tracks = tracks,
+                track = track,
+                positionMs = positionMs,
+                autoPlay = autoPlay,
+                updateProgress = true,
+            )
+        }
+    }
+
+    private suspend fun prepareMissingTrackDownload(
+        book: BookEntity,
+        tracks: List<TrackEntity>,
+        track: TrackEntity,
+        positionMs: Long,
+        autoPlay: Boolean,
+        updateProgress: Boolean,
+    ) {
+        val bookId = book.driveId
+        _selectedBookId.value = bookId
+        if (BookInUse.isInUse(bookId) || player.state.value.bookId == bookId) {
+            player.stopAndClear()
+            BookInUse.set(null)
+        }
+        val account = settings.current().accountKey
+        val existing = database.progressDao().get(bookId, account)
+        val pair = database.syncPairDao().forFolder(book.effectiveParentId)
+        val isFullCollection = pair?.status == BookStatus.COLLECTION && pair.mode == PairMode.FULL
+        if (book.userEffectiveStatus(existing?.personalStatus) != BookStatus.IN_PROGRESS && !book.pinnedOffline && !isFullCollection) {
+            gestures.moveTo(bookId, BookStatus.IN_PROGRESS)?.let(::announceMove)
+        }
+        val pos = positionMs.coerceAtLeast(0L)
+        if (updateProgress) {
+            val refreshed = database.progressDao().get(bookId, account)
+            val durations = ProgressMath.durations(tracks, book.durationMs)
+            val percent = ProgressMath.percent(durations, track.sortIndex, pos)
+            val now = clock.now()
+            database.progressDao().upsert(
+                (refreshed ?: ProgressEntity(bookId = bookId, account = account, updatedAt = now)).copy(
+                    trackId = track.driveId,
+                    trackIndex = track.sortIndex,
+                    positionMs = pos,
+                    percent = percent,
+                    finished = false,
+                    updatedAt = now,
+                    dirty = true,
+                ),
+            )
+            progressBridge.pushProgress(bookId)
+        }
+        if (autoPlay) {
+            scheduleAutoPlayWhenDownloaded(
+                bookId = bookId,
+                trackId = track.driveId,
+                positionMs = pos,
+                resumeMode = !updateProgress,
+            )
+        } else {
+            cancelPendingPlayback()
+        }
+        withContext(Dispatchers.IO) { engine.onPlaybackTrackChanged(bookId) }
+        scheduler.requestSync(SyncTrigger.PLAYBACK)
+        com.julienmiquel.audiotheque.widget.AudiothequeWidgetProvider.requestUpdate(app)
+        if (autoPlay) {
+            message("Téléchargement de « ${track.chapterLabel} » lancé : la lecture démarrera dès réception…")
+        } else {
+            message("Téléchargement de « ${track.chapterLabel} » lancé…")
+        }
     }
 
     fun requestSync(trigger: SyncTrigger = SyncTrigger.MANUAL) = scheduler.requestSync(trigger)
@@ -618,6 +892,7 @@ class AppContainer(private val app: Application) {
      * téléphone. La progression (propre à chaque compte) et les signets restent.
      */
     suspend fun signOut() = accountLock.withLock {
+        cancelPendingPlayback()
         scheduler.cancelAll()
         syncNotifications.dismissAuthRequired()
         player.stopAndClear()

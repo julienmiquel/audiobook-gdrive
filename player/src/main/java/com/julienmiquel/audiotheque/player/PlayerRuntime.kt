@@ -1,6 +1,7 @@
 package com.julienmiquel.audiotheque.player
 
 import com.julienmiquel.audiotheque.core.db.AppDatabase
+import com.julienmiquel.audiotheque.core.db.ProgressEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookStatus
 import com.julienmiquel.audiotheque.core.model.chapterLabel
@@ -23,6 +24,74 @@ interface PlayerDependencies {
 
     /** Appelé quand l'état de lecture, le chapitre ou la progression change (widget d'accueil). */
     val onPlaybackStateChanged: (() -> Unit)? get() = null
+
+    /**
+     * Appelé après un changement de piste enregistrée ou en fin de piste : lance le nettoyage des
+     * pistes hors fenêtre / écoutées et le pré-téléchargement de la fenêtre suivante.
+     */
+    val onTrackTransition: ((bookId: String, trackIndex: Int, finished: Boolean) -> Unit)? get() = null
+
+    /**
+     * Appelé quand la piste visée (reprise depuis un autre appareil ou fenêtre streaming absente)
+     * n'est pas encore téléchargée sur le téléphone : ne jamais retomber sur la piste 0 au risque
+     * d'écraser la progression, mais programmer le téléchargement de la piste cible.
+     */
+    val onMissingTargetTrack: ((bookId: String, trackId: String, positionMs: Long, autoPlay: Boolean) -> Unit)? get() = null
+}
+
+/** Résultat du choix de la piste et de la position de départ pour un livre. */
+sealed interface StartResolution {
+    data object NoTracks : StartResolution
+    data class Playable(val track: TrackEntity, val unclippedPositionMs: Long) : StartResolution
+    data class MissingTrack(val track: TrackEntity, val positionMs: Long) : StartResolution
+}
+
+/**
+ * Détermine la piste et la position exactes où démarrer la lecture sans jamais retomber sur une
+ * autre piste locale quand la piste cible (progression locale ou Drive) est absente du téléphone.
+ */
+object PlaybackTargetResolver {
+    fun resolve(
+        tracks: List<TrackEntity>,
+        presentTrackIds: Set<String>,
+        progress: ProgressEntity?,
+        explicitTrackId: String? = null,
+        explicitPositionMs: Long? = null,
+        explicitChapterStartMs: Long? = null,
+        smartRewind: Boolean = true,
+        nowMs: Long = System.currentTimeMillis(),
+    ): StartResolution {
+        if (tracks.isEmpty()) return StartResolution.NoTracks
+        val resuming = explicitTrackId == null && explicitPositionMs == null && explicitChapterStartMs == null
+        val restart = resuming && progress?.finished == true
+        val wantedTrack = when {
+            explicitTrackId != null -> tracks.firstOrNull { it.driveId == explicitTrackId } ?: return StartResolution.NoTracks
+            restart -> tracks.first()
+            else -> tracks.firstOrNull { it.driveId == progress?.trackId }
+                ?: tracks.getOrNull(progress?.trackIndex ?: 0)
+                ?: tracks.first()
+        }
+        val matchesSavedTrack = progress != null &&
+            (progress.trackId == wantedTrack.driveId || (progress.trackId == null && progress.trackIndex == wantedTrack.sortIndex))
+        val rawPosMs = when {
+            explicitChapterStartMs != null -> (explicitChapterStartMs + (explicitPositionMs ?: 0L)).coerceAtLeast(0L)
+            explicitPositionMs != null -> explicitPositionMs.coerceAtLeast(0L)
+            restart || explicitTrackId != null -> 0L
+            matchesSavedTrack -> progress.positionMs.coerceAtLeast(0L)
+            else -> 0L
+        }
+        if (wantedTrack.driveId !in presentTrackIds) {
+            return StartResolution.MissingTrack(track = wantedTrack, positionMs = rawPosMs)
+        }
+        val unclippedPosMs = if (resuming && !restart && matchesSavedTrack) {
+            val pauseElapsed = progress.lastListenedAt?.let { (nowMs - it).coerceAtLeast(0L) } ?: 60_000L
+            val rewindMs = SmartRewind.computeMs(pauseElapsed, smartRewind)
+            (rawPosMs - rewindMs).coerceAtLeast(0L)
+        } else {
+            rawPosMs
+        }
+        return StartResolution.Playable(track = wantedTrack, unclippedPositionMs = unclippedPosMs)
+    }
 }
 
 interface PlayerDependenciesProvider {

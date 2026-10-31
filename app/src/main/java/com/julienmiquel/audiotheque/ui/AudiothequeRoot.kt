@@ -160,10 +160,11 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
     val libraryItems by container.library.observeLibrary().collectAsStateWithLifecycle(initialValue = emptyList())
     val playerState by container.player.state.collectAsStateWithLifecycle()
     val selectedBookId by container.selectedBookId.collectAsStateWithLifecycle()
+    val pendingPlaybackBookId by container.pendingPlaybackBookId.collectAsStateWithLifecycle()
     val appSettings by container.settings.settings.collectAsStateWithLifecycle(initialValue = null)
     var finishedBook by remember { mutableStateOf<Pair<String, String>?>(null) }
 
-    val miniBookId = playerState.bookId ?: selectedBookId ?: appSettings?.lastPlayedBookId
+    val miniBookId = playerState.bookId ?: pendingPlaybackBookId ?: selectedBookId ?: appSettings?.lastPlayedBookId
     val miniItem = remember(libraryItems, miniBookId) {
         miniBookId?.let { id -> libraryItems.firstOrNull { it.id == id } }
     }
@@ -251,18 +252,27 @@ private fun MainScaffold(container: AppContainer, openPlayerRequests: Flow<Unit>
         bottomBar = {
             Column {
                 if (authRequired) AuthRenewalBanner(container)
-                if (!onPlayerScreen && miniItem != null && (playerState.bookId == miniItem.id || miniItem.presentTracks > 0)) {
+                if (
+                    !onPlayerScreen && miniItem != null && (
+                        playerState.bookId == miniItem.id ||
+                            pendingPlaybackBookId == miniItem.id ||
+                            miniItem.presentTracks > 0 ||
+                            (miniItem.status == BookStatus.IN_PROGRESS && miniItem.trackCount > 0 && !miniItem.finished)
+                        )
+                ) {
+                    val waiting = pendingPlaybackBookId == miniItem.id
                     MiniPlayerBar(
                         item = miniItem,
                         tracks = miniTracks,
                         playerState = playerState,
                         skipSeconds = appSettings?.skipSeconds ?: 30,
+                        waitingForDownload = waiting,
                         onOpenPlayer = { nav.navigateToTab(TopTab.PLAYER) },
                         onTogglePlay = {
-                            if (playerState.bookId == miniItem.id) {
-                                container.player.togglePlayPause()
-                            } else {
-                                container.playBook(miniItem.id)
+                            when {
+                                waiting -> container.cancelPendingPlayback()
+                                playerState.bookId == miniItem.id -> container.player.togglePlayPause()
+                                else -> container.playOrDownloadBook(miniItem.id)
                             }
                         },
                         onSeekBack = { container.player.seekBack() },

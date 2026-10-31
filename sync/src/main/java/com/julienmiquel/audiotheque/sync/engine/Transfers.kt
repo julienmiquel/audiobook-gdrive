@@ -5,6 +5,7 @@ import com.julienmiquel.audiotheque.core.db.AppDatabase
 import com.julienmiquel.audiotheque.core.db.BookEntity
 import com.julienmiquel.audiotheque.core.db.EmbeddedChapterEntity
 import com.julienmiquel.audiotheque.core.db.ProgressEntity
+import com.julienmiquel.audiotheque.core.db.SyncPairEntity
 import com.julienmiquel.audiotheque.core.db.TrackEntity
 import com.julienmiquel.audiotheque.core.model.BookKind
 import com.julienmiquel.audiotheque.core.model.BookStatus
@@ -118,19 +119,42 @@ class Downloader(
         return candidates.distinctBy { it.driveId }
     }
 
+    private fun shouldKeepAllTracks(book: BookEntity, pairs: List<SyncPairEntity>): Boolean {
+        if (book.pinnedOffline) return true
+        val pair = pairs.firstOrNull { it.driveFolderId == book.parentId }
+        return pair != null && pair.enabled && pair.mode == PairMode.FULL && pair.status == BookStatus.COLLECTION
+    }
+
     /** Livres livrés en archive `.zip` à télécharger et décompresser. */
     suspend fun zipPlan(): List<BookEntity> {
         val s = settings.current()
-        val progressDao = db.progressDao()
+        val pairs = db.syncPairDao().all()
+        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
         return fullModeCandidates(s)
             .filter { it.kind == BookKind.ZIP }
             .filter { book ->
                 val bookTracks = tracks.forBook(book.driveId)
-                bookTracks.isEmpty() || bookTracks.any { t ->
-                    t.state != TrackState.PRESENT || t.localPath?.let { File(it).exists() } != true
+                val progress = progressByBook[book.driveId]
+                val keepAll = shouldKeepAllTracks(book, pairs)
+                if (bookTracks.isEmpty()) {
+                    progress?.finished != true || keepAll
+                } else {
+                    val current = progress?.trackIndex?.coerceIn(0, (bookTracks.size - 1).coerceAtLeast(0)) ?: 0
+                    val desiredIndices = CleanupPolicy.orderedDownloadIndices(
+                        totalTracks = bookTracks.size,
+                        currentTrackIndex = current,
+                        finished = progress?.finished == true,
+                        streamingMode = s.streamingMode,
+                        keepAllTracks = keepAll,
+                    )
+                    val bySortIndex = bookTracks.associateBy { it.sortIndex }
+                    desiredIndices.any { idx ->
+                        val t = bySortIndex[idx]
+                        t == null || t.state != TrackState.PRESENT || t.localPath?.let { File(it).exists() } != true
+                    }
                 }
             }
-            .map { it to progressDao.get(it.driveId, s.accountKey) }
+            .map { it to progressByBook[it.driveId] }
             .sortedWith(
                 compareByDescending<Pair<BookEntity, ProgressEntity?>> { it.second?.lastListenedAt ?: 0L }
                     .thenByDescending { (book, p) ->
@@ -140,9 +164,10 @@ class Downloader(
             .map { it.first }
     }
 
-    /** Pistes à télécharger, dans l'ordre de priorité. */
+    /** Pistes à télécharger, dans l'ordre de priorité (mode streaming N..N+1..N-1 par défaut, ou reste à écouter). */
     suspend fun plan(): List<Task> {
         val s = settings.current()
+        val pairs = db.syncPairDao().all()
         val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
         val withProgress = fullModeCandidates(s).filter { it.kind != BookKind.ZIP }
             .map { it to progressByBook[it.driveId] }
@@ -155,10 +180,22 @@ class Downloader(
         val result = mutableListOf<Task>()
         for ((book, progress) in withProgress) {
             val bookTracks = tracks.forBook(book.driveId)
-            val current = progress?.trackIndex?.coerceIn(0, (bookTracks.size - 1).coerceAtLeast(0)) ?: 0
-            bookTracks.filter { it.state != TrackState.PRESENT }
-                .sortedBy { if (it.sortIndex >= current) it.sortIndex - current else bookTracks.size + current - it.sortIndex }
-                .forEach { result += Task(book, it) }
+            if (bookTracks.isEmpty()) continue
+            val current = progress?.trackIndex?.coerceIn(0, bookTracks.size - 1) ?: 0
+            val desiredIndices = CleanupPolicy.orderedDownloadIndices(
+                totalTracks = bookTracks.size,
+                currentTrackIndex = current,
+                finished = progress?.finished == true,
+                streamingMode = s.streamingMode,
+                keepAllTracks = shouldKeepAllTracks(book, pairs),
+            )
+            val bySortIndex = bookTracks.associateBy { it.sortIndex }
+            for (idx in desiredIndices) {
+                val track = bySortIndex[idx] ?: continue
+                if (track.state != TrackState.PRESENT || track.localPath?.let { File(it).exists() } != true) {
+                    result += Task(book, track)
+                }
+            }
         }
         if (s.previewNew) {
             val newBooks = books.all().filter { book ->
@@ -166,7 +203,9 @@ class Downloader(
                     (book.pendingStatus ?: progressByBook[book.driveId]?.personalStatus ?: book.status) == BookStatus.NEW
             }
             for (book in newBooks) {
-                tracks.forBook(book.driveId).firstOrNull()?.takeIf { it.state != TrackState.PRESENT }?.let { result += Task(book, it) }
+                tracks.forBook(book.driveId).firstOrNull()
+                    ?.takeIf { it.state != TrackState.PRESENT || it.localPath?.let { p -> File(p).exists() } != true }
+                    ?.let { result += Task(book, it) }
             }
         }
         return result
@@ -208,7 +247,12 @@ class Downloader(
                 if (item.id in inFlight) continue
                 if (item.book.driveId !in checkedBooks) {
                     val roomOk = when (item) {
-                        is WorkItem.TrackWork -> hasRoomFor(item.book, ctx)
+                        is WorkItem.TrackWork -> {
+                            val tracksForBook = plannedTracks
+                                .filter { it.book.driveId == item.book.driveId }
+                                .map { it.task.track }
+                            hasRoomFor(item.book, tracksForBook, ctx)
+                        }
                         is WorkItem.ZipWork -> hasRoomForZip(item.book, ctx)
                     }
                     if (!roomOk) {
@@ -297,10 +341,9 @@ class Downloader(
         stop.get() ?: DownloadStop.DONE
     }
 
-    /** Espace libre ≥ reste à télécharger du livre + 500 Mo. */
-    private suspend fun hasRoomFor(book: BookEntity, ctx: RunContext): Boolean {
-        val remaining = tracks.forBook(book.driveId).filter { it.state != TrackState.PRESENT }
-            .sumOf { (it.sizeBytes - it.downloadedBytes).coerceAtLeast(0) }
+    /** Espace libre ≥ reste planifié à télécharger du livre + 500 Mo. */
+    private suspend fun hasRoomFor(book: BookEntity, plannedTracks: List<TrackEntity>, ctx: RunContext): Boolean {
+        val remaining = plannedTracks.sumOf { (it.sizeBytes - it.downloadedBytes).coerceAtLeast(0) }
         val free = storage.freeBytes(storage.root())
         if (free >= remaining + SPACE_MARGIN_BYTES) return true
         history.log(
@@ -558,7 +601,7 @@ class Downloader(
 
     suspend fun download(drive: DriveService, task: Task, ctx: RunContext, canContinue: () -> Boolean = { true }) = withContext(Dispatchers.IO) {
         val track = tracks.get(task.track.driveId) ?: return@withContext
-        if (track.state == TrackState.PRESENT) return@withContext
+        if (track.state == TrackState.PRESENT && track.localPath?.let { File(it).exists() } == true) return@withContext
         val book = books.get(track.bookId) ?: return@withContext
         val dir = bookDir(book)
         val target = File(dir, track.relativePath.split('/').joinToString("/") { LocalStorage.sanitize(it) })
@@ -652,7 +695,10 @@ class Downloader(
     private suspend fun markPresent(book: BookEntity, track: TrackEntity, file: File, ctx: RunContext, received: Boolean) {
         val info = inspector.inspect(file)
         tracks.setLocalState(track.driveId, TrackState.PRESENT, file.path, file.length())
-        info?.durationMs?.takeIf { it > 0 }?.let { tracks.setExactDuration(track.driveId, it) }
+        val exactDuration = info?.durationMs?.takeIf { it > 0 }
+        if (exactDuration != null) {
+            tracks.setExactDuration(track.driveId, exactDuration)
+        }
         if (info != null && info.chapters.size > 1) {
             db.embeddedChapterDao().replaceForTrack(
                 track.driveId,
@@ -682,6 +728,22 @@ class Downloader(
             cover.writeBytes(picture)
             books.setCoverPath(book.driveId, cover.path)
         }
+        // En mode streaming ou téléchargement partiel, estime la durée des pistes non téléchargées
+        // à partir du débit moyen constaté afin d'afficher immédiatement la durée totale du livre.
+        val beforeEstimate = tracks.forBook(book.driveId)
+        if (exactDuration != null && track.sizeBytes > 0 && beforeEstimate.any { it.durationMs == null }) {
+            val known = beforeEstimate.filter { it.durationExact && (it.durationMs ?: 0L) > 0L && it.sizeBytes > 0L }
+            val msPerByte = if (known.isNotEmpty()) {
+                known.sumOf { it.durationMs!! }.toDouble() / known.sumOf { it.sizeBytes }
+            } else {
+                exactDuration.toDouble() / track.sizeBytes
+            }
+            for (other in beforeEstimate) {
+                if (other.durationMs == null && other.sizeBytes > 0L) {
+                    tracks.updateEstimatedDuration(other.driveId, (other.sizeBytes * msPerByte).toLong())
+                }
+            }
+        }
         val all = tracks.forBook(book.driveId)
         if (all.isNotEmpty() && all.all { it.durationMs != null }) {
             books.updateDuration(book.driveId, all.sumOf { it.durationMs!! }, all.all { it.durationExact })
@@ -701,9 +763,12 @@ class Downloader(
 }
 
 /**
- * Nettoyage selon le statut ([CleanupPolicy]) : seul _En écoute garde ses pistes sur le
- * téléphone ; _A écouter plus tard les garde 7 jours, _Ecouté 24 h (délais réglables) ; les autres
- * statuts ne gardent que leurs métadonnées (sauf la première piste des _Nouveaux si « Aperçu »).
+ * Nettoyage selon le statut et l'avancement d'écoute ([CleanupPolicy]) :
+ * - Pour un livre « En écoute » : garde uniquement la fenêtre `N-1..N+1` en mode streaming (par
+ *   défaut), ou supprime chaque piste écoutée (`< N`, ou toutes si terminé) hors mode streaming.
+ * - Pour les autres statuts : `_A écouter plus tard` garde les pistes 7 jours, `_Ecouté` 24 h
+ *   (délais réglables) ; les autres statuts ne gardent que leurs métadonnées (sauf la première
+ *   piste des `_Nouveaux` si « Aperçu »).
  * Seul le statut confirmé par Drive compte : un geste encore annulable ou un déplacement pas
  * encore fait dans Drive ne supprime rien.
  */
@@ -715,31 +780,85 @@ class Cleaner(
     private val history: HistoryLogger,
     private val clock: Clock,
     private val isBookInUse: (String) -> Boolean,
+    private val isTrackInUse: (String) -> Boolean = { false },
 ) {
-    suspend fun run(ctx: RunContext?) {
+    private data class ListenerPosition(val trackIndex: Int, val finished: Boolean)
+
+    private fun inProgressPositionsFor(
+        book: BookEntity,
+        allProgressForBook: List<ProgressEntity>,
+        activeAccountKey: String,
+    ): List<ListenerPosition> {
+        val positions = mutableListOf<ListenerPosition>()
+        for (p in allProgressForBook) {
+            val status = book.pendingStatus ?: p.personalStatus ?: book.status
+            if (status == BookStatus.IN_PROGRESS) {
+                positions += ListenerPosition(p.trackIndex, p.finished)
+            }
+        }
+        if (allProgressForBook.none { it.account == activeAccountKey }) {
+            val activeStatus = book.pendingStatus ?: book.status
+            if (activeStatus == BookStatus.IN_PROGRESS) {
+                positions += ListenerPosition(0, false)
+            }
+        }
+        return positions
+    }
+
+    /**
+     * Nettoie immédiatement les pistes devenues inutiles d'un livre « En écoute » (changement de
+     * piste ou fin de lecture). Retourne le nombre d'octets libérés.
+     */
+    suspend fun cleanBookInProgress(bookId: String, ctx: RunContext? = null): Long {
+        val book = db.bookDao().get(bookId) ?: return 0L
+        if (book.pendingStatus != null && book.pendingStatus != BookStatus.IN_PROGRESS) return 0L
         val s = settings.current()
-        val now = clock.now()
         val pairs = db.syncPairDao().all()
-        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
-        val inProgressOnDevice = db.progressDao().booksInProgressOnDevice().toSet()
-        for (track in db.trackDao().withLocalData()) {
-            val book = db.bookDao().get(track.bookId) ?: continue
-            if (isBookInUse(book.driveId) || book.driveId in inProgressOnDevice) continue
+        val allProgress = db.progressDao().allForBook(bookId)
+        val positions = inProgressPositionsFor(book, allProgress, s.accountKey)
+        if (positions.isEmpty()) return 0L
+        val bookTracks = db.trackDao().forBook(bookId)
+        val localTracks = bookTracks.filter { it.state != TrackState.ABSENT || it.localPath != null }
+        return cleanInProgressTracks(book, localTracks, bookTracks.size, positions, pairs, s, ctx)
+    }
+
+    private suspend fun cleanInProgressTracks(
+        book: BookEntity,
+        localTracks: List<TrackEntity>,
+        totalTracks: Int,
+        positions: List<ListenerPosition>,
+        pairs: List<SyncPairEntity>,
+        s: com.julienmiquel.audiotheque.core.settings.AppSettings,
+        ctx: RunContext?,
+    ): Long {
+        val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
+        val keepAllTracks = book.pinnedOffline || (book.status == BookStatus.COLLECTION && pairMode == PairMode.FULL)
+        if (keepAllTracks) return 0L
+        var totalFreed = 0L
+        val reason = if (s.streamingMode) {
+            "Mode streaming : piste hors fenêtre (N-1..N+1) supprimée"
+        } else {
+            "Nettoyage : piste écoutée supprimée"
+        }
+        for (track in localTracks) {
             if (track.state == TrackState.DOWNLOADING) continue
-            val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-            val prog = progressByBook[book.driveId]
-            val deadline = CleanupPolicy.deadline(
-                book = book,
-                trackSortIndex = track.sortIndex,
-                pairMode = pairMode,
-                settings = s,
-                personalStatus = prog?.personalStatus,
-                personalStatusChangedAt = prog?.personalStatusChangedAt,
-            ) ?: continue
-            if (now < deadline) continue
+            if (isTrackInUse(track.driveId)) continue
+            val keep = positions.any { pos ->
+                CleanupPolicy.shouldKeepInProgressTrack(
+                    trackSortIndex = track.sortIndex,
+                    totalTracks = totalTracks,
+                    currentTrackIndex = pos.trackIndex,
+                    finished = pos.finished,
+                    streamingMode = s.streamingMode,
+                    keepAllTracks = false,
+                    isZip = book.kind == BookKind.ZIP,
+                )
+            }
+            if (keep) continue
             val path = track.localPath
             val freed = localFiles.deleteTrackFiles(track)
             if (freed > 0 && path != null) {
+                totalFreed += freed
                 ctx?.filesDeleted?.incrementAndGet()
                 ctx?.bytesDeleted?.addAndGet(freed)
                 history.log(
@@ -747,9 +866,60 @@ class Cleaner(
                     path = storage.displayPath(File(path)),
                     book = book,
                     sizeBytes = freed,
-                    message = "Nettoyage : livre dans ${pairs.firstOrNull { it.driveFolderId == book.parentId }?.name ?: "un autre statut"}",
+                    message = reason,
                     runId = ctx?.runId,
                 )
+            }
+        }
+        return totalFreed
+    }
+
+    suspend fun run(ctx: RunContext?) {
+        val s = settings.current()
+        val now = clock.now()
+        val pairs = db.syncPairDao().all()
+        val allProgressByBook = db.progressDao().all().groupBy { it.bookId }
+        val activeProgressByBook = allProgressByBook.mapValues { (_, list) ->
+            list.firstOrNull { it.account == s.accountKey }
+        }
+        val localByBook = db.trackDao().withLocalData().groupBy { it.bookId }
+        for ((bookId, localTracks) in localByBook) {
+            val book = db.bookDao().get(bookId) ?: continue
+            if (book.pendingStatus != null && book.pendingStatus != BookStatus.IN_PROGRESS) continue
+            val positions = inProgressPositionsFor(book, allProgressByBook[bookId].orEmpty(), s.accountKey)
+            if (positions.isNotEmpty()) {
+                val totalTracks = db.trackDao().forBook(bookId).size
+                cleanInProgressTracks(book, localTracks, totalTracks, positions, pairs, s, ctx)
+                continue
+            }
+            if (isBookInUse(book.driveId)) continue
+            val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
+            val prog = activeProgressByBook[book.driveId]
+            for (track in localTracks) {
+                if (track.state == TrackState.DOWNLOADING) continue
+                val deadline = CleanupPolicy.deadline(
+                    book = book,
+                    trackSortIndex = track.sortIndex,
+                    pairMode = pairMode,
+                    settings = s,
+                    personalStatus = prog?.personalStatus,
+                    personalStatusChangedAt = prog?.personalStatusChangedAt,
+                ) ?: continue
+                if (now < deadline) continue
+                val path = track.localPath
+                val freed = localFiles.deleteTrackFiles(track)
+                if (freed > 0 && path != null) {
+                    ctx?.filesDeleted?.incrementAndGet()
+                    ctx?.bytesDeleted?.addAndGet(freed)
+                    history.log(
+                        type = SyncEventType.LOCAL_DELETE,
+                        path = storage.displayPath(File(path)),
+                        book = book,
+                        sizeBytes = freed,
+                        message = "Nettoyage : livre dans ${pairs.firstOrNull { it.driveFolderId == book.parentId }?.name ?: "un autre statut"}",
+                        runId = ctx?.runId,
+                    )
+                }
             }
         }
     }
@@ -763,14 +933,19 @@ class Cleaner(
         val s = settings.current()
         val now = clock.now()
         val pairs = db.syncPairDao().all()
-        val progressByBook = db.progressDao().allFor(s.accountKey).associateBy { it.bookId }
-        val inProgressOnDevice = db.progressDao().booksInProgressOnDevice().toSet()
+        val allProgressByBook = db.progressDao().all().groupBy { it.bookId }
+        val activeProgressByBook = allProgressByBook.mapValues { (_, list) ->
+            list.firstOrNull { it.account == s.accountKey }
+        }
         val booksById = HashMap<String, BookEntity?>()
         return db.trackDao().withLocalData().mapNotNull { track ->
             val book = booksById.getOrPut(track.bookId) { db.bookDao().get(track.bookId) } ?: return@mapNotNull null
-            if (isBookInUse(book.driveId) || book.driveId in inProgressOnDevice) return@mapNotNull null
+            if (isBookInUse(book.driveId)) return@mapNotNull null
+            if (inProgressPositionsFor(book, allProgressByBook[book.driveId].orEmpty(), s.accountKey).isNotEmpty()) {
+                return@mapNotNull null
+            }
             val pairMode = pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
-            val prog = progressByBook[book.driveId]
+            val prog = activeProgressByBook[book.driveId]
             CleanupPolicy.deadline(
                 book = book,
                 trackSortIndex = track.sortIndex,

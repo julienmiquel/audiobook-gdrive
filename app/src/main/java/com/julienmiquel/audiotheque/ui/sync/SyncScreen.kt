@@ -231,6 +231,10 @@ class SyncViewModel(private val c: AppContainer) : ViewModel() {
         viewModelScope.launch { c.settings.update(transform) }
     }
 
+    fun setStreamingMode(enabled: Boolean) = c.setStreamingMode(enabled)
+
+    fun deleteAllLocalFiles() = c.deleteAllLocalFiles()
+
     fun fullInventory() {
         viewModelScope.launch {
             c.settings.updateSyncState { it.copy(lastFullInventoryAt = null) }
@@ -359,6 +363,7 @@ fun SyncScreen(onOpenSettings: () -> Unit, contentPadding: PaddingValues) {
 
 @Composable
 private fun FollowTab(state: SyncUiState, vm: SyncViewModel) {
+    var confirmDeleteLocal by remember { mutableStateOf(false) }
     val now by produceState(System.currentTimeMillis(), state.engine.running) {
         while (true) {
             value = System.currentTimeMillis()
@@ -456,13 +461,54 @@ private fun FollowTab(state: SyncUiState, vm: SyncViewModel) {
             InfoRow("Livres sur le téléphone", Formats.size(state.localBytes))
             InfoRow("Espace libre", Formats.size(state.freeBytes))
             InfoRow("Emplacement", state.localRoot ?: "—")
+            SwitchRow(
+                "Mode streaming (pistes N-1, N et N+1)",
+                "Par défaut : seules 3 pistes autour de l'écoute sont gardées sur le disque",
+                state.settings.streamingMode,
+                vm::setStreamingMode,
+            )
             Text(
-                "Un transfert ne démarre pas si l'espace libre est inférieur à la taille du livre plus 500 Mo.",
+                "Un transfert ne démarre pas si l'espace libre est inférieur à la taille des pistes prévues plus 500 Mo.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            OutlinedButton(
+                onClick = { confirmDeleteLocal = true },
+                enabled = state.localBytes > 0L,
+            ) {
+                Icon(Icons.Filled.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (state.localBytes > 0L) {
+                        "Supprimer les fichiers locaux (${Formats.size(state.localBytes)})…"
+                    } else {
+                        "Aucun fichier audio sur le téléphone"
+                    },
+                )
+            }
         }
         Spacer(Modifier.height(72.dp))
+    }
+
+    if (confirmDeleteLocal) {
+        AlertDialog(
+            onDismissRequest = { confirmDeleteLocal = false },
+            icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+            title = { Text("Supprimer les fichiers locaux ?") },
+            text = {
+                Text(
+                    "Toutes les pistes audio téléchargées (${Formats.size(state.localBytes)}) seront effacées du téléphone pour libérer de la place. " +
+                        "Vos fichiers sur Google Drive, vos progressions, vos pochettes et vos signets sont conservés.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDeleteLocal = false
+                    vm.deleteAllLocalFiles()
+                }) { Text("Supprimer du téléphone") }
+            },
+            dismissButton = { TextButton(onClick = { confirmDeleteLocal = false }) { Text("Annuler") } },
+        )
     }
 }
 

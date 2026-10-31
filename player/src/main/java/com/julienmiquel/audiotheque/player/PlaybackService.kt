@@ -143,6 +143,9 @@ class PlaybackService : MediaLibraryService() {
     /** Écoute effective depuis le dernier enregistrement (date de « dernière écoute »). */
     private var listenedSinceSave = false
 
+    /** Livre dont la relecture différée sur Drive est en cours : évite d'écraser `updatedAt` avant la réponse. */
+    private var deferredPullBookId: String? = null
+
     /** Dernier envoi de la position dans Drive (pendant l'écoute : au plus toutes les 5 min). */
     @Volatile
     private var lastPushAt = 0L
@@ -458,10 +461,12 @@ class PlaybackService : MediaLibraryService() {
     private val listener = object : Player.Listener {
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             if (isPlaying) {
+                val firstPlayForBook = !persistEnabled
                 playStartedWallMs = System.currentTimeMillis()
                 pausedAt = null
                 persistEnabled = true
                 listenedSinceSave = true
+                if (firstPlayForBook) persistNow()
                 startTicker()
             } else {
                 recordListeningSlice(resetIfPlaying = false)
@@ -477,8 +482,19 @@ class PlaybackService : MediaLibraryService() {
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             finishedEmitted = false
-            // Nouvelle liste (livre chargé) : rien à enregistrer, ce n'est pas une écoute.
-            if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) persistNow()
+            if (mediaItem == null && exo.mediaItemCount == 0) {
+                tracksJob?.cancel()
+                currentBook = null
+                currentBookIdFlow.value = null
+                BookInUse.set(null)
+            } else {
+                val ref = mediaItem?.mediaId?.let(MediaIds::parseTrack)
+                if (ref != null && ref.bookId == currentBook?.driveId) {
+                    BookInUse.setTrack(ref.trackId)
+                }
+                // Nouvelle liste (livre chargé) : rien à enregistrer, ce n'est pas une écoute.
+                if (reason != Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED) persistNow()
+            }
             notifyWidgetState()
         }
 
@@ -558,14 +574,16 @@ class PlaybackService : MediaLibraryService() {
 
     private fun onEnded() {
         val book = currentBook ?: return
-        currentTrack() ?: return
+        val track = currentTrack() ?: return
         if (isOnLastTrack()) {
             if (finishedEmitted) return
             finishedEmitted = true
+            BookInUse.setTrack(null)
             persistNow(markFinished = true, push = true)
             PlayerRuntime.emit(PlaybackEvent.BookFinished(book.driveId))
         } else {
             waitingForNext = true
+            deps.onTrackTransition?.invoke(book.driveId, track.sortIndex, false)
             PlayerRuntime.emit(PlaybackEvent.WaitingForDownload(book.driveId))
         }
     }
@@ -734,6 +752,7 @@ class PlaybackService : MediaLibraryService() {
      */
     private fun persistNow(markFinished: Boolean = false, push: Boolean = false) {
         if (!persistEnabled && !markFinished) return
+        if (!markFinished && deferredPullBookId != null && deferredPullBookId == currentBook?.driveId) return
         val now = System.currentTimeMillis()
         val send = push || now - lastPushAt >= PUSH_INTERVAL_MS
         val snapshot = snapshot(markFinished, listened = listenedSinceSave || exo.isPlaying, push = send) ?: return
@@ -751,6 +770,8 @@ class PlaybackService : MediaLibraryService() {
         val durations = ProgressMath.durations(s.tracks, s.book.durationMs)
         val percent = if (s.markFinished) 100f else ProgressMath.percent(durations, track.sortIndex, s.positionMs)
         val existing = dao.get(s.book.driveId, account)
+        val finished = (existing?.finished == true && percent >= FINISHED_PERCENT) || s.markFinished
+        val trackChanged = existing == null || existing.trackIndex != track.sortIndex || (finished && existing.finished != true)
         dao.upsert(
             (existing ?: ProgressEntity(bookId = s.book.driveId, account = account, updatedAt = now)).copy(
                 trackId = track.driveId,
@@ -759,7 +780,7 @@ class PlaybackService : MediaLibraryService() {
                 speed = s.speed,
                 percent = percent,
                 lastListenedAt = if (s.listened) now else existing?.lastListenedAt,
-                finished = (existing?.finished == true && percent >= FINISHED_PERCENT) || s.markFinished,
+                finished = finished,
                 updatedAt = now,
                 dirty = true,
             ),
@@ -768,6 +789,9 @@ class PlaybackService : MediaLibraryService() {
             deps.settings.update { it.copy(lastPlayedBookId = s.book.driveId) }
         }
         deps.onPlaybackStateChanged?.invoke()
+        if (trackChanged && settings.accountKey == account) {
+            deps.onTrackTransition?.invoke(s.book.driveId, track.sortIndex, finished)
+        }
         // Après l'écriture locale : l'envoi relit la base, la position est à jour.
         if (s.push && settings.accountKey == account) deps.progressSync?.pushProgress(s.book.driveId)
     }
@@ -798,6 +822,7 @@ class PlaybackService : MediaLibraryService() {
         positionMs: Long?,
         chapterIndex: Int? = null,
         deferRemote: Boolean = false,
+        autoPlay: Boolean = true,
     ): MediaSession.MediaItemsWithStartPosition? {
         // Livre précédent : sa position est enregistrée avant d'en charger un autre, et les
         // enregistrements en cours sont terminés pour lire une position à jour.
@@ -806,57 +831,77 @@ class PlaybackService : MediaLibraryService() {
         val db = deps.database
         val book = db.bookDao().get(bookId) ?: return null
         val tracks = db.trackDao().forBook(bookId)
+        if (tracks.isEmpty()) return null
         val present = tracks.filter { it.isPlayableLocally() }
-        if (present.isEmpty()) return null
+        val presentIds = present.map { it.driveId }.toSet()
         val embeddedByTrack = db.embeddedChapterDao().forBook(bookId).groupBy { it.trackId }
         val settings = deps.settings.current()
         val resuming = trackId == null && positionMs == null && chapterIndex == null
         val restored = if (resuming && !deferRemote) pullRemoteProgress(bookId, PULL_TIMEOUT_MS) else null
         val progress = db.progressDao().get(bookId, settings.accountKey)
-        val restart = resuming && progress?.finished == true
-        val wantedId = when {
-            trackId != null -> trackId
-            restart -> tracks.first().driveId
-            else -> progress?.trackId ?: tracks.getOrNull(progress?.trackIndex ?: 0)?.driveId
+        val explicitChapterStartMs = if (chapterIndex != null && trackId != null) {
+            embeddedByTrack[trackId]?.firstOrNull { it.chapterIndex == chapterIndex }?.startMs ?: 0L
+        } else {
+            null
+        }
+        val resolution = PlaybackTargetResolver.resolve(
+            tracks = tracks,
+            presentTrackIds = presentIds,
+            progress = progress,
+            explicitTrackId = trackId,
+            explicitPositionMs = positionMs,
+            explicitChapterStartMs = explicitChapterStartMs,
+            smartRewind = settings.smartRewind,
+        )
+        val playable = when (resolution) {
+            StartResolution.NoTracks -> return null
+            is StartResolution.MissingTrack -> {
+                releaseCurrentBookWithoutPersisting()
+                if (restored != null) PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
+                deps.onMissingTargetTrack?.invoke(bookId, resolution.track.driveId, resolution.positionMs, autoPlay)
+                return null
+            }
+            is StartResolution.Playable -> resolution
         }
         val items = present.flatMap { buildTrackItems(book, it, tracks.size, embeddedByTrack[it.driveId].orEmpty()) }
-        val matchingIndices = items.indices.filter { idx -> MediaIds.parseTrack(items[idx].mediaId)?.trackId == wantedId }
-        val startIndex: Int
-        val startPosition: Long
-        if (matchingIndices.isEmpty()) {
-            val wantedSort = tracks.firstOrNull { it.driveId == wantedId }?.sortIndex ?: 0
-            val fallbackTrack = present.firstOrNull { it.sortIndex >= wantedSort } ?: present.first()
-            startIndex = items.indexOfFirst { MediaIds.parseTrack(it.mediaId)?.trackId == fallbackTrack.driveId }.coerceAtLeast(0)
-            startPosition = 0L
-        } else {
-            val unclippedStartPos: Long = when {
-                chapterIndex != null && trackId != null -> {
-                    val chStart = embeddedByTrack[trackId]?.firstOrNull { it.chapterIndex == chapterIndex }?.startMs ?: 0L
-                    chStart + (positionMs ?: 0L)
-                }
-                positionMs != null -> positionMs
-                restart || trackId != null -> 0L
-                progress != null && progress.trackId == wantedId -> {
-                    val pauseElapsed = progress.lastListenedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) } ?: 60_000L
-                    val rewindMs = SmartRewind.computeMs(pauseElapsed, settings.smartRewind)
-                    (progress.positionMs - rewindMs).coerceAtLeast(0L)
-                }
-                else -> 0L
-            }
-            val chosen = matchingIndices.lastOrNull { idx ->
-                val start = items[idx].mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
-                unclippedStartPos >= start
-            } ?: matchingIndices.first()
-            val chosenStart = items[chosen].mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
-            startIndex = chosen
-            startPosition = (unclippedStartPos - chosenStart).coerceAtLeast(0L)
-        }
-        bind(book, settings.accountKey, tracks, embeddedByTrack)
+        val matchingIndices = items.indices.filter { idx -> MediaIds.parseTrack(items[idx].mediaId)?.trackId == playable.track.driveId }
+        if (matchingIndices.isEmpty()) return null
+        val unclippedStartPos = playable.unclippedPositionMs
+        val chosen = matchingIndices.lastOrNull { idx ->
+            val start = items[idx].mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+            unclippedStartPos >= start
+        } ?: matchingIndices.first()
+        val chosenStart = items[chosen].mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+        val startIndex = chosen
+        val startPosition = (unclippedStartPos - chosenStart).coerceAtLeast(0L)
+        val initialTrackId = items.getOrNull(startIndex)?.let { MediaIds.parseTrack(it.mediaId)?.trackId }
+        deferredPullBookId = if (resuming && deferRemote) bookId else null
+        bind(book, settings.accountKey, tracks, embeddedByTrack, initialTrackId)
         exo.setPlaybackSpeed(progress?.speed?.coerceIn(MIN_SPEED, MAX_SPEED) ?: 1f)
         pausedAt = null
         if (restored != null) PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
         if (resuming && deferRemote) scope.launch { adoptRemoteProgressLater(bookId) }
         return MediaSession.MediaItemsWithStartPosition(items, startIndex, startPosition)
+    }
+
+    /** Libère le lecteur sans écraser la progression en base (quand la piste cible doit être téléchargée). */
+    private fun releaseCurrentBookWithoutPersisting() {
+        recordListeningSlice(resetIfPlaying = false, closeSession = true)
+        deferredPullBookId = null
+        persistEnabled = false
+        listenedSinceSave = false
+        waitingForNext = false
+        tracksJob?.cancel()
+        exo.pause()
+        exo.stop()
+        exo.clearMediaItems()
+        currentBook = null
+        boundAccountKey = null
+        currentBookIdFlow.value = null
+        currentTracks = emptyList()
+        currentEmbedded = emptyMap()
+        BookInUse.set(null)
+        notifyWidgetState()
     }
 
     /** Position du livre dans Drive, au plus [timeoutMs] : null si rien de plus récent (ou hors ligne). */
@@ -874,30 +919,55 @@ class PlaybackService : MediaLibraryService() {
 
     /**
      * Reprise lancée sans attendre Drive : si l'autre téléphone y a enregistré une position plus
-     * récente, la lecture y saute dès qu'elle est relue (le livre doit être toujours chargé).
+     * récente, la lecture y saute dès qu'elle est relue (ou lance le téléchargement de la piste
+     * distante si elle n'est pas encore présente sur ce téléphone).
      */
     private suspend fun adoptRemoteProgressLater(bookId: String) {
-        val restored = pullRemoteProgress(bookId, DEFERRED_PULL_TIMEOUT_MS) ?: return
-        if (currentBook?.driveId != bookId) return
-        val settings = deps.settings.current()
-        val progress = deps.database.progressDao().get(bookId, settings.accountKey) ?: return
-        val matching = (0 until exo.mediaItemCount).filter { MediaIds.parseTrack(exo.getMediaItemAt(it).mediaId)?.trackId == progress.trackId }
-        if (matching.isEmpty()) return
-        val pauseElapsed = progress.lastListenedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) } ?: 60_000L
-        val rewindMs = SmartRewind.computeMs(pauseElapsed, settings.smartRewind)
-        val unclippedPos = (progress.positionMs - rewindMs).coerceAtLeast(0L)
-        val chosen = matching.lastOrNull { idx ->
-            val start = exo.getMediaItemAt(idx).mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
-            unclippedPos >= start
-        } ?: matching.first()
-        val chosenStart = exo.getMediaItemAt(chosen).mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
-        suppressNextSeekHistory = true
-        exo.seekTo(chosen, (unclippedPos - chosenStart).coerceAtLeast(0L))
-        PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
+        try {
+            val restored = pullRemoteProgress(bookId, DEFERRED_PULL_TIMEOUT_MS) ?: return
+            if (currentBook?.driveId != bookId) return
+            val settings = deps.settings.current()
+            val progress = deps.database.progressDao().get(bookId, settings.accountKey) ?: return
+            val targetTrackId = progress.trackId ?: currentTracks.getOrNull(progress.trackIndex)?.driveId ?: return
+            val matching = (0 until exo.mediaItemCount).filter {
+                MediaIds.parseTrack(exo.getMediaItemAt(it).mediaId)?.trackId == targetTrackId
+            }
+            if (matching.isEmpty()) {
+                val wasPlaying = exo.playWhenReady || exo.isPlaying
+                releaseCurrentBookWithoutPersisting()
+                PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
+                deps.onMissingTargetTrack?.invoke(bookId, targetTrackId, progress.positionMs.coerceAtLeast(0L), wasPlaying)
+                return
+            }
+            val pauseElapsed = progress.lastListenedAt?.let { (System.currentTimeMillis() - it).coerceAtLeast(0L) } ?: 60_000L
+            val rewindMs = SmartRewind.computeMs(pauseElapsed, settings.smartRewind)
+            val unclippedPos = (progress.positionMs - rewindMs).coerceAtLeast(0L)
+            val chosen = matching.lastOrNull { idx ->
+                val start = exo.getMediaItemAt(idx).mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+                unclippedPos >= start
+            } ?: matching.first()
+            val chosenStart = exo.getMediaItemAt(chosen).mediaMetadata.extras?.getLong(EXTRA_CHAPTER_START_MS, 0L) ?: 0L
+            suppressNextSeekHistory = true
+            exo.seekTo(chosen, (unclippedPos - chosenStart).coerceAtLeast(0L))
+            PlayerRuntime.emit(PlaybackEvent.ProgressRestored(bookId, restored.device, restored.percent))
+        } finally {
+            if (deferredPullBookId == bookId) {
+                deferredPullBookId = null
+                if (currentBook?.driveId == bookId && persistEnabled) {
+                    persistNow()
+                }
+            }
+        }
     }
 
-    /** Livre chargé : protégé du nettoyage, et complété au fil des téléchargements. */
-    private fun bind(book: BookEntity, accountKey: String, tracks: List<TrackEntity>, embeddedByTrack: Map<String, List<EmbeddedChapterEntity>>) {
+    /** Livre chargé : protégé du nettoyage sur la piste active, et synchronisé au fil des téléchargements / nettoyages. */
+    private fun bind(
+        book: BookEntity,
+        accountKey: String,
+        tracks: List<TrackEntity>,
+        embeddedByTrack: Map<String, List<EmbeddedChapterEntity>>,
+        initialTrackId: String?,
+    ) {
         if (currentBook?.driveId != book.driveId || boundAccountKey != accountKey) {
             recordListeningSlice(resetIfPlaying = false, closeSession = true)
         }
@@ -913,7 +983,7 @@ class PlaybackService : MediaLibraryService() {
         persistEnabled = false
         listenedSinceSave = false
         finishedEmitted = false
-        BookInUse.set(book.driveId)
+        BookInUse.set(book.driveId, initialTrackId)
         tracksJob?.cancel()
         tracksJob = scope.launch {
             combine(
@@ -924,18 +994,31 @@ class PlaybackService : MediaLibraryService() {
                     // Livre retiré de la base pendant l'écoute : on garde ses pistes pour enregistrer la position.
                     if (updated.isNotEmpty()) currentTracks = updated
                     currentEmbedded = embeddedMap
-                    insertNewlyDownloaded(book, updated, embeddedMap)
+                    syncPlaylistWithDisk(book, updated, embeddedMap)
                 }
         }
     }
 
-    private fun insertNewlyDownloaded(book: BookEntity, tracks: List<TrackEntity>, embeddedMap: Map<String, List<EmbeddedChapterEntity>>) {
+    private fun syncPlaylistWithDisk(
+        book: BookEntity,
+        tracks: List<TrackEntity>,
+        embeddedMap: Map<String, List<EmbeddedChapterEntity>>,
+    ) {
         if (currentBook?.driveId != book.driveId) return
+        if (exo.mediaItemCount == 0) return
+        val playableIds = tracks.filter { it.isPlayableLocally() }.map { it.driveId }.toSet()
+        val activeTrackId = exo.currentMediaItem?.let { MediaIds.parseTrack(it.mediaId)?.trackId }
+        for (i in exo.mediaItemCount - 1 downTo 0) {
+            val id = MediaIds.parseTrack(exo.getMediaItemAt(i).mediaId)?.trackId
+            if (id != null && id != activeTrackId && id !in playableIds) {
+                exo.removeMediaItem(i)
+            }
+        }
         val inPlaylist = (0 until exo.mediaItemCount).mapNotNull { MediaIds.parseTrack(exo.getMediaItemAt(it).mediaId)?.trackId }.toSet()
         if (inPlaylist.isEmpty()) return
         val sortById = tracks.associate { it.driveId to it.sortIndex }
         var inserted = false
-        for (track in tracks.filter { it.isPlayableLocally() && it.driveId !in inPlaylist }) {
+        for (track in tracks.filter { it.driveId in playableIds && it.driveId !in inPlaylist }) {
             val index = (0 until exo.mediaItemCount).count { i ->
                 val id = MediaIds.parseTrack(exo.getMediaItemAt(i).mediaId)?.trackId
                 (sortById[id] ?: Int.MAX_VALUE) < track.sortIndex
@@ -1556,6 +1639,7 @@ class PlaybackService : MediaLibraryService() {
         ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> = scope.future {
             val first = mediaItems.getOrNull(startIndex.coerceAtLeast(0)) ?: mediaItems.firstOrNull()
             val explicitPosition = startPositionMs.takeIf { it != C.TIME_UNSET && it > 0 }
+            val autoPlay = first?.mediaMetadata?.extras?.getBoolean(EXTRA_AUTO_PLAY, true) ?: true
             val query = first?.requestMetadata?.searchQuery
             val book = first?.let { MediaIds.parseBookRequest(it.mediaId) }
             val track = first?.let { MediaIds.parseTrack(it.mediaId) }
@@ -1567,8 +1651,8 @@ class PlaybackService : MediaLibraryService() {
                     val card = if (resume) lastPlayableBook() else searchBooks(query).firstOrNull()
                     card?.let { resolveBook(it.book.driveId, null, null, deferRemote = resume) }
                 }
-                book != null -> resolveBook(book.bookId, book.trackId, book.positionMs ?: explicitPosition)
-                track != null -> resolveBook(track.bookId, track.trackId, explicitPosition ?: 0, chapterIndex = track.chapterIndex)
+                book != null -> resolveBook(book.bookId, book.trackId, book.positionMs ?: explicitPosition, autoPlay = autoPlay)
+                track != null -> resolveBook(track.bookId, track.trackId, explicitPosition ?: 0, chapterIndex = track.chapterIndex, autoPlay = autoPlay)
                 else -> null
             } ?: emptyPlaylist()
         }
@@ -1617,6 +1701,7 @@ class PlaybackService : MediaLibraryService() {
         const val EXTRA_BOOK_ID = "bookId"
         const val EXTRA_CHAPTER_START_MS = "chapterStartMs"
         const val EXTRA_CHAPTER_END_MS = "chapterEndMs"
+        const val EXTRA_AUTO_PLAY = "autoPlay"
         const val COMMAND_CYCLE_SPEED = "com.julienmiquel.audiotheque.CYCLE_SPEED"
         const val SAVE_INTERVAL_MS = 10_000L
         const val RESUME_REWIND_MS = 5_000L

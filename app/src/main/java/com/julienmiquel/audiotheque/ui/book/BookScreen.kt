@@ -203,7 +203,15 @@ class BookViewModel(private val c: AppContainer, val bookId: String) : ViewModel
 
     fun togglePinnedOffline() = c.togglePinnedOffline(bookId)
 
-    fun play(trackId: String? = null, positionMs: Long? = null) = c.playBook(bookId, trackId, positionMs)
+    fun play(trackId: String? = null, positionMs: Long? = null) {
+        if (trackId != null) {
+            c.jumpToTrackAndSync(bookId, trackId, positionMs ?: 0L)
+        } else {
+            c.playOrDownloadBook(bookId, positionMs)
+        }
+    }
+
+    fun deleteLocalFiles() = c.deleteLocalBookFiles(bookId)
 
     fun saveCorrections(title: String, author: String, narrator: String, renameDriveTo: String? = null) {
         viewModelScope.launch {
@@ -259,6 +267,7 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
     var editing by rememberSaveable { mutableStateOf(false) }
     var renaming by rememberSaveable { mutableStateOf(false) }
     var moving by rememberSaveable { mutableStateOf(false) }
+    var confirmingLocalDelete by remember { mutableStateOf(false) }
 
     /** Exemplaire dont la suppression est à confirmer (cet exemplaire ou un autre). */
     var trashing by remember { mutableStateOf<BookEntity?>(null) }
@@ -303,6 +312,16 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                                         vm.togglePinnedOffline()
                                     },
                                 )
+                                if (item.presentTracks > 0) {
+                                    DropdownMenuItem(
+                                        text = { Text("Supprimer les fichiers locaux…") },
+                                        leadingIcon = { Icon(Icons.Filled.Delete, null) },
+                                        onClick = {
+                                            menu = false
+                                            confirmingLocalDelete = true
+                                        },
+                                    )
+                                }
                                 DropdownMenuItem(
                                     text = { Text("Corriger titre, auteur, voix") },
                                     leadingIcon = { Icon(Icons.Filled.Edit, null) },
@@ -466,6 +485,27 @@ fun BookScreen(bookId: String, onBack: () -> Unit, onOpenBook: (String) -> Unit,
                 }) { Text("Mettre à la corbeille") }
             },
             dismissButton = { TextButton(onClick = { trashing = null }) { Text("Annuler") } },
+        )
+    }
+    if (confirmingLocalDelete && item != null) {
+        val localSize = state.tracks.filter { it.state == TrackState.PRESENT }.sumOf { it.sizeBytes }
+        AlertDialog(
+            onDismissRequest = { confirmingLocalDelete = false },
+            icon = { Icon(Icons.Filled.Delete, contentDescription = null) },
+            title = { Text("Supprimer les fichiers locaux ?") },
+            text = {
+                Text(
+                    "Les pistes téléchargées de « ${item.title} » (${Formats.size(localSize)}) seront effacées du téléphone pour libérer de la place. " +
+                        "Vos fichiers Google Drive, votre progression, la pochette et vos signets sont conservés.",
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    vm.deleteLocalFiles()
+                    confirmingLocalDelete = false
+                }) { Text("Supprimer du téléphone") }
+            },
+            dismissButton = { TextButton(onClick = { confirmingLocalDelete = false }) { Text("Annuler") } },
         )
     }
 }
@@ -656,7 +696,7 @@ private fun BookContent(
                             Row(
                                 Modifier
                                     .fillMaxWidth()
-                                    .clickable(enabled = present, onClickLabel = "Écouter ce chapitre") { onPlay(track.driveId, ch.startMs) }
+                                    .clickable(onClickLabel = if (present) "Écouter ce chapitre" else "Télécharger ce chapitre") { onPlay(track.driveId, ch.startMs) }
                                     .padding(start = 44.dp, end = 16.dp, top = 6.dp, bottom = 6.dp),
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
@@ -775,7 +815,9 @@ private fun Actions(
     val familyMode = state.settings.statusSyncMode == StatusSyncMode.PERSONAL_FAMILY
     Column(Modifier.padding(horizontal = 16.dp, vertical = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (item.presentTracks > 0) {
+            val canPlayOrDownload = item.presentTracks > 0 ||
+                ((item.status == BookStatus.IN_PROGRESS || item.status == BookStatus.COLLECTION) && state.tracks.isNotEmpty())
+            if (canPlayOrDownload) {
                 val resume = (state.progress?.percent ?: 0f) > 0f && state.progress?.finished != true
                 Button(onClick = { onPlay(null, null) }) {
                     Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -857,8 +899,15 @@ private fun cleanupInfo(state: BookUiState, item: LibraryItem): Pair<String, Str
     if (book.pinnedOffline) {
         return "Pistes gardées" to "toujours (gardé sur ce téléphone)"
     }
-    if (book.pendingStatus != null) {
-        return if (book.pendingStatus == BookStatus.IN_PROGRESS) null else "Pistes gardées" to "jusqu'à la confirmation du déplacement par Drive"
+    if (book.pendingStatus != null && book.pendingStatus != BookStatus.IN_PROGRESS) {
+        return "Pistes gardées" to "jusqu'à la confirmation du déplacement par Drive"
+    }
+    if (item.status == BookStatus.IN_PROGRESS) {
+        return "Mode de stockage" to if (state.settings.streamingMode) {
+            "streaming (pistes N-1, N et N+1)"
+        } else {
+            "suppression après écoute de chaque piste"
+        }
     }
     val mode = state.pairs.firstOrNull { it.driveFolderId == book.parentId }?.mode
     val deadline = CleanupPolicy.bookDeadline(
@@ -878,7 +927,11 @@ private fun TrackRow(track: TrackEntity, isCurrent: Boolean, transfer: Transfer?
     Row(
         Modifier
             .fillMaxWidth()
-            .clickable(enabled = present && playable, onClickLabel = "Écouter cette piste", onClick = onPlay)
+            .clickable(
+                enabled = playable,
+                onClickLabel = if (present) "Écouter cette piste" else "Télécharger cette piste",
+                onClick = onPlay,
+            )
             .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {

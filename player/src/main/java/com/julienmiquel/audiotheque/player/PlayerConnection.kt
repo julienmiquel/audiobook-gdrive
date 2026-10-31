@@ -2,8 +2,10 @@ package com.julienmiquel.audiotheque.player
 
 import android.content.ComponentName
 import android.content.Context
+import android.os.Bundle
 import android.util.Log
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.session.MediaController
@@ -103,7 +105,15 @@ class PlayerConnection(private val context: Context) {
     fun playBook(bookId: String, trackId: String? = null, positionMs: Long? = null, autoPlay: Boolean = true) {
         scope.launch {
             val c = controller()
-            c.setMediaItem(MediaItem.Builder().setMediaId(MediaIds.bookRequest(bookId, trackId, positionMs)).build())
+            val item = MediaItem.Builder()
+                .setMediaId(MediaIds.bookRequest(bookId, trackId, positionMs))
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setExtras(Bundle().apply { putBoolean(PlaybackService.EXTRA_AUTO_PLAY, autoPlay) })
+                        .build(),
+                )
+                .build()
+            c.setMediaItem(item)
             c.prepare()
             if (autoPlay) c.play() else c.pause()
         }

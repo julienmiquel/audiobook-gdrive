@@ -314,6 +314,9 @@ interface TrackDao {
     @Query("SELECT COALESCE(SUM(sizeBytes), 0) FROM tracks WHERE state = 'PRESENT'")
     fun observeLocalBytes(): Flow<Long>
 
+    @Query("SELECT COALESCE(SUM(sizeBytes), 0) FROM tracks WHERE bookId = :bookId AND state = 'PRESENT'")
+    fun observeLocalBytesForBook(bookId: String): Flow<Long>
+
     @Query("SELECT COUNT(*) FROM tracks WHERE bookId = :bookId AND state = 'PRESENT'")
     suspend fun presentCount(bookId: String): Int
 
@@ -337,6 +340,12 @@ interface ProgressDao {
 
     @Query("SELECT * FROM progress WHERE account = :account")
     suspend fun allFor(account: String): List<ProgressEntity>
+
+    @Query("SELECT * FROM progress WHERE bookId = :bookId")
+    suspend fun allForBook(bookId: String): List<ProgressEntity>
+
+    @Query("SELECT * FROM progress")
+    suspend fun all(): List<ProgressEntity>
 
     @Query("SELECT DISTINCT account FROM progress WHERE account != 'local'")
     suspend fun distinctAccounts(): List<String>

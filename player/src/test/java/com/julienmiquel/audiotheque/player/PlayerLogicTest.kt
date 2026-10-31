@@ -99,4 +99,106 @@ class PlayerLogicTest {
         assertThat(PlaybackService.RESUME_REWIND_MS).isEqualTo(5_000)
         assertThat(PlaybackService.SAVE_INTERVAL_MS).isEqualTo(10_000)
     }
+
+    @Test
+    fun `résolution de la piste cible - ne retombe jamais sur la piste 0 quand la piste de reprise est absente`() {
+        fun track(i: Int) = TrackEntity(
+            driveId = "t$i",
+            bookId = "civ",
+            name = "0$i.mp3",
+            relativePath = "0$i.mp3",
+            sortIndex = i,
+            title = "Chapitre $i",
+            sizeBytes = 1_000L,
+            mimeType = "audio/mpeg",
+        )
+        val allTracks = (0..9).map(::track)
+        val now = 1_000_000L
+
+        // 1. Reprise streaming / inter-appareils sur t8 alors que seules t0 et t1 sont locales :
+        //    retourne MissingTrack(t8) avec la position exacte, sans retomber sur t0.
+        val progressOnT8 = com.julienmiquel.audiotheque.core.db.ProgressEntity(
+            bookId = "civ",
+            account = "a@b.fr",
+            trackId = "t8",
+            trackIndex = 8,
+            positionMs = 42_000L,
+            lastListenedAt = now - 60_000L,
+            updatedAt = now - 60_000L,
+        )
+        val missing = PlaybackTargetResolver.resolve(
+            tracks = allTracks,
+            presentTrackIds = setOf("t0", "t1"),
+            progress = progressOnT8,
+            smartRewind = true,
+            nowMs = now,
+        )
+        assertThat(missing).isEqualTo(StartResolution.MissingTrack(allTracks[8], 42_000L))
+
+        // 2. Même reprise une fois t8 présente : Playable avec recul intelligent (1 min -> 5 s).
+        val playable = PlaybackTargetResolver.resolve(
+            tracks = allTracks,
+            presentTrackIds = setOf("t7", "t8", "t9"),
+            progress = progressOnT8,
+            smartRewind = true,
+            nowMs = now,
+        )
+        assertThat(playable).isEqualTo(StartResolution.Playable(allTracks[8], 37_000L))
+
+        // 3. Saut explicite vers une piste absente : MissingTrack sans recul.
+        val explicitMissing = PlaybackTargetResolver.resolve(
+            tracks = allTracks,
+            presentTrackIds = setOf("t0", "t1"),
+            progress = progressOnT8,
+            explicitTrackId = "t6",
+            explicitPositionMs = 15_000L,
+            smartRewind = true,
+            nowMs = now,
+        )
+        assertThat(explicitMissing).isEqualTo(StartResolution.MissingTrack(allTracks[6], 15_000L))
+
+        // 4. Livre terminé (finished = true) dont les pistes ont été nettoyées : repart au début (t0, 0 ms).
+        val finishedProgress = progressOnT8.copy(trackId = "t9", trackIndex = 9, percent = 100f, finished = true)
+        val restartMissing = PlaybackTargetResolver.resolve(
+            tracks = allTracks,
+            presentTrackIds = emptySet(),
+            progress = finishedProgress,
+            smartRewind = true,
+            nowMs = now,
+        )
+        assertThat(restartMissing).isEqualTo(StartResolution.MissingTrack(allTracks[0], 0L))
+
+        // 5. Progression indexée sans driveId ou avec piste remplacée sur Drive : retrouvée par trackIndex.
+        val indexOnlyProgress = progressOnT8.copy(trackId = null, trackIndex = 5, positionMs = 20_000L)
+        val fallbackByIndex = PlaybackTargetResolver.resolve(
+            tracks = allTracks,
+            presentTrackIds = setOf("t0"),
+            progress = indexOnlyProgress,
+            smartRewind = false,
+            nowMs = now,
+        )
+        assertThat(fallbackByIndex).isEqualTo(StartResolution.MissingTrack(allTracks[5], 20_000L))
+
+        val replacedIdProgress = progressOnT8.copy(trackId = "ancien-id-drive", trackIndex = 5, positionMs = 20_000L)
+        assertThat(
+            PlaybackTargetResolver.resolve(
+                tracks = allTracks,
+                presentTrackIds = setOf("t0"),
+                progress = replacedIdProgress,
+                smartRewind = false,
+                nowMs = now,
+            ),
+        ).isEqualTo(StartResolution.MissingTrack(allTracks[5], 0L))
+
+        // 6. Aucune piste inventoriée.
+        assertThat(
+            PlaybackTargetResolver.resolve(
+                tracks = emptyList(),
+                presentTrackIds = emptySet(),
+                progress = null,
+                smartRewind = true,
+                nowMs = now,
+            ),
+        ).isEqualTo(StartResolution.NoTracks)
+    }
 }
